@@ -1,0 +1,23 @@
+# ===================================
+# PDF2BPMN API 서버 환경 설정
+# ===================================
+#
+# 사용법:
+# 1. 이 파일을 '.env'로 복사: copy api.env.example .env
+# 2. 아래 값들을 실제 값으로 변경
+# 3. API 서버 실행: python run.py api --port 8001
+#
+# 주의: 에이전트 서버(agent.env)와 별도의 파일입니다!
+# ===================================
+
+# OpenAI API (PDF 분석 및 엔티티 추출에 사용)
+OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Neo4j 그래프 데이터베이스
+# Neo4j Desktop 또는 Docker로 실행 후 연결
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=1234567bpmn
+
+# (선택) 로깅 레벨
+LOG_LEVEL=INFO

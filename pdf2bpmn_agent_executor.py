@@ -783,12 +783,11 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             if process_response.status_code != 200:
                 raise Exception(f"처리 시작 실패: {process_response.status_code}")
             
-            # 진행 상황 폴링
-            max_retries = 600  # 10분
-            retry_count = 0
+            # 진행 상황 폴링 (무한 대기 - PDF 처리는 시간이 오래 걸릴 수 있음)
+            poll_count = 0
             last_progress = 15
             
-            while retry_count < max_retries:
+            while True:
                 if self.is_cancelled:
                     raise Exception("작업이 취소되었습니다.")
                 
@@ -801,7 +800,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 current_progress = job_status.get("progress", 0)
                 detail_message = job_status.get("detail_message", "")
                 
-                if retry_count % 10 == 0:  # 10초마다 로그
+                if poll_count % 10 == 0:  # 10초마다 로그
                     logger.info(f"[POLL] status={current_status}, progress={current_progress}")
                 
                 if current_status == "completed":
@@ -822,10 +821,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     last_progress = current_progress
                 
                 await asyncio.sleep(1)
-                retry_count += 1
-            
-            if retry_count >= max_retries:
-                raise Exception("처리 시간 초과")
+                poll_count += 1
             
             # =================================================================
             # 7. 결과 가져오기 - 이 작업에서 생성된 BPMN만 필터링

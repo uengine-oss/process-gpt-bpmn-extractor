@@ -72,7 +72,7 @@ class PDF2BPMNServerConfig:
         
         # PDF2BPMN 서버 설정
         self.pdf2bpmn_url = os.getenv("PDF2BPMN_URL", "http://localhost:8001")
-        self.task_timeout = int(os.getenv("TASK_TIMEOUT", "300"))  # 5분
+        self.task_timeout = int(os.getenv("TASK_TIMEOUT", "3600"))  # 1시간
         
         # 환경 검증
         self.validate()
@@ -230,7 +230,7 @@ def print_usage():
     print("  PDF2BPMN_URL=http://localhost:8001 - PDF2BPMN 서버 URL")
     print("  POLLING_INTERVAL=5    - 폴링 간격 (초)")
     print("  AGENT_ORCH=pdf2bpmn   - 에이전트 타입")
-    print("  TASK_TIMEOUT=300      - 태스크 타임아웃 (초)")
+    print("  TASK_TIMEOUT=3600     - 태스크 타임아웃 (초, 기본 1시간)")
     print()
     print("실행 예시:")
     print("  export SUPABASE_URL='https://your-project.supabase.co'")

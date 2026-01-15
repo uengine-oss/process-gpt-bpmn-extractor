@@ -96,7 +96,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         
         # PDF2BPMN 서버 설정
         self.pdf2bpmn_url = os.getenv('PDF2BPMN_URL', self.config.get('pdf2bpmn_url', 'http://localhost:8001'))
-        self.timeout = self.config.get('timeout', 300)  # 5분 타임아웃
+        self.timeout = self.config.get('timeout', 3600)  # 1시간 타임아웃
         
         # Supabase 설정
         self.supabase_url = os.getenv('SUPABASE_URL')
@@ -783,11 +783,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             if process_response.status_code != 200:
                 raise Exception(f"처리 시작 실패: {process_response.status_code}")
             
-            # 진행 상황 폴링 (무한 대기 - PDF 처리는 시간이 오래 걸릴 수 있음)
-            poll_count = 0
+            # 진행 상황 폴링 (self.timeout 사용 - config에서 전달받은 값, 기본 1시간)
+            max_retries = self.timeout  # 1초 간격으로 폴링
+            retry_count = 0
             last_progress = 15
+            logger.info(f"[INFO] PDF 처리 폴링 시작 (timeout: {self.timeout}초)")
             
-            while True:
+            while retry_count < max_retries:
                 if self.is_cancelled:
                     raise Exception("작업이 취소되었습니다.")
                 
@@ -800,7 +802,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 current_progress = job_status.get("progress", 0)
                 detail_message = job_status.get("detail_message", "")
                 
-                if poll_count % 10 == 0:  # 10초마다 로그
+                if retry_count % 10 == 0:  # 10초마다 로그
                     logger.info(f"[POLL] status={current_status}, progress={current_progress}")
                 
                 if current_status == "completed":
@@ -821,7 +823,10 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     last_progress = current_progress
                 
                 await asyncio.sleep(1)
-                poll_count += 1
+                retry_count += 1
+            
+            if retry_count >= max_retries:
+                raise Exception("처리 시간 초과")
             
             # =================================================================
             # 7. 결과 가져오기 - 이 작업에서 생성된 BPMN만 필터링

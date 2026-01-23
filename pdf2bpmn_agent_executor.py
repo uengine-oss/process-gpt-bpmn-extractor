@@ -15,11 +15,16 @@ import httpx
 import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Set, Tuple
 import traceback
 import xml.etree.ElementTree as ET
 import sys
 from html.parser import HTMLParser
+
+from src.pdf2bpmn.processgpt.bpmn_xml_generator import ProcessGPTBPMNXmlGenerator
+from src.pdf2bpmn.processgpt.process_definition_prompt import build_system_prompt_processgpt
+from src.pdf2bpmn.processgpt.process_consulting_prompt import get_process_consulting_system_prompt
+from src.pdf2bpmn.processgpt.process_generation_messages import build_process_definition_messages
 
 # OpenAI
 try:
@@ -242,6 +247,9 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         # OpenAI client (for form generation)
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o")
+        # Separate models (requested: user/agent creation vs process creation)
+        self.user_mapping_model = os.getenv("USER_MAPPING_MODEL", self.openai_model)
+        self.process_definition_model = os.getenv("PROCESS_DEF_MODEL", self.openai_model)
         self.openai_client: Optional[OpenAI] = None
         if OPENAI_AVAILABLE and self.openai_api_key:
             try:
@@ -253,10 +261,36 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         # HTTP 클라이언트
         self.http_client: Optional[httpx.AsyncClient] = None
 
-        # Org/agent cache (lazy)
+        # Org/user/agent cache (lazy)
         self._org_loaded: bool = False
-        self._org_teams_by_name: Dict[str, str] = {}  # normalized team name -> team id
-        self._agents: List[Dict[str, Any]] = []  # users table agents
+        self._org_config_uuid: Optional[str] = None
+        self._org_value: Optional[Dict[str, Any]] = None  # configuration.value (may include chart + extras)
+        self._org_chart: Optional[Dict[str, Any]] = None
+        self._org_teams_by_name: Dict[str, str] = {}  # normalized team name -> team(node) id
+        self._org_team_name_by_id: Dict[str, str] = {}  # team(node) id -> display name
+        self._org_members_by_team_id: Dict[str, List[str]] = {}  # team(node) id -> [user_id...]
+
+        # users table cache
+        self._users: List[Dict[str, Any]] = []   # all users (agents + humans)
+        self._agents: List[Dict[str, Any]] = []  # users where is_agent=true
+
+        # ProcessGPT flow toggle:
+        # - When enabled, DO NOT use PDF2BPMN-generated BPMN XML as the source of truth.
+        # - Instead: Neo4j extracted info -> (user mapping LLM) -> (process definition LLM) -> (ProcessGPTBPMNXmlGenerator.create_bpmn_xml) -> save.
+        # 요구사항: 기존 XML 생성/활용 경로는 사용하지 않고, 이 흐름만 사용합니다.
+        self._enable_processgpt_flow = True
+        self._processgpt_bpmn_xml_generator = ProcessGPTBPMNXmlGenerator()
+
+        # LLM-based assignment controls
+        # - ENABLE_LLM_ROLE_MAPPING: allow LLM to suggest best assignee (existing user/agent/team)
+        # - ENABLE_AUTO_AGENT_CREATION: allow creating a NEW agent user and mapping it
+        self._enable_llm_role_mapping: bool = os.getenv("ENABLE_LLM_ROLE_MAPPING", "true").lower() == "true"
+        # 요구사항: 에이전트가 필요한 경우 생성되어야 함 → 기본값 true (환경변수로 비활성화 가능)
+        self._enable_auto_agent_creation: bool = os.getenv("ENABLE_AUTO_AGENT_CREATION", "true").lower() == "true"
+        self._llm_assignment_min_conf: float = float(os.getenv("LLM_ASSIGNMENT_MIN_CONFIDENCE", "0.72"))
+
+        # In-run cache to avoid repeated LLM calls per role name
+        self._role_assignment_cache: Dict[str, Dict[str, Any]] = {}
         
         # Supabase 초기화
         self._setup_supabase()
@@ -606,13 +640,28 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         task_id: str,
         job_id: str,
     ) -> Dict[str, Any]:
-        """proc_def 저장 후, activity별 폼 생성+저장을 완료합니다(프론트가 없어도 수행)."""
+        """
+        proc_def 저장 후, activity별 폼 생성+저장을 완료합니다(프론트가 없어도 수행).
+
+        Returns:
+          {
+            "forms_saved": int,
+            "activities": int,
+            "forms": {
+              "<activity_id>": {
+                "form_id": "<form_def.id>",
+                "fields_json": [ {text,key,type,...}, ... ]   # from _extract_fields_json_from_form_html
+              }
+            }
+          }
+        """
         activities = proc_json.get("activities") or []
         if not isinstance(activities, list) or not activities:
-            return {"forms_saved": 0, "activities": 0}
+            return {"forms_saved": 0, "activities": 0, "forms": {}}
 
         forms_saved = 0
         total = len(activities)
+        forms_by_activity_id: Dict[str, Dict[str, Any]] = {}
         max_forms = int(os.getenv("FORM_MAX_PER_PROCESS", "200"))
         if total > max_forms:
             activities = activities[:max_forms]
@@ -695,6 +744,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             if ok:
                 forms_saved += 1
 
+            # Always keep an index for post-processing (even if save failed).
+            forms_by_activity_id[activity_id] = {
+                "form_id": form_def_id,
+                "fields_json": fields_json,
+            }
+
             await self._send_progress_event(
                 event_queue,
                 context_id,
@@ -706,7 +761,360 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 {"proc_def_id": proc_def_id, "activity_id": activity_id, "form_def_id": form_def_id, "saved": ok},
             )
 
-        return {"forms_saved": forms_saved, "activities": total}
+        return {"forms_saved": forms_saved, "activities": total, "forms": forms_by_activity_id}
+
+    # -----------------------------------------------------------------------
+    # Post-process expansion: inputData wiring after forms exist
+    # -----------------------------------------------------------------------
+
+    def _extract_form_field_refs(self, form_id: str, fields_json: Any) -> List[Dict[str, str]]:
+        """
+        Convert fields_json (from _extract_fields_json_from_form_html) into a list of candidates:
+          [{"ref": "<form_id>.<field_key>", "label": "...", "type": "..."}, ...]
+        """
+        out: List[Dict[str, str]] = []
+        if not form_id:
+            return out
+        if not isinstance(fields_json, list):
+            return out
+        seen: Set[str] = set()
+        for f in fields_json:
+            if not isinstance(f, dict):
+                continue
+            key = str(f.get("key") or "").strip()
+            if not key:
+                continue
+            ref = f"{form_id}.{key}"
+            if ref in seen:
+                continue
+            seen.add(ref)
+            out.append(
+                {
+                    "ref": ref,
+                    "label": str(f.get("text") or ""),
+                    "type": str(f.get("type") or ""),
+                }
+            )
+        return out
+
+    def _build_predecessor_activity_map(self, proc_json: Dict[str, Any]) -> Dict[str, List[str]]:
+        """
+        Build a mapping: activity_id -> list of predecessor activity_ids (reachable via sequences).
+        - Uses runtime proc_def.definition shape: activities + sequences (+ events/gateways).
+        - If sequences are missing/invalid, falls back to "list order" (all previous activities).
+        """
+        activities = proc_json.get("activities") or []
+        if not isinstance(activities, list):
+            return {}
+        activity_ids = [str(a.get("id")) for a in activities if isinstance(a, dict) and a.get("id")]
+        activity_id_set = set(activity_ids)
+
+        sequences = proc_json.get("sequences") or []
+        if not isinstance(sequences, list) or not sequences:
+            # fallback: list order
+            out2: Dict[str, List[str]] = {}
+            prev: List[str] = []
+            for aid in activity_ids:
+                out2[aid] = list(prev)
+                prev.append(aid)
+            return out2
+
+        # Build reverse adjacency for all nodes (events/gateways/activities)
+        rev: Dict[str, List[str]] = {}
+        edge_count = 0
+        for s in sequences:
+            if not isinstance(s, dict):
+                continue
+            src = str(s.get("source") or "").strip()
+            tgt = str(s.get("target") or "").strip()
+            if not src or not tgt or src == tgt:
+                continue
+            rev.setdefault(tgt, []).append(src)
+            edge_count += 1
+
+        if edge_count == 0:
+            out2 = {}
+            prev = []
+            for aid in activity_ids:
+                out2[aid] = list(prev)
+                prev.append(aid)
+            return out2
+
+        # For each activity, walk backwards through rev graph and collect activity nodes.
+        out: Dict[str, List[str]] = {}
+        for aid in activity_ids:
+            seen_nodes: Set[str] = set()
+            preds: List[str] = []
+            q: List[str] = list(rev.get(aid) or [])
+            while q:
+                cur = q.pop(0)
+                if cur in seen_nodes:
+                    continue
+                seen_nodes.add(cur)
+                if cur in activity_id_set and cur != aid:
+                    preds.append(cur)
+                for p in rev.get(cur) or []:
+                    if p not in seen_nodes:
+                        q.append(p)
+                # safety guard to avoid pathological loops
+                if len(seen_nodes) > 5000:
+                    break
+            # Stable order: keep by activities list order (older first)
+            preds_sorted = [x for x in activity_ids if x in set(preds)]
+            out[aid] = preds_sorted
+        return out
+
+    async def _llm_choose_inputdata_for_process(
+        self,
+        *,
+        process_name: str,
+        proc_def_id: str,
+        proc_json: Dict[str, Any],
+        candidates_by_activity_id: Dict[str, List[Dict[str, str]]],
+    ) -> Optional[Dict[str, List[str]]]:
+        """
+        Decide inputData for activities, using ONLY provided candidates.
+        Returns: { activity_id: [ "form_id.field_key", ... ] }
+        """
+        if not self.openai_client:
+            return None
+        if os.getenv("ENABLE_LLM_INPUTDATA_MAPPING", "true").lower() != "true":
+            return None
+
+        activities = proc_json.get("activities") or []
+        if not isinstance(activities, list):
+            return None
+
+        tasks_payload: List[Dict[str, Any]] = []
+        for a in activities:
+            if not isinstance(a, dict):
+                continue
+            aid = str(a.get("id") or "").strip()
+            if not aid:
+                continue
+            cands = candidates_by_activity_id.get(aid) or []
+            # Keep prompt compact
+            tasks_payload.append(
+                {
+                    "task_id": aid,
+                    "name": str(a.get("name") or ""),
+                    "role": str(a.get("role") or ""),
+                    "description": str(a.get("description") or ""),
+                    "instruction": str(a.get("instruction") or ""),
+                    "candidates": cands[:120],  # cap
+                }
+            )
+
+        system_prompt = (
+            "당신은 BPM 프로세스의 각 태스크(UserTask)에 대해 inputData(참조 데이터)를 설계하는 전문가입니다.\n"
+            "규칙:\n"
+            "- inputData에는 반드시 제공된 candidates.ref 값만 넣을 수 있습니다.\n"
+            "- inputData는 '이 태스크를 수행할 때 참고하면 좋은 이전 태스크의 입력값'이어야 합니다.\n"
+            "- 불필요한 참조는 넣지 마세요. 꼭 필요한 것만 선택하세요.\n"
+            "- 출력은 JSON ONLY 입니다.\n"
+        )
+
+        user_prompt = (
+            f"프로세스명: {process_name}\n"
+            f"proc_def_id: {proc_def_id}\n\n"
+            "각 태스크별 후보(candidates) 중에서 inputData로 적절한 것들을 골라주세요.\n"
+            "반환 형식:\n"
+            "{\n"
+            '  "mappings": [\n'
+            '    {"task_id": "...", "inputData": ["form_id.field_key", "..."]}\n'
+            "  ]\n"
+            "}\n\n"
+            f"tasks:\n{json.dumps(tasks_payload, ensure_ascii=False)}\n"
+        )
+
+        obj = await self._call_openai_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=int(os.getenv("LLM_INPUTDATA_MAX_TOKENS", "1400")),
+            model=os.getenv("INPUTDATA_MAPPING_MODEL", self.process_definition_model),
+            temperature=float(os.getenv("LLM_INPUTDATA_TEMPERATURE", "0.0")),
+        )
+        if not isinstance(obj, dict):
+            return None
+        mappings = obj.get("mappings")
+        if not isinstance(mappings, list):
+            return None
+
+        out: Dict[str, List[str]] = {}
+        for m in mappings:
+            if not isinstance(m, dict):
+                continue
+            tid = str(m.get("task_id") or "").strip()
+            if not tid:
+                continue
+            arr = m.get("inputData") or []
+            if not isinstance(arr, list):
+                continue
+            cleaned: List[str] = []
+            seen: Set[str] = set()
+            allowed = {c.get("ref") for c in (candidates_by_activity_id.get(tid) or []) if isinstance(c, dict) and c.get("ref")}
+            for x in arr:
+                ref = str(x or "").strip()
+                if not ref or ref in seen:
+                    continue
+                if allowed and ref not in allowed:
+                    continue
+                seen.add(ref)
+                cleaned.append(ref)
+            out[tid] = cleaned
+        return out
+
+    async def _expand_process_after_forms(
+        self,
+        *,
+        proc_def_id: str,
+        process_name: str,
+        proc_json: Dict[str, Any],
+        forms_result: Dict[str, Any],
+        tenant_id: str,
+        event_queue: EventQueue,
+        context_id: str,
+        task_id: str,
+        job_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Post-processing step AFTER forms exist:
+        - Ensure agent fields are consistent (agentMode/orchestration)
+        - Set inputData using real form_id + fields_json from earlier tasks
+        """
+        # 0) Ensure assignment is applied (and agents can be created) once more, now that we are close to saving.
+        try:
+            await self._apply_assignment_and_maybe_create_agents(
+                proc_json=proc_json,
+                tenant_id=tenant_id,
+                process_name=process_name,
+            )
+        except Exception as e:
+            logger.warning(f"[WARN] assignment apply failed in expand stage: {e}")
+
+        # 1) Build predecessors based on sequences
+        pred_map = self._build_predecessor_activity_map(proc_json)
+
+        # 2) Build candidate form-field refs per activity from predecessor activities only
+        forms_by_activity_id = (forms_result.get("forms") or {}) if isinstance(forms_result, dict) else {}
+        candidates_by_activity_id: Dict[str, List[Dict[str, str]]] = {}
+        for aid, preds in (pred_map or {}).items():
+            cand: List[Dict[str, str]] = []
+            seen: Set[str] = set()
+            for pid in preds:
+                info = forms_by_activity_id.get(pid) if isinstance(forms_by_activity_id, dict) else None
+                if not isinstance(info, dict):
+                    continue
+                form_id = str(info.get("form_id") or "").strip()
+                fields_json = info.get("fields_json")
+                for c in self._extract_form_field_refs(form_id, fields_json):
+                    ref = c.get("ref") or ""
+                    if ref and ref not in seen:
+                        seen.add(ref)
+                        cand.append(c)
+            candidates_by_activity_id[aid] = cand
+
+        # 3) Ask LLM to choose relevant inputData, otherwise fallback to "all candidates"
+        await self._send_progress_event(
+            event_queue,
+            context_id,
+            task_id,
+            job_id,
+            f"[EXPAND] inputData(참조 필드) 자동 설정을 시작합니다: {process_name}",
+            "tool_usage_started",
+            97,
+            {"proc_def_id": proc_def_id},
+        )
+
+        chosen = await self._llm_choose_inputdata_for_process(
+            process_name=process_name,
+            proc_def_id=proc_def_id,
+            proc_json=proc_json,
+            candidates_by_activity_id=candidates_by_activity_id,
+        )
+
+        max_inputs = int(os.getenv("INPUTDATA_MAX_PER_TASK", "60"))
+        activities = proc_json.get("activities") or []
+        if isinstance(activities, list):
+            for a in activities:
+                if not isinstance(a, dict):
+                    continue
+                aid = str(a.get("id") or "").strip()
+                if not aid:
+                    continue
+
+                # normalize agent fields (final)
+                agent_id = str(a.get("agent") or "").strip()
+                if agent_id:
+                    a["agentMode"] = "draft"
+                    a["orchestration"] = "crewai-action"
+                else:
+                    a["agentMode"] = "none"
+                    a["orchestration"] = None
+
+                # inputData:
+                # - MUST be limited to predecessor candidates only (prevents referencing future/non-existent forms)
+                allowed = {
+                    str(c.get("ref"))
+                    for c in (candidates_by_activity_id.get(aid) or [])
+                    if isinstance(c, dict) and c.get("ref")
+                }
+
+                # 1) If LLM provided mapping for this task, it is already filtered by `allowed` upstream.
+                if isinstance(chosen, dict) and aid in chosen:
+                    new_inputs = chosen.get(aid) or []
+                    if isinstance(new_inputs, list):
+                        a["inputData"] = [str(x).strip() for x in new_inputs if str(x or "").strip()][:max_inputs]
+                        continue
+
+                # 2) Otherwise, sanitize any existing inputData to allowed-only.
+                existing = a.get("inputData") or []
+                sanitized: List[str] = []
+                seen2: Set[str] = set()
+                if isinstance(existing, list) and allowed:
+                    for x in existing:
+                        ref = str(x or "").strip()
+                        if not ref or ref in seen2:
+                            continue
+                        if ref not in allowed:
+                            continue
+                        seen2.add(ref)
+                        sanitized.append(ref)
+                        if len(sanitized) >= max_inputs:
+                            break
+
+                # 3) If nothing left, fallback to "all candidates" (dedup) up to max_inputs.
+                if not sanitized:
+                    refs = [
+                        str(c.get("ref") or "").strip()
+                        for c in (candidates_by_activity_id.get(aid) or [])
+                        if isinstance(c, dict)
+                    ]
+                    for r in refs:
+                        if not r or r in seen2:
+                            continue
+                        seen2.add(r)
+                        sanitized.append(r)
+                        if len(sanitized) >= max_inputs:
+                            break
+
+                a["inputData"] = sanitized
+
+        await self._send_progress_event(
+            event_queue,
+            context_id,
+            task_id,
+            job_id,
+            f"[EXPAND] inputData(참조 필드) 자동 설정 완료: {process_name}",
+            "tool_usage_finished",
+            98,
+            {"proc_def_id": proc_def_id},
+        )
+
+        return {
+            "candidates_count": {k: len(v) for k, v in candidates_by_activity_id.items()},
+            "llm_used": bool(isinstance(chosen, dict)),
+        }
 
     async def _update_proc_def_definition_only(self, *, proc_def_id: str, tenant_id: str, definition: Dict[str, Any]) -> bool:
         """proc_def.definition만 업데이트(폼 id 연결을 위해)."""
@@ -841,6 +1249,14 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
     def _normalize_text_key(self, s: str) -> str:
         return re.sub(r"\s+", "", (s or "").strip().lower())
 
+    def _safe_json_loads(self, v: Any) -> Any:
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return None
+        return v
+
     def _extract_teams_from_org_chart(self, chart: Dict[str, Any]) -> Dict[str, str]:
         """
         configuration(key=organization).value.chart 트리에서 팀(부서) 노드를 추출합니다.
@@ -866,8 +1282,56 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         walk(chart)
         return teams
 
+    def _index_org_chart(self, chart: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        조직도(chart)에서 다음 인덱스를 생성합니다.
+        - teams_by_name: normalized team name -> team node id
+        - team_name_by_id: team node id -> team display name
+        - members_by_team_id: team node id -> [member user_id...]
+
+        프론트에서 조직도에 멤버/에이전트 추가 시 child 노드는 다음 형태를 가집니다:
+          { id: <users.id>, name: <display>, data: <users row-ish>, children?: [...] }
+        """
+        teams_by_name: Dict[str, str] = {}
+        team_name_by_id: Dict[str, str] = {}
+        members_by_team_id: Dict[str, List[str]] = {}
+
+        def walk(node: Any, current_team_id: Optional[str] = None):
+            if not node or not isinstance(node, dict):
+                return
+            node_id = str(node.get("id") or "")
+            data = node.get("data") or {}
+            is_team = isinstance(data, dict) and bool(data.get("isTeam"))
+
+            next_team_id = current_team_id
+            if is_team and node_id:
+                team_name = str(data.get("name") or node_id).strip()
+                if team_name:
+                    teams_by_name[self._normalize_text_key(team_name)] = node_id
+                    team_name_by_id[node_id] = team_name
+                next_team_id = node_id
+                members_by_team_id.setdefault(node_id, [])
+            else:
+                # member/agent node under a team
+                if current_team_id and node_id:
+                    members_by_team_id.setdefault(current_team_id, [])
+                    if node_id not in members_by_team_id[current_team_id]:
+                        members_by_team_id[current_team_id].append(node_id)
+
+            children = node.get("children") or []
+            if isinstance(children, list):
+                for ch in children:
+                    walk(ch, next_team_id)
+
+        walk(chart, None)
+        return {
+            "teams_by_name": teams_by_name,
+            "team_name_by_id": team_name_by_id,
+            "members_by_team_id": members_by_team_id,
+        }
+
     async def _load_org_and_agents(self, tenant_id: str):
-        """Supabase에서 조직도/에이전트 목록을 로드하여 캐시합니다."""
+        """Supabase에서 조직도/유저/에이전트 목록을 로드하여 캐시합니다."""
         if self._org_loaded:
             return
         self._org_loaded = True
@@ -876,35 +1340,48 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             logger.warning("[WARN] Supabase client unavailable: org/agent mapping will be skipped.")
             return
 
-        # 1) organization chart (teams)
+        # 1) organization chart (teams + members)
         try:
-            org = self.supabase_client.table("configuration").select("value").eq("key", "organization").eq("tenant_id", tenant_id).execute()
+            org = (
+                self.supabase_client.table("configuration")
+                .select("uuid,value")
+                .eq("key", "organization")
+                .eq("tenant_id", tenant_id)
+                .execute()
+            )
             if org.data and len(org.data) > 0:
+                self._org_config_uuid = org.data[0].get("uuid")
                 value = org.data[0].get("value")
-                if isinstance(value, str):
-                    try:
-                        value = json.loads(value)
-                    except Exception:
-                        value = None
+                value = self._safe_json_loads(value)
                 if isinstance(value, dict):
+                    self._org_value = value
                     chart = value.get("chart") or value
                     if isinstance(chart, dict):
-                        self._org_teams_by_name = self._extract_teams_from_org_chart(chart)
+                        self._org_chart = chart
+                        idx = self._index_org_chart(chart)
+                        self._org_teams_by_name = idx.get("teams_by_name") or {}
+                        self._org_team_name_by_id = idx.get("team_name_by_id") or {}
+                        self._org_members_by_team_id = idx.get("members_by_team_id") or {}
+            logger.info(
+                f"[ASSIGN] org loaded: tenant_id={tenant_id!r} chart={'yes' if isinstance(self._org_chart, dict) else 'no'} "
+                f"teams={len(self._org_teams_by_name or {})} members_teams={len(self._org_members_by_team_id or {})}"
+            )
         except Exception as e:
             logger.warning(f"[WARN] organization 로드 실패: {e}")
 
-        # 2) agents (users table)
+        # 2) users (agents + humans)
         try:
-            agents = (
+            users = (
                 self.supabase_client.table("users")
-                .select("id, username, role, endpoint, agent_type, alias, is_agent")
+                .select("id, username, role, endpoint, agent_type, alias, is_agent, email, goal, persona, description, tools, skills, model")
                 .eq("tenant_id", tenant_id)
-                .eq("is_agent", True)
                 .execute()
             )
-            self._agents = agents.data or []
+            self._users = users.data or []
+            self._agents = [u for u in self._users if isinstance(u, dict) and u.get("is_agent") is True]
+            logger.info(f"[ASSIGN] users loaded: tenant_id={tenant_id!r} users={len(self._users)} agents={len(self._agents)}")
         except Exception as e:
-            logger.warning(f"[WARN] agents(users) 로드 실패: {e}")
+            logger.warning(f"[WARN] users 로드 실패: {e}")
 
     def _pick_agent_for_role(self, role_name: str) -> Optional[Dict[str, Any]]:
         """역할명으로 users(is_agent=true) 중 가장 잘 맞는 agent를 선택."""
@@ -938,6 +1415,1576 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 return a
 
         return None
+
+    def _pick_user_for_role(self, role_name: str) -> Optional[Dict[str, Any]]:
+        """
+        역할명으로 users 전체(에이전트+사용자) 중 가장 잘 맞는 사용자를 선택합니다.
+        우선순위:
+        1) agent 먼저 매칭
+        2) 그 다음 일반 사용자 매칭
+        """
+        key = self._normalize_text_key(role_name)
+        if not key:
+            return None
+
+        def match_in(pool: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            # exact-ish match priority: username / role / alias
+            for u in pool:
+                if not isinstance(u, dict):
+                    continue
+                if self._normalize_text_key(u.get("username")) == key:
+                    return u
+                if self._normalize_text_key(u.get("role")) == key:
+                    return u
+                if self._normalize_text_key(u.get("alias")) == key:
+                    return u
+            # contains match
+            for u in pool:
+                if not isinstance(u, dict):
+                    continue
+                cand = self._normalize_text_key(u.get("username")) or ""
+                if cand and (cand in key or key in cand):
+                    return u
+                cand = self._normalize_text_key(u.get("role")) or ""
+                if cand and (cand in key or key in cand):
+                    return u
+                cand = self._normalize_text_key(u.get("alias")) or ""
+                if cand and (cand in key or key in cand):
+                    return u
+            return None
+
+        agent_hit = match_in(self._agents)
+        if agent_hit:
+            return agent_hit
+        return match_in(self._users)
+
+    def _get_org_team_candidates(self, role_name: str) -> List[Dict[str, Any]]:
+        """역할명에 대해 후보 팀을 가볍게 필터링(LLM 입력 토큰 절약용)."""
+        key = self._normalize_text_key(role_name)
+        if not key:
+            return []
+        out: List[Dict[str, Any]] = []
+        for norm_name, team_id in (self._org_teams_by_name or {}).items():
+            if not team_id:
+                continue
+            if norm_name and (norm_name in key or key in norm_name):
+                out.append({"team_id": team_id, "team_name": self._org_team_name_by_id.get(team_id) or ""})
+        # IMPORTANT: do NOT provide unrelated fallback teams.
+        # It increases token usage and often makes the model return action=none with confidence=0.
+        return out[:30]
+
+    def _get_user_candidates(self, role_name: str) -> List[Dict[str, Any]]:
+        """역할명에 대해 후보 사용자/에이전트를 가볍게 필터링(LLM 입력 토큰 절약용)."""
+        key = self._normalize_text_key(role_name)
+        if not key:
+            return []
+
+        scored: List[tuple[float, Dict[str, Any]]] = []
+        for u in (self._users or []):
+            if not isinstance(u, dict) or not u.get("id"):
+                continue
+            uname = self._normalize_text_key(u.get("username")) or ""
+            urole = self._normalize_text_key(u.get("role")) or ""
+            ualias = self._normalize_text_key(u.get("alias")) or ""
+            score = 0.0
+            for cand in (uname, urole, ualias):
+                if not cand:
+                    continue
+                if cand == key:
+                    score = max(score, 1.0)
+                elif cand in key or key in cand:
+                    score = max(score, 0.8)
+                elif any(tok and tok in cand for tok in (key[:3], key[-3:])) and len(key) >= 3:
+                    score = max(score, 0.5)
+            if score > 0:
+                scored.append((score, u))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        picked = [u for _, u in scored[:30]]
+
+        # if nothing matched, still provide top agents (helps LLM pick generic assignee)
+        if not picked:
+            picked = (self._agents or [])[:20]
+        # minimize fields
+        slim: List[Dict[str, Any]] = []
+        for u in picked:
+            if not isinstance(u, dict):
+                continue
+            slim.append(
+                {
+                    "id": str(u.get("id") or ""),
+                    "username": str(u.get("username") or ""),
+                    "role": str(u.get("role") or ""),
+                    "alias": str(u.get("alias") or ""),
+                    "is_agent": bool(u.get("is_agent") is True),
+                    "agent_type": str(u.get("agent_type") or ""),
+                }
+            )
+        return slim[:30]
+
+    async def _call_openai_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 1200,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """OpenAI 호출을 통해 JSON 객체를 반환(실패 시 None)."""
+        if not self.openai_client:
+            return None
+        try:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+
+            def _run():
+                # Prefer JSON mode when supported; fallback gracefully if SDK/model doesn't support it.
+                try:
+                    return self.openai_client.chat.completions.create(
+                        model=(model or self.openai_model),
+                        messages=messages,
+                        temperature=float(os.getenv("LLM_ASSIGNMENT_TEMPERATURE", "0.0")) if temperature is None else float(temperature),
+                        max_tokens=max_tokens,
+                        response_format={"type": "json_object"},
+                    )
+                except TypeError:
+                    return self.openai_client.chat.completions.create(
+                        model=(model or self.openai_model),
+                        messages=messages,
+                        temperature=float(os.getenv("LLM_ASSIGNMENT_TEMPERATURE", "0.0")) if temperature is None else float(temperature),
+                        max_tokens=max_tokens,
+                    )
+
+            resp = await asyncio.to_thread(_run)
+            content = (resp.choices[0].message.content or "").strip()
+            if not content:
+                return None
+            # strip code fences if present
+            m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", content, re.IGNORECASE)
+            if m:
+                content = m.group(1).strip()
+            return json.loads(content)
+        except Exception as e:
+            logger.warning(f"[WARN] OpenAI JSON call failed: {e}")
+            return None
+
+    def _extract_json_block_from_markdown(self, text: str) -> Optional[str]:
+        """LLM 응답에서 ``` ``` 코드블록(JSON)을 추출합니다."""
+        if not text:
+            return None
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+        if m:
+            return (m.group(1) or "").strip()
+        # fallback: try to find first '{'..last '}' span
+        s = text.find("{")
+        e = text.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            return text[s : e + 1].strip()
+        return None
+
+    async def _call_openai_process_definition(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 3500,
+    ) -> Optional[Dict[str, Any]]:
+        """프로세스 정의 생성용: 마크다운+코드블록 응답에서 JSON만 파싱."""
+        if not self.openai_client:
+            return None
+        try:
+            def _run():
+                return self.openai_client.chat.completions.create(
+                    model=self.process_definition_model,
+                    messages=messages,
+                    temperature=float(os.getenv("LLM_PROCESS_TEMPERATURE", "0.2")),
+                    max_tokens=max_tokens,
+                )
+            resp = await asyncio.to_thread(_run)
+            content = (resp.choices[0].message.content or "").strip()
+            json_block = self._extract_json_block_from_markdown(content) or ""
+            if not json_block:
+                return None
+            return json.loads(json_block)
+        except Exception as e:
+            logger.warning(f"[WARN] OpenAI process-definition call failed: {e}")
+            return None
+
+    async def _call_openai_json_messages(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 1200,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """OpenAI 호출을 통해 JSON 객체를 반환(메시지 배열 직접 전달)."""
+        if not self.openai_client:
+            return None
+        try:
+            def _run():
+                # Prefer JSON mode when supported; fallback gracefully if SDK/model doesn't support it.
+                try:
+                    return self.openai_client.chat.completions.create(
+                        model=(model or self.openai_model),
+                        messages=messages,
+                        temperature=float(os.getenv("LLM_ASSIGNMENT_TEMPERATURE", "0.0")) if temperature is None else float(temperature),
+                        max_tokens=max_tokens,
+                        response_format={"type": "json_object"},
+                    )
+                except TypeError:
+                    return self.openai_client.chat.completions.create(
+                        model=(model or self.openai_model),
+                        messages=messages,
+                        temperature=float(os.getenv("LLM_ASSIGNMENT_TEMPERATURE", "0.0")) if temperature is None else float(temperature),
+                        max_tokens=max_tokens,
+                    )
+
+            resp = await asyncio.to_thread(_run)
+            content = (resp.choices[0].message.content or "").strip()
+            if not content:
+                return None
+            m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", content, re.IGNORECASE)
+            if m:
+                content = m.group(1).strip()
+            return json.loads(content)
+        except Exception as e:
+            logger.warning(f"[WARN] OpenAI JSON(messages) call failed: {e}")
+            return None
+
+    async def _generate_process_outline_via_consulting_prompt(
+        self,
+        *,
+        process_name: str,
+        user_request: str,
+        extracted: Dict[str, Any],
+        hints_simplified: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """
+        (프롬프트 개선) ProcessConsultingGenerator.js 시스템 프롬프트를 그대로 사용해
+        '말로 된 프로세스 초안'을 먼저 생성합니다.
+        - 출력(JSON)은 {content, answerType} 구조를 기대합니다.
+        - 반환값은 content(markdown)만 추출합니다.
+        """
+        if not self.openai_client:
+            return None
+
+        system_consulting = get_process_consulting_system_prompt()
+        system_guard = (
+            "위 시스템 지시를 그대로 따르되, 이 호출에서는 고객에게 추가 질문을 하지 말고\n"
+            "반드시 아래 JSON 형식으로만 응답하세요(JSON only, code fence 금지):\n"
+            '{ "content": "...", "answerType": "consulting" }\n'
+            "- content에는 '프로세스 초안'을 반드시 1. 2. 3. 번호 목록으로 작성하고, 흐름은 → 를 사용하세요.\n"
+        )
+
+        payload = {
+            "process_name": process_name,
+            "user_request": user_request,
+            "extracted": extracted,
+            "assignment_hints": hints_simplified or {},
+        }
+        user_prompt = (
+            "아래 정보를 바탕으로 사용자가 만들고자 하는 비즈니스 프로세스의 **초안**을 작성하세요.\n"
+            "- 시스템/도구/프로그램을 무엇을 쓰는지 묻지 마세요.\n"
+            "- 답변은 JSON만 반환해야 합니다.\n\n"
+            f"{json.dumps(payload, ensure_ascii=False)}\n"
+        )
+
+        obj = await self._call_openai_json_messages(
+            messages=[
+                {"role": "system", "content": system_consulting},
+                {"role": "system", "content": system_guard},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=900,
+            model=self.process_definition_model,
+            temperature=float(os.getenv("LLM_PROCESS_TEMPERATURE", "0.2")),
+        )
+        if not isinstance(obj, dict):
+            return None
+        content = str(obj.get("content") or "").strip()
+        return content or None
+
+    def _generate_bpmn_xml_backend(
+        self,
+        *,
+        model: Dict[str, Any],
+        horizontal: Optional[bool] = None,
+    ) -> Optional[str]:
+        """백엔드에서 ProcessGPTBPMNXmlGenerator로 BPMN XML 생성."""
+        try:
+            return self._processgpt_bpmn_xml_generator.create_bpmn_xml(model, horizontal=horizontal)
+        except Exception as e:
+            logger.warning(f"[WARN] BPMN xml generation failed: {e}")
+            return None
+
+    def _elements_model_to_runtime_definition(self, elements_model: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        ProcessDefinitionGenerator(elements 기반) 출력 → proc_def.definition(activities/events/gateways/sequences 기반)으로 변환.
+        (폼 생성/실행/UI 호환을 위해 런타임 구조를 사용)
+        """
+        out: Dict[str, Any] = {}
+        for k in ("megaProcessId", "majorProcessId", "processDefinitionName", "processDefinitionId", "description", "isHorizontal"):
+            if k in elements_model:
+                out[k] = elements_model.get(k)
+
+        out["data"] = elements_model.get("data") or []
+        out["roles"] = elements_model.get("roles") or []
+        out["events"] = []
+        out["activities"] = []
+        out["gateways"] = []
+        out["sequences"] = []
+        out["subProcesses"] = elements_model.get("subProcesses") or []
+        out["participants"] = elements_model.get("participants") or []
+
+        elems = elements_model.get("elements") or []
+        if not isinstance(elems, list):
+            return out
+
+        def gw_type_map(t: str) -> str:
+            t = (t or "").strip()
+            if t.lower() in ("exclusivegateway", "exclusive_gateway"):
+                return "exclusiveGateway"
+            if t.lower() in ("parallelgateway", "parallel_gateway"):
+                return "parallelGateway"
+            if t.lower() in ("inclusivegateway", "inclusive_gateway"):
+                return "inclusiveGateway"
+            return t or "exclusiveGateway"
+
+        for e in elems:
+            if not isinstance(e, dict):
+                continue
+            et = str(e.get("elementType") or "").strip()
+            if et.lower() == "event":
+                t = str(e.get("type") or "").strip()
+                if t == "StartEvent":
+                    rt = "startEvent"
+                elif t == "EndEvent":
+                    rt = "endEvent"
+                else:
+                    rt = "intermediateCatchEvent"
+                out["events"].append(
+                    {
+                        "id": e.get("id"),
+                        "name": e.get("name") or "",
+                        "role": e.get("role") or "",
+                        "type": rt,
+                        "process": out.get("processDefinitionId") or "",
+                        "properties": "{}",
+                        "description": e.get("description") or "",
+                        "trigger": e.get("trigger") or "",
+                    }
+                )
+            elif et.lower() == "activity":
+                # element.type is "UserActivity" in ProcessGPT mode
+                out["activities"].append(
+                    {
+                        "id": e.get("id"),
+                        "name": e.get("name") or "",
+                        "role": e.get("role") or "",
+                        "tool": e.get("tool") or "",
+                        "type": "userTask",
+                        "process": out.get("processDefinitionId") or "",
+                        "duration": int(e.get("duration") or 5) if str(e.get("duration") or "").isdigit() else 5,
+                        "inputData": e.get("inputData") or [],
+                        "outputData": e.get("outputData") or [],
+                        "properties": "{}",
+                        "description": e.get("description") or "",
+                        "instruction": e.get("instruction") or "",
+                        "attachedEvents": None,
+                        # agent fields will be filled later
+                        "agent": None,
+                        "agentMode": "none",
+                        "orchestration": None,
+                        "attachments": [],
+                        "checkpoints": e.get("checkpoints") or [],
+                    }
+                )
+            elif et.lower() == "gateway":
+                out["gateways"].append(
+                    {
+                        "id": e.get("id"),
+                        "name": e.get("name") or "",
+                        "role": e.get("role") or "",
+                        "type": gw_type_map(str(e.get("type") or "")),
+                        "process": out.get("processDefinitionId") or "",
+                        "condition": "",
+                        "properties": "{}",
+                        "description": e.get("description") or "",
+                    }
+                )
+            elif et.lower() == "sequence":
+                out["sequences"].append(
+                    {
+                        "id": e.get("id"),
+                        "name": e.get("name") or "",
+                        "source": e.get("source"),
+                        "target": e.get("target"),
+                        "condition": e.get("condition") or "",
+                        "properties": "{}",
+                    }
+                )
+
+        return out
+
+    def _simplify_assignment_hints(self, hints: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        (t2) 역할/유저 매핑 결과를 프롬프트/로그/저장에 쓰기 좋은 "간소화 JSON"으로 변환.
+
+        Shape:
+          {
+            "roles": {
+              "<roleName>": {"endpoint": "<id or ''>", "default": "<id or ''>", "origin": "..."}
+            },
+            "activities": {
+              "<activityId>": {"role": "...", "agent": "<userId or ''>", "agentMode": "draft|none", "orchestration": "crewai-action|"}
+            }
+          }
+        """
+        roles_out: Dict[str, Any] = {}
+        acts_out: Dict[str, Any] = {}
+
+        for r in (hints.get("roles") or []):
+            if not isinstance(r, dict):
+                continue
+            name = str(r.get("name") or "").strip()
+            if not name:
+                continue
+            endpoint = ""
+            default = ""
+            ep = r.get("endpoint")
+            df = r.get("default")
+            if isinstance(ep, list) and ep:
+                endpoint = str(ep[0])
+            elif isinstance(ep, str):
+                endpoint = ep
+            if isinstance(df, list) and df:
+                default = str(df[0])
+            elif isinstance(df, str):
+                default = df
+            roles_out[name] = {
+                "endpoint": endpoint,
+                "default": default,
+                "origin": str(r.get("origin") or ""),
+            }
+
+        for a in (hints.get("activities") or []):
+            if not isinstance(a, dict):
+                continue
+            aid = str(a.get("id") or "").strip()
+            if not aid:
+                continue
+            acts_out[aid] = {
+                "role": str(a.get("role") or "").strip(),
+                "agent": str(a.get("agent") or "").strip(),
+                "agentMode": str(a.get("agentMode") or "").strip(),
+                "orchestration": str(a.get("orchestration") or "").strip(),
+            }
+
+        return {"roles": roles_out, "activities": acts_out}
+
+    def _snake_id(self, s: str) -> str:
+        s = str(s or "").strip().lower()
+        s = re.sub(r"[^a-z0-9_]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return s
+
+    def _validate_and_normalize_elements_model(
+        self,
+        elements_model: Dict[str, Any],
+        *,
+        process_name: str,
+    ) -> Dict[str, Any]:
+        """
+        (t3) LLM 결과(elements 모델)를 더 엄격히 검증/정규화하여:
+        - 끊긴 연결선/누락된 source/target을 복구
+        - ids/elementType/type 등을 표준화
+        - Activity의 outputData/tool 등 런타임/레이아웃에 필요한 최소 필드를 보정
+
+        NOTE:
+        - 비즈니스 내용을 새로 창작하지 않되, "기술적 필수 요소" (start/end, sequence 연결, 필수 필드) 보정은 허용.
+        """
+        m = dict(elements_model or {})
+
+        # Ensure required identifiers
+        m.setdefault("processDefinitionName", process_name)
+        if not str(m.get("processDefinitionId") or "").strip():
+            safe_id = self._snake_id(process_name or "process")
+            m["processDefinitionId"] = f"{safe_id}_{uuid.uuid4().hex[:6]}"
+
+        # Normalize elements list
+        elems_raw = m.get("elements") or []
+        elems: List[Dict[str, Any]] = []
+        if isinstance(elems_raw, list):
+            elems = [e for e in elems_raw if isinstance(e, dict)]
+        elif isinstance(elems_raw, dict):
+            elems = [e for e in elems_raw.values() if isinstance(e, dict)]
+        else:
+            elems = []
+
+        # Normalize elementType casing & types
+        def norm_element_type(et: str) -> str:
+            t = (et or "").strip().lower()
+            if t == "event":
+                return "Event"
+            if t == "sequence":
+                return "Sequence"
+            if t == "activity":
+                return "Activity"
+            if t == "gateway":
+                return "Gateway"
+            return et or ""
+
+        # First pass: normalize ids (build mapping old->new)
+        id_map: Dict[str, str] = {}
+        for idx, e in enumerate(elems):
+            et = norm_element_type(str(e.get("elementType") or ""))
+            e["elementType"] = et
+            if et == "Sequence":
+                continue
+            old = str(e.get("id") or "").strip()
+            if not old:
+                # generate deterministic-ish id by type
+                base = "event" if et == "Event" else "gateway" if et == "Gateway" else "activity"
+                old = f"{base}_{idx+1}"
+            new = self._snake_id(old)
+            if not new:
+                new = f"node_{idx+1}"
+            # ensure uniqueness
+            if new in id_map.values():
+                new = f"{new}_{uuid.uuid4().hex[:4]}"
+            id_map[old] = new
+            e["id"] = new
+
+            # normalize event/activity/gateway type value
+            if et == "Event":
+                t = str(e.get("type") or "").strip()
+                t_low = t.lower()
+                if t_low in ("startevent", "start_event", "start"):
+                    e["type"] = "StartEvent"
+                elif t_low in ("endevent", "end_event", "end"):
+                    e["type"] = "EndEvent"
+                elif t:
+                    # keep as-is but enforce Pascal-ish (fallback to IntermediateCatchEvent)
+                    e["type"] = t if t[0].isupper() else "IntermediateCatchEvent"
+                else:
+                    e["type"] = "IntermediateCatchEvent"
+            elif et == "Activity":
+                # ProcessGPT only supports UserActivity
+                e["type"] = "UserActivity"
+
+                # required-ish fields for stability
+                e.setdefault("name", f"활동 {idx+1}")
+                if not isinstance(e.get("inputData"), list):
+                    e["inputData"] = []
+                if not isinstance(e.get("outputData"), list):
+                    e["outputData"] = []
+                if not e["outputData"]:
+                    # 최소 1개는 필요 (프롬프트 규칙 + 실행/폼 안정성)
+                    an = str(e.get("name") or "").strip()
+                    e["outputData"] = [f"{an} 결과" if an else "결과"]
+                e.setdefault("checkpoints", [])
+                if not isinstance(e.get("checkpoints"), list):
+                    e["checkpoints"] = []
+                # tool은 런타임 변환에서 채워지지만, elements 모델에도 있으면 일관성 도움
+                if not str(e.get("tool") or "").strip():
+                    safe_pid = self._snake_id(str(m.get("processDefinitionId") or "process"))
+                    safe_aid = self._snake_id(str(e.get("id") or "activity"))
+                    e["tool"] = f"formHandler:{safe_pid}_{safe_aid}_form"
+                # duration
+                try:
+                    d = int(e.get("duration") or 5)
+                except Exception:
+                    d = 5
+                e["duration"] = d
+            elif et == "Gateway":
+                gt = str(e.get("type") or "").strip()
+                gt_low = gt.lower()
+                if gt_low in ("exclusivegateway", "exclusive_gateway"):
+                    e["type"] = "ExclusiveGateway"
+                elif gt_low in ("parallelgateway", "parallel_gateway"):
+                    e["type"] = "ParallelGateway"
+                elif gt_low in ("inclusivegateway", "inclusive_gateway"):
+                    e["type"] = "InclusiveGateway"
+                else:
+                    e["type"] = gt or "ExclusiveGateway"
+
+            # normalize source pointer if present
+            if e.get("source"):
+                e["source"] = id_map.get(str(e.get("source")), self._snake_id(str(e.get("source"))))
+
+        # Second pass: normalize sequences, fix source/target and create missing sequences from 'source' pointers
+        node_ids = {str(e.get("id")) for e in elems if e.get("elementType") != "Sequence" and e.get("id")}
+        seq_pairs: Set[Tuple[str, str]] = set()
+        seqs: List[Dict[str, Any]] = []
+
+        # helper: find prev/next node id in element order
+        node_order: List[str] = [str(e.get("id")) for e in elems if e.get("elementType") != "Sequence" and e.get("id")]
+        for i, e in enumerate(elems):
+            if e.get("elementType") != "Sequence":
+                continue
+            s = str(e.get("source") or "").strip()
+            t = str(e.get("target") or "").strip()
+            # remap
+            s = id_map.get(s, self._snake_id(s)) if s else ""
+            t = id_map.get(t, self._snake_id(t)) if t else ""
+
+            # infer from surrounding nodes if missing
+            if (not s) or (not t) or (s not in node_ids) or (t not in node_ids):
+                # find nearest prev/next node in elems list
+                prev_node = ""
+                next_node = ""
+                for j in range(i - 1, -1, -1):
+                    if elems[j].get("elementType") != "Sequence" and elems[j].get("id"):
+                        prev_node = str(elems[j].get("id"))
+                        break
+                for j in range(i + 1, len(elems)):
+                    if elems[j].get("elementType") != "Sequence" and elems[j].get("id"):
+                        next_node = str(elems[j].get("id"))
+                        break
+                if not s and prev_node:
+                    s = prev_node
+                if not t and next_node:
+                    t = next_node
+
+            if not s or not t or s == t or (s not in node_ids) or (t not in node_ids):
+                continue
+
+            e["source"] = s
+            e["target"] = t
+            if not str(e.get("id") or "").strip():
+                e["id"] = f"seq_{uuid.uuid4().hex[:8]}"
+            else:
+                e["id"] = self._snake_id(str(e.get("id")))
+            e.setdefault("name", "")
+            e.setdefault("condition", "")
+            seq_pairs.add((s, t))
+            seqs.append(e)
+
+        # create sequences from explicit 'source' pointers on nodes if missing
+        for e in elems:
+            if e.get("elementType") == "Sequence":
+                continue
+            src = str(e.get("source") or "").strip()
+            tid = str(e.get("id") or "").strip()
+            if src and tid and (src, tid) not in seq_pairs and src in node_ids and tid in node_ids and src != tid:
+                seqs.append(
+                    {
+                        "elementType": "Sequence",
+                        "id": f"seq_{src}_{tid}",
+                        "name": "",
+                        "source": src,
+                        "target": tid,
+                        "condition": "",
+                    }
+                )
+                seq_pairs.add((src, tid))
+
+        # Ensure start/end exist (technical requirement)
+        has_start = any(e.get("elementType") == "Event" and e.get("type") == "StartEvent" for e in elems)
+        has_end = any(e.get("elementType") == "Event" and e.get("type") == "EndEvent" for e in elems)
+        if not has_start:
+            sid = f"start_{uuid.uuid4().hex[:6]}"
+            elems.insert(
+                0,
+                {
+                    "elementType": "Event",
+                    "id": sid,
+                    "name": "프로세스 시작",
+                    "role": (m.get("roles") or [{}])[0].get("name") if isinstance(m.get("roles"), list) and m.get("roles") else "",
+                    "source": "",
+                    "type": "StartEvent",
+                    "description": "",
+                    "trigger": "",
+                },
+            )
+            node_order.insert(0, sid)
+            node_ids.add(sid)
+        if not has_end:
+            eid = f"end_{uuid.uuid4().hex[:6]}"
+            elems.append(
+                {
+                    "elementType": "Event",
+                    "id": eid,
+                    "name": "프로세스 종료",
+                    "role": (m.get("roles") or [{}])[-1].get("name") if isinstance(m.get("roles"), list) and m.get("roles") else "",
+                    "source": "",
+                    "type": "EndEvent",
+                    "description": "",
+                    "trigger": "",
+                }
+            )
+            node_order.append(eid)
+            node_ids.add(eid)
+
+        # Recompute node order after potential insertions (exclude sequences)
+        node_order = [str(e.get("id")) for e in elems if e.get("elementType") != "Sequence" and e.get("id")]
+
+        # Connectivity repair: ensure every consecutive node is connected (fallback chain)
+        for i in range(len(node_order) - 1):
+            s = node_order[i]
+            t = node_order[i + 1]
+            if not s or not t or s == t:
+                continue
+            if (s, t) in seq_pairs:
+                continue
+            seqs.append(
+                {
+                    "elementType": "Sequence",
+                    "id": f"seq_{s}_{t}",
+                    "name": "",
+                    "source": s,
+                    "target": t,
+                    "condition": "",
+                }
+            )
+            seq_pairs.add((s, t))
+
+        # Gateway branching: ensure conditions exist when a gateway has multiple outgoing.
+        # Also: remove degenerate gateways (<=1 outgoing) by collapsing them into straight sequences.
+        outgoing_by_source: Dict[str, List[Dict[str, Any]]] = {}
+        incoming_by_target: Dict[str, List[Dict[str, Any]]] = {}
+        for s in seqs:
+            outgoing_by_source.setdefault(str(s.get("source")), []).append(s)
+            incoming_by_target.setdefault(str(s.get("target")), []).append(s)
+
+        gateway_ids = {str(e.get("id")) for e in elems if e.get("elementType") == "Gateway" and e.get("id")}
+
+        removed_gateway_ids: Set[str] = set()
+        if gateway_ids:
+            # collapse single-branch gateways: connect incoming.source -> outgoing.target and remove gateway node/sequences
+            for gid in list(gateway_ids):
+                outs = outgoing_by_source.get(gid) or []
+                if len(outs) >= 2:
+                    continue
+                ins = incoming_by_target.get(gid) or []
+                out_target = str(outs[0].get("target")) if outs else ""
+                for inc in ins:
+                    src = str(inc.get("source") or "")
+                    if src and out_target and src != out_target and (src, out_target) not in seq_pairs:
+                        seqs.append(
+                            {
+                                "elementType": "Sequence",
+                                "id": f"seq_{src}_{out_target}",
+                                "name": "",
+                                "source": src,
+                                "target": out_target,
+                                "condition": "",
+                            }
+                        )
+                        seq_pairs.add((src, out_target))
+                removed_gateway_ids.add(gid)
+
+            if removed_gateway_ids:
+                seqs = [
+                    s
+                    for s in seqs
+                    if str(s.get("source")) not in removed_gateway_ids and str(s.get("target")) not in removed_gateway_ids
+                ]
+                elems = [
+                    e
+                    for e in elems
+                    if not (e.get("elementType") == "Gateway" and str(e.get("id")) in removed_gateway_ids)
+                ]
+                gateway_ids = {str(e.get("id")) for e in elems if e.get("elementType") == "Gateway" and e.get("id")}
+
+        # recompute outgoing after collapse
+        outgoing_by_source = {}
+        for s in seqs:
+            outgoing_by_source.setdefault(str(s.get("source")), []).append(s)
+
+        for gid in gateway_ids:
+            outs = outgoing_by_source.get(gid) or []
+            if len(outs) <= 1:
+                continue
+            for j, s in enumerate(outs, start=1):
+                cond = str(s.get("condition") or "").strip()
+                if not cond:
+                    s["condition"] = f"조건 {j}"
+
+        # Merge normalized elements list: keep non-seq + normalized seqs at end (stable parsing)
+        non_seq = [e for e in elems if e.get("elementType") != "Sequence"]
+        m["elements"] = non_seq + seqs
+        return m
+
+    async def _prepare_assignment_hints_from_extraction(
+        self,
+        *,
+        tenant_id: str,
+        process_name: str,
+        extracted: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        (유저 생성/지정 LLM) 단계:
+        - Neo4j 추출정보(roles/tasks)를 보고 role별 endpoint/default(사용자/에이전트)와
+          activity별 담당 role 힌트를 만든다.
+        - 필요 시 에이전트 자동 생성(users insert) + 조직도 반영까지 수행.
+        """
+        await self._load_org_and_agents(tenant_id)
+
+        # Extract role names from extraction
+        role_names: List[str] = []
+        roles = extracted.get("roles") or []
+        if isinstance(roles, list):
+            for r in roles:
+                if isinstance(r, dict):
+                    rn = str(r.get("name") or r.get("role_name") or "").strip()
+                    if rn and rn not in role_names:
+                        role_names.append(rn)
+
+        tasks = extracted.get("tasks") or extracted.get("activities") or []
+        if isinstance(tasks, list):
+            for t in tasks:
+                if isinstance(t, dict):
+                    rn = str(t.get("role_name") or t.get("role") or "").strip()
+                    if rn and rn not in role_names:
+                        role_names.append(rn)
+
+        hints_roles: List[Dict[str, Any]] = []
+
+        # Cache by id for quick lookup
+        users_by_id = {str(u.get("id")): u for u in (self._users or []) if isinstance(u, dict) and u.get("id")}
+
+        for rn in role_names:
+            # 1) existing agent/user by name
+            u = self._pick_user_for_role(rn)
+            if u and u.get("id"):
+                uid = str(u.get("id"))
+                # roles.default/endpoint should be array when user id is used (frontend supports both)
+                hints_roles.append(
+                    {
+                        "name": rn,
+                        "default": [uid],
+                        "endpoint": [uid],
+                        "origin": "used",
+                    }
+                )
+                continue
+
+            # 2) existing team
+            team_id = (self._org_teams_by_name or {}).get(self._normalize_text_key(rn))
+            if team_id:
+                hints_roles.append(
+                    {
+                        "name": rn,
+                        "default": [],
+                        "endpoint": [team_id],
+                        "origin": "used",
+                    }
+                )
+                continue
+
+            # 3) LLM-based: recommend/possibly create agent
+            rec = await self._llm_recommend_assignee(
+                tenant_id=tenant_id,
+                process_name=process_name,
+                role_name=rn,
+                activities_context=[],
+            )
+            if isinstance(rec, dict) and str(rec.get("action") or "") == "create_agent" and self._enable_auto_agent_creation:
+                create_agent = rec.get("create_agent") or {}
+                team_id_for_new = str(create_agent.get("team_id") or rec.get("target_team_id") or "").strip()
+                team_name = self._org_team_name_by_id.get(team_id_for_new) or "미분류"
+                user_input = str(create_agent.get("user_input") or "").strip() or f"역할 '{rn}' 업무를 수행할 에이전트를 생성해주세요."
+                mcp_tools = self._safe_json_loads(os.getenv("MCP_TOOLS_JSON", "")) or {}
+                agent_profile = await self._llm_generate_agent_profile(
+                    team_name=team_name,
+                    user_input=user_input,
+                    mcp_tools=mcp_tools,
+                )
+                created = None
+                if agent_profile:
+                    created = await self._insert_agent_user(
+                        tenant_id=tenant_id,
+                        agent_profile=agent_profile,
+                        agent_type=str(create_agent.get("agent_type") or "agent"),
+                    )
+                if created and created.get("id"):
+                    if team_id_for_new:
+                        await self._update_org_chart_add_member(
+                            tenant_id=tenant_id,
+                            team_id=team_id_for_new,
+                            member_user=created,
+                        )
+                    uid = str(created.get("id"))
+                    users_by_id[uid] = created
+                    hints_roles.append(
+                        {
+                            "name": rn,
+                            "default": [uid],
+                            "endpoint": [uid],
+                            "origin": "created",
+                        }
+                    )
+                    continue
+
+            # fallback: created team role without assignee
+            hints_roles.append({"name": rn, "default": [], "endpoint": [], "origin": "created"})
+
+        # Activity hints: role + optional agent id if role endpoint resolves to an agent
+        hints_activities: List[Dict[str, Any]] = []
+        role_to_agent_id: Dict[str, Optional[str]] = {}
+        for r in hints_roles:
+            if not isinstance(r, dict):
+                continue
+            rn = str(r.get("name") or "").strip()
+            endpoint = r.get("endpoint") or []
+            if isinstance(endpoint, list) and endpoint:
+                eid = str(endpoint[0])
+                u = users_by_id.get(eid)
+                if u and u.get("is_agent") is True:
+                    role_to_agent_id[rn] = eid
+                else:
+                    role_to_agent_id[rn] = None
+            else:
+                role_to_agent_id[rn] = None
+
+        if isinstance(tasks, list):
+            for t in tasks:
+                if not isinstance(t, dict):
+                    continue
+                tid = str(t.get("task_id") or t.get("id") or t.get("name") or "").strip()
+                tname = str(t.get("name") or "").strip()
+                rn = str(t.get("role_name") or t.get("role") or "").strip()
+                agent_id = role_to_agent_id.get(rn)
+                hints_activities.append(
+                    {
+                        "id": tid,
+                        "name": tname,
+                        "role": rn,
+                        "agent": agent_id,
+                        "agentMode": "draft" if agent_id else "none",
+                        "orchestration": "crewai-action" if agent_id else None,
+                    }
+                )
+
+        hints = {"roles": hints_roles, "activities": hints_activities}
+        hints["simplified"] = self._simplify_assignment_hints(hints)
+        return hints
+
+    async def _generate_processgpt_definition_and_bpmn(
+        self,
+        *,
+        tenant_id: str,
+        process_name: str,
+        extracted: Dict[str, Any],
+        user_request: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        (프로세스 생성 LLM) 단계:
+        - 프론트 ProcessDefinitionGenerator 프롬프트와 동일한 규칙을 사용해 elements 모델 생성
+        - 백엔드 ProcessGPTBPMNXmlGenerator로 XML 생성
+        - proc_def.definition(런타임) 구조로 변환하여 함께 반환
+        """
+        if not self.openai_client:
+            return None
+
+        # 1) user mapping first (hints)
+        hints = await self._prepare_assignment_hints_from_extraction(
+            tenant_id=tenant_id,
+            process_name=process_name,
+            extracted=extracted,
+        )
+        hints_simplified = hints.get("simplified") if isinstance(hints, dict) else {}
+
+        # 1.5) (프롬프트 개선) ProcessConsultingGenerator 프롬프트로 "말로 된 프로세스 초안"을 먼저 생성
+        consulting_outline = await self._generate_process_outline_via_consulting_prompt(
+            process_name=process_name,
+            user_request=user_request,
+            extracted=extracted,
+            hints_simplified=hints_simplified if isinstance(hints_simplified, dict) else {},
+        )
+
+        # 2) build system prompt (100% identical target: ProcessDefinitionGenerator.js, ProcessGPT mode)
+        # NOTE: In ProcessGPT backend, external system list is empty (frontend returns []).
+        system_prompt = build_system_prompt_processgpt(
+            external_systems=[],
+            organization_chart=self._org_chart or {},
+            process_definition_map={},
+            existing_process_definition={},
+            strategy={},
+        )
+
+        # 4) extracted info summary + user request
+        extracted_summary = {
+            "process_name": process_name,
+            "extracted": extracted,
+        }
+        messages = build_process_definition_messages(
+            base_system_prompt=system_prompt,
+            hints_simplified=hints_simplified if isinstance(hints_simplified, dict) else {},
+            consulting_outline=consulting_outline,
+            extracted_summary=extracted_summary,
+            user_request=user_request,
+        )
+
+        elements_model = await self._call_openai_process_definition(messages=messages)
+        if not isinstance(elements_model, dict):
+            return None
+
+        # 5) Strict validate/normalize elements model (connectivity + ids + required fields)
+        elements_model = self._validate_and_normalize_elements_model(elements_model, process_name=process_name)
+
+        # 6) Convert to runtime definition + enrich + assignment(again, as safety)
+        runtime_def = self._elements_model_to_runtime_definition(elements_model)
+        runtime_def = self._enrich_process_definition(
+            runtime_def,
+            process_name=str(runtime_def.get("processDefinitionName") or process_name),
+            process_definition_id=str(runtime_def.get("processDefinitionId") or elements_model.get("processDefinitionId")),
+        )
+        try:
+            await self._apply_assignment_and_maybe_create_agents(
+                proc_json=runtime_def,
+                tenant_id=tenant_id,
+                process_name=str(runtime_def.get("processDefinitionName") or process_name),
+            )
+        except Exception as e:
+            logger.warning(f"[WARN] assignment apply failed (post-process): {e}")
+
+        # (t2) store simplified mapping into runtime definition (for debugging/prompt reuse)
+        try:
+            runtime_def["roleUserMappingSimplified"] = self._simplify_assignment_hints(
+                {"roles": runtime_def.get("roles") or [], "activities": runtime_def.get("activities") or []}
+            )
+        except Exception:
+            runtime_def["roleUserMappingSimplified"] = {"roles": {}, "activities": {}}
+
+        # 7) Generate BPMN XML in backend (no frontend dependency)
+        bpmn_xml = await asyncio.to_thread(
+            self._generate_bpmn_xml_backend,
+            model=elements_model,
+            horizontal=elements_model.get("isHorizontal"),
+        )
+        if not bpmn_xml:
+            return None
+
+        return {"elements_model": elements_model, "definition": runtime_def, "bpmn_xml": bpmn_xml}
+
+    async def _llm_recommend_assignee(
+        self,
+        *,
+        tenant_id: str,
+        process_name: str,
+        role_name: str,
+        activities_context: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        LLM으로 역할 담당자(기존 user/agent 또는 팀) 추천.
+        반환 예시:
+          {
+            "action": "existing_user"|"team"|"create_agent"|"none",
+            "target_user_id": "...",
+            "target_team_id": "...",
+            "confidence": 0.0-1.0,
+            "reason": "...",
+            "create_agent": { ... }  # action=create_agent일 때만
+          }
+        """
+        if not (self._enable_llm_role_mapping and self.openai_client and self.openai_api_key):
+            return None
+
+        # role_name can include hard line breaks from PDF OCR; normalize to keep matching stable
+        role_name_clean = " ".join(str(role_name or "").split())
+        cache_key = self._normalize_text_key(role_name_clean)
+        if cache_key and cache_key in self._role_assignment_cache:
+            return self._role_assignment_cache.get(cache_key)
+
+        candidates_users = self._get_user_candidates(role_name_clean)
+        candidates_teams = self._get_org_team_candidates(role_name_clean)
+
+        # also provide team members for candidate teams
+        team_members: Dict[str, List[Dict[str, Any]]] = {}
+        users_by_id = {str(u.get("id")): u for u in (self._users or []) if isinstance(u, dict) and u.get("id")}
+        for t in candidates_teams:
+            tid = str(t.get("team_id") or "")
+            if not tid:
+                continue
+            mids = (self._org_members_by_team_id or {}).get(tid) or []
+            mlist: List[Dict[str, Any]] = []
+            for mid in mids[:30]:
+                u = users_by_id.get(str(mid))
+                if not u:
+                    continue
+                mlist.append(
+                    {
+                        "id": str(u.get("id") or ""),
+                        "username": str(u.get("username") or ""),
+                        "role": str(u.get("role") or ""),
+                        "is_agent": bool(u.get("is_agent") is True),
+                        "agent_type": str(u.get("agent_type") or ""),
+                        "alias": str(u.get("alias") or ""),
+                    }
+                )
+            if mlist:
+                team_members[tid] = mlist
+
+        system_prompt = (
+            "당신은 BPM 프로세스 정의에서 '역할(Role)'을 시스템의 실제 담당자(User/Agent) 또는 팀(조직도)으로 매핑하는 전문가입니다.\n"
+            "중요 규칙:\n"
+            "- existing_user/team을 선택하는 경우에는 반드시 제공된 후보 목록(users/teams/team_members) 안에서만 선택해야 합니다.\n"
+            "- create_agent는 후보에 적절한 담당자가 없을 때 선택할 수 있으며, team_id는 비어있어도 됩니다.\n"
+            "- create_agent를 선택하는 경우, 생성될 에이전트는 **너무 단일 태스크 전용으로 쪼개지지 않도록** '중간 정도 범위(상세도 6/10)'로 설계하세요.\n"
+            "  예: '수강 신청 도우미', '수강 관리 도우미', '강의 개설 도우미'처럼 과도하게 세분화하지 말고, 가능하면 '교육/수강 운영 도우미'처럼 관련 업무를 포괄하세요.\n"
+            "- 확신이 낮으면 none을 반환하세요.\n"
+            "- 'create_agent'는 자동화 가능성이 높고(정보수집/검증/정리/작성/조회/계산 등) 에이전트가 수행 가능한 작업일 때만 추천하세요.\n"
+            "- create_agent를 추천하더라도, 실제 생성은 ENABLE_AUTO_AGENT_CREATION 설정에 따라 진행될 수 있습니다.\n"
+            "- 출력은 JSON ONLY 입니다.\n"
+        )
+
+        user_prompt = (
+            f"테넌트: {tenant_id}\n"
+            f"프로세스: {process_name}\n"
+            f"매핑할 역할명: {role_name_clean}\n\n"
+            f"이 역할이 수행하는 태스크 컨텍스트(요약):\n{json.dumps(activities_context[:15], ensure_ascii=False)}\n\n"
+            f"users 후보(최대 30, agents 포함):\n{json.dumps(candidates_users, ensure_ascii=False)}\n\n"
+            f"teams 후보(최대 30):\n{json.dumps(candidates_teams, ensure_ascii=False)}\n\n"
+            f"team_members(팀별 멤버/에이전트 후보, 없을 수 있음):\n{json.dumps(team_members, ensure_ascii=False)}\n\n"
+            "다음 JSON 형식으로만 응답하세요:\n"
+            "{\n"
+            '  "action": "existing_user" | "team" | "create_agent" | "none",\n'
+            '  "target_user_id": "existing_user일 때만. users 후보의 id",\n'
+            '  "target_team_id": "team/create_agent일 때 권장. teams 후보의 team_id (없으면 빈 문자열 가능)",\n'
+            '  "confidence": 0.0,  // 0~1 숫자 (반드시 숫자)\n'
+            '  "reason": "한두 문장 근거",\n'
+            '  "create_agent": {\n'
+            '    "team_id": "생성 에이전트를 소속시킬 team_id (가능하면, 없으면 빈 문자열)",\n'
+            '    "user_input": "OrganizationAgentGenerator에 넣을 사용자 요구사항(한국어, 3~6문장). 단일 태스크 전용이 아니라 관련 업무를 포괄하는 중간 범위(6/10)로 작성",\n'
+            '    "agent_type": "agent" \n'
+            '  }\n'
+            "}\n"
+        )
+
+        logger.info(
+            f"[ASSIGN] recommend role={role_name_clean!r} candidates: users={len(candidates_users)} teams={len(candidates_teams)} team_members={len(team_members)}"
+        )
+        obj = await self._call_openai_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=900,
+            model=self.user_mapping_model,
+            temperature=float(os.getenv("LLM_ASSIGNMENT_TEMPERATURE", "0.0")),
+        )
+        if not isinstance(obj, dict):
+            return None
+
+        # basic validation + threshold
+        conf = obj.get("confidence")
+        try:
+            conf_f = float(conf)
+        except Exception:
+            conf_f = 0.0
+            logger.warning(f"[ASSIGN] role={role_name_clean!r} LLM response missing/invalid confidence. keys={list(obj.keys())}")
+        if conf_f < self._llm_assignment_min_conf:
+            prev_action = str(obj.get("action") or "")
+            # do not block create_agent purely by confidence: if model explicitly requests creation,
+            # let downstream creation pipeline decide (it can still fail safely).
+            if str(obj.get("action") or "") != "create_agent":
+                obj["action"] = "none"
+                logger.info(
+                    f"[ASSIGN] role={role_name_clean!r} LLM confidence {conf_f:.2f} < {self._llm_assignment_min_conf:.2f} -> action forced to none (was {prev_action!r})"
+                )
+
+        if cache_key:
+            self._role_assignment_cache[cache_key] = obj
+        return obj
+
+    async def _llm_generate_agent_profile(
+        self,
+        *,
+        team_name: str,
+        user_input: str,
+        mcp_tools: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """OrganizationAgentGenerator.js 프롬프트 스타일로 에이전트 프로필 생성(JSON)."""
+        if not self.openai_client:
+            return None
+        mcp_tools = mcp_tools or {}
+        mcp_tools_text = json.dumps(mcp_tools, ensure_ascii=False)
+        system_prompt = (
+            "당신은 조직에서 사용할 AI 에이전트의 정보를 생성하는 전문가입니다.\n"
+            f'사용자가 입력한 요구사항을 바탕으로 "{team_name}" 팀에 적합한 에이전트의 상세 정보를 JSON 형식으로 생성해주세요.\n\n'
+            "다음 형식에 맞춰 응답해주세요:\n\n"
+            "{\n"
+            '  "name": "에이전트의 이름 (한국어)",\n'
+            '  "role": "에이전트의 역할 (간단명료하게)",\n'
+            '  "goal": "에이전트의 목표 (구체적이고 측정 가능하게)",\n'
+            '  "persona": "에이전트의 성격과 특징 (상세하게 기술)",\n'
+            '  "tools": "필요한 MCP 도구들 (쉼표로 구분)"\n'
+            "}\n\n"
+            "## 지침:\n"
+            "1. name은 한국어로 직관적이고 명확하게\n"
+            "2. role은 한 문장으로 핵심 역할만\n"
+            "3. goal은 SMART 원칙에 따라 구체적이고 측정 가능하게\n"
+            "4. persona는 에이전트의 성격, 말투, 전문성 등을 포함하여 상세히\n"
+            "5. tools는 업무 수행에 필요한 MCP 도구들을 쉼표로 구분하여 나열, 도구는 우리 회사 MCP 도구 목록에 있는 도구만 사용할 수 있습니다.\n\n"
+            "6. (중요) 에이전트는 너무 세분화된 '단일 태스크 전용'으로 만들지 마세요.\n"
+            "   - 상세도 기준 1~10 중 **6 정도**로, 관련 업무를 묶어 포괄하는 형태가 좋습니다.\n"
+            "   - 예: '수강 신청 도우미', '수강 관리 도우미', '강의 개설 도우미'처럼 과도하게 쪼개지 말고,\n"
+            "         가능하면 '교육/수강 운영 도우미'처럼 하나로 포괄하세요.\n"
+            "   - 단, 너무 광범위한 전사 공용 에이전트(예: '만능 도우미')도 피하세요.\n\n"
+            f"도구 목록:\n{mcp_tools_text}\n\n"
+            "반드시 JSON ONLY로 응답하세요.\n"
+        )
+        user_prompt = (
+            "## 팀 컨텍스트:\n"
+            f"- 소속 팀: {team_name}\n"
+            f'- "{team_name}" 팀의 업무 특성과 목표를 고려하여 에이전트를 설계해주세요\n'
+            "- 팀 내에서 실제로 활용 가능하고 업무 효율성을 높일 수 있는 에이전트여야 합니다\n"
+            "- 팀원들과의 협업과 소통을 원활하게 도울 수 있는 특성을 포함해주세요\n\n"
+            f"사용자 요구사항: {user_input}\n"
+        )
+        obj = await self._call_openai_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=900,
+            model=self.user_mapping_model,
+            temperature=float(os.getenv("LLM_ASSIGNMENT_TEMPERATURE", "0.0")),
+        )
+        if not isinstance(obj, dict):
+            return None
+        return obj
+
+    async def _insert_agent_user(
+        self,
+        *,
+        tenant_id: str,
+        agent_profile: Dict[str, Any],
+        agent_type: str = "agent",
+    ) -> Optional[Dict[str, Any]]:
+        """users 테이블에 에이전트를 insert 하고, 성공 시 row(dict)를 반환."""
+        if not self.supabase_client:
+            return None
+        try:
+            new_id = str(uuid.uuid4())
+            username = str(agent_profile.get("name") or "").strip() or "자동생성 에이전트"
+            role = str(agent_profile.get("role") or "").strip()
+            goal = str(agent_profile.get("goal") or "").strip()
+            persona = str(agent_profile.get("persona") or "").strip()
+            tools = str(agent_profile.get("tools") or "").strip()
+
+            # 중복 생성 방지: username/role이 거의 같은 agent가 이미 있으면 그걸 재사용
+            key_name = self._normalize_text_key(username)
+            key_role = self._normalize_text_key(role)
+            for u in (self._agents or []):
+                if not isinstance(u, dict):
+                    continue
+                if key_name and self._normalize_text_key(u.get("username")) == key_name:
+                    return u
+                if key_role and self._normalize_text_key(u.get("role")) == key_role:
+                    return u
+                # fuzzy reuse: if role/name is largely contained, reuse (prevents micro-agent explosion)
+                exist_role = self._normalize_text_key(u.get("role")) or ""
+                exist_name = self._normalize_text_key(u.get("username")) or ""
+                if key_role and exist_role and (key_role in exist_role or exist_role in key_role) and (len(key_role) >= 4 or len(exist_role) >= 4):
+                    return u
+                if key_name and exist_name and (key_name in exist_name or exist_name in key_name) and (len(key_name) >= 4 or len(exist_name) >= 4):
+                    return u
+
+            row = {
+                "id": new_id,
+                "tenant_id": tenant_id,
+                "username": username,
+                "role": role,
+                "goal": goal,
+                "persona": persona,
+                "tools": tools,
+                "is_agent": True,
+                "agent_type": agent_type,
+                "model": os.getenv("DEFAULT_NEW_AGENT_MODEL", self.openai_model),
+                "alias": None,
+                "endpoint": None,
+                "description": None,
+                "skills": None,
+            }
+            self.supabase_client.table("users").insert(row).execute()
+            logger.info(f"[ASSIGN] users insert(agent) ok: id={new_id} username={username!r} role={role!r}")
+
+            # 캐시 갱신
+            self._users.append(row)
+            self._agents.append(row)
+            return row
+        except Exception as e:
+            logger.warning(f"[WARN] users insert(agent) failed: {e}")
+            return None
+
+    async def _update_org_chart_add_member(
+        self,
+        *,
+        tenant_id: str,
+        team_id: str,
+        member_user: Dict[str, Any],
+    ) -> bool:
+        """configuration(key=organization)에 에이전트/사용자 노드를 팀 children에 추가(가능한 경우)."""
+        if not self.supabase_client:
+            return False
+        if not self._org_chart or not team_id:
+            return False
+        try:
+            chart = self._org_chart
+
+            def walk(node: Any) -> bool:
+                if not node or not isinstance(node, dict):
+                    return False
+                if str(node.get("id") or "") == str(team_id):
+                    children = node.get("children")
+                    if not isinstance(children, list):
+                        children = []
+                        node["children"] = children
+                    # 이미 있으면 skip
+                    mid = str(member_user.get("id") or "")
+                    for ch in children:
+                        if isinstance(ch, dict) and str(ch.get("id") or "") == mid:
+                            return True
+                    # 프론트의 OrganizationAddDialog가 push하는 형태를 따라감
+                    child_node = {
+                        "id": mid,
+                        "name": str(member_user.get("username") or ""),
+                        "data": {
+                            "id": mid,
+                            "name": str(member_user.get("username") or ""),
+                            "username": str(member_user.get("username") or ""),
+                            "role": str(member_user.get("role") or ""),
+                            "goal": member_user.get("goal"),
+                            "persona": member_user.get("persona"),
+                            "endpoint": member_user.get("endpoint"),
+                            "description": member_user.get("description"),
+                            "skills": member_user.get("skills"),
+                            "model": member_user.get("model"),
+                            "alias": member_user.get("alias"),
+                            "tools": member_user.get("tools"),
+                            "isAgent": True,
+                            "is_agent": True,
+                            "agent_type": member_user.get("agent_type"),
+                            "type": member_user.get("agent_type"),
+                        },
+                    }
+                    children.append(child_node)
+                    return True
+
+                children = node.get("children") or []
+                if isinstance(children, list):
+                    for ch in children:
+                        if walk(ch):
+                            return True
+                return False
+
+            updated = walk(chart)
+            if not updated:
+                return False
+
+            # configuration 업데이트 (uuid가 있으면 uuid로, 없으면 key+tenant_id 기준)
+            # NOTE: value 전체를 덮어쓰지 않고, 기존 value가 있으면 chart만 교체합니다.
+            value_root: Dict[str, Any] = {}
+            if isinstance(self._org_value, dict):
+                value_root = dict(self._org_value)
+            # chart key가 없었던 레거시 구조면, chart만 가진 value로 저장
+            value_root["chart"] = chart
+
+            payload = {"key": "organization", "tenant_id": tenant_id, "value": value_root}
+            if self._org_config_uuid:
+                self.supabase_client.table("configuration").update(payload).eq("uuid", self._org_config_uuid).execute()
+            else:
+                # fallback: key+tenant_id
+                existing = (
+                    self.supabase_client.table("configuration")
+                    .select("uuid")
+                    .eq("key", "organization")
+                    .eq("tenant_id", tenant_id)
+                    .execute()
+                )
+                if existing.data and len(existing.data) > 0:
+                    self._org_config_uuid = existing.data[0].get("uuid")
+                    if self._org_config_uuid:
+                        self.supabase_client.table("configuration").update(payload).eq("uuid", self._org_config_uuid).execute()
+                else:
+                    self.supabase_client.table("configuration").insert(payload).execute()
+
+            # 인덱스 재생성(다음 매핑에 반영)
+            self._org_value = value_root
+            idx = self._index_org_chart(chart)
+            self._org_teams_by_name = idx.get("teams_by_name") or {}
+            self._org_team_name_by_id = idx.get("team_name_by_id") or {}
+            self._org_members_by_team_id = idx.get("members_by_team_id") or {}
+            return True
+        except Exception as e:
+            logger.warning(f"[WARN] organization chart update failed: {e}")
+            return False
+
+    async def _apply_assignment_and_maybe_create_agents(
+        self,
+        *,
+        proc_json: Dict[str, Any],
+        tenant_id: str,
+        process_name: str,
+    ) -> None:
+        """
+        proc_json.roles / proc_json.activities에 대해:
+        - 기존 룰 기반 매핑(사용자/에이전트/팀)
+        - LLM 기반 추천(선택)
+        - 필요 시 에이전트 자동 생성(users insert) + 조직도 반영(선택)
+        """
+        await self._load_org_and_agents(tenant_id)
+        roles = proc_json.get("roles") or []
+        activities = proc_json.get("activities") or []
+        if not isinstance(roles, list):
+            roles = []
+        if not isinstance(activities, list):
+            activities = []
+
+        # Build per-role activity context (LLM 입력으로 활용)
+        role_ctx: Dict[str, List[Dict[str, Any]]] = {}
+        for a in activities:
+            if not isinstance(a, dict):
+                continue
+            rn = str(a.get("role") or "").strip()
+            if not rn:
+                continue
+            role_ctx.setdefault(rn, [])
+            role_ctx[rn].append(
+                {
+                    "activityId": str(a.get("id") or ""),
+                    "activityName": str(a.get("name") or ""),
+                    "instruction": str(a.get("instruction") or ""),
+                    "description": str(a.get("description") or ""),
+                    "tool": str(a.get("tool") or ""),
+                }
+            )
+
+        # -------------------------------------------------------------------
+        # Activity-based assignment (요구사항):
+        # - roles.endpoint/default는 '기준'으로 쓰지 않고, activities를 기준으로 agent를 채운다.
+        # - 역할명이 추상적이거나(신청자 등) 역할만으로는 판단이 어려운 경우에도
+        #   activity name/instruction/tool 컨텍스트로 매핑/생성을 시도한다.
+        # -------------------------------------------------------------------
+        users_by_id = {str(u.get("id")): u for u in (self._users or []) if isinstance(u, dict) and u.get("id")}
+
+        def _clean_text(s: Any) -> str:
+            return " ".join(str(s or "").split())
+
+        def _is_agent_user_id(user_id: str) -> bool:
+            u = users_by_id.get(str(user_id) or "")
+            return bool(u and u.get("is_agent") is True and u.get("id"))
+
+        def _heuristic_pick_agent(activity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            # 1) match by role name (agent first)
+            rn = _clean_text(activity.get("role"))
+            if rn:
+                hit = self._pick_user_for_role(rn)
+                if hit and hit.get("is_agent") is True:
+                    return hit
+            # 2) match by activity name/instruction keywords vs agent username/role/alias
+            key = self._normalize_text_key(f"{activity.get('name') or ''} {activity.get('instruction') or ''} {activity.get('description') or ''}")
+            if not key:
+                return None
+            for a in (self._agents or []):
+                if not isinstance(a, dict) or not a.get("id"):
+                    continue
+                for field in ("username", "role", "alias"):
+                    cand = self._normalize_text_key(a.get(field)) or ""
+                    if cand and (cand in key or key in cand):
+                        return a
+            return None
+
+        default_agent_mode = "draft"  # fixed
+        for a in activities:
+            if not isinstance(a, dict):
+                continue
+            aid = _clean_text(a.get("id"))
+            aname = _clean_text(a.get("name"))
+            rn = _clean_text(a.get("role"))
+
+            # already assigned and valid
+            if a.get("agent") and _is_agent_user_id(str(a.get("agent"))):
+                a["agentMode"] = default_agent_mode
+                a["orchestration"] = "crewai-action"
+                continue
+
+            # heuristic pick first
+            hit = _heuristic_pick_agent(a)
+            if hit and hit.get("id"):
+                a["agent"] = hit.get("id")
+                a["agentMode"] = default_agent_mode
+                a["orchestration"] = "crewai-action"
+                logger.info(f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> existing_agent id={hit.get('id')}")
+                continue
+
+            # LLM-based for this specific activity (more context than role-only)
+            activity_ctx = [
+                {
+                    "activityId": aid,
+                    "activityName": aname,
+                    "role": rn,
+                    "instruction": _clean_text(a.get("instruction")),
+                    "description": _clean_text(a.get("description")),
+                    "tool": _clean_text(a.get("tool")),
+                }
+            ]
+            # IMPORTANT: do not use role name only. Include activity name/instruction so that
+            # candidate filtering can find agents like "인터뷰 검증 에이전트".
+            role_query = _clean_text(f"{rn} {aname} {a.get('instruction') or ''} {a.get('description') or ''}") or aid
+            rec = await self._llm_recommend_assignee(
+                tenant_id=tenant_id,
+                process_name=process_name,
+                role_name=role_query,
+                activities_context=activity_ctx,
+            )
+            if not isinstance(rec, dict):
+                a["agent"] = None
+                a["agentMode"] = "none"
+                a["orchestration"] = None
+                continue
+
+            action = str(rec.get("action") or "none").strip()
+            logger.info(
+                f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} LLM action={action} conf={rec.get('confidence')} reason={str(rec.get('reason') or '')[:120]!r}"
+            )
+
+            if action == "existing_user":
+                target_user_id = str(rec.get("target_user_id") or "").strip()
+                if target_user_id and _is_agent_user_id(target_user_id):
+                    a["agent"] = target_user_id
+                    a["agentMode"] = default_agent_mode
+                    a["orchestration"] = "crewai-action"
+                    continue
+
+            if action == "create_agent" and self._enable_auto_agent_creation:
+                create_agent = rec.get("create_agent") or {}
+                if not isinstance(create_agent, dict):
+                    create_agent = {}
+                team_id_for_new = str(create_agent.get("team_id") or rec.get("target_team_id") or "").strip()
+                team_name = self._org_team_name_by_id.get(team_id_for_new) or ""
+                if not team_name:
+                    team_name = "미분류"
+                user_input = str(create_agent.get("user_input") or "").strip()
+                if not user_input:
+                    user_input = (
+                        f"다음 태스크를 자동화할 에이전트를 생성해주세요.\n"
+                        f"- 역할: {rn}\n"
+                        f"- 태스크: {aname}\n"
+                        f"- 지침: {_clean_text(a.get('instruction'))}\n"
+                        "필요 시 사용자에게 확인을 요청하고 결과를 정리해 주세요."
+                    )
+                mcp_tools = self._safe_json_loads(os.getenv("MCP_TOOLS_JSON", "")) or {}
+                agent_profile = await self._llm_generate_agent_profile(team_name=team_name, user_input=user_input, mcp_tools=mcp_tools)
+                if agent_profile:
+                    new_agent_type = str(create_agent.get("agent_type") or "agent").strip() or "agent"
+                    created = await self._insert_agent_user(tenant_id=tenant_id, agent_profile=agent_profile, agent_type=new_agent_type)
+                    if created and created.get("id"):
+                        if team_id_for_new:
+                            await self._update_org_chart_add_member(tenant_id=tenant_id, team_id=team_id_for_new, member_user=created)
+                        a["agent"] = created.get("id")
+                        a["agentMode"] = default_agent_mode
+                        a["orchestration"] = "crewai-action"
+                        continue
+
+            # default: no agent
+            a["agent"] = None
+            a["agentMode"] = "none"
+            a["orchestration"] = None
+
+        proc_json["activities"] = activities
 
     async def _send_progress_event(
         self, 
@@ -1658,7 +3705,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # =================================================================
             await self._send_progress_event(
                 event_queue, context_id, task_id, job_id,
-                "[GENERATING] 이번 작업의 BPMN XML들을 가져옵니다...",
+                "[GENERATING] 이번 작업의 추출 정보(Neo4j)로 ProcessGPT 프로세스 정의/유저 매핑을 생성합니다...",
                 "tool_usage_started", 88
             )
             # 6-1) 작업(job) 상태에서 이번 처리 결과(process_id 목록)를 가져온다.
@@ -1704,8 +3751,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             except Exception as e:
                 logger.warning(f"[WARN] job status 조회 중 예외: {e}")
 
-            # 6-2) job_id 기반 process_id들로 BPMN content를 개별 조회한다.
-            bpmn_files: Dict[str, Dict[str, Any]] = {}
+            # 6-2) job_id 기반 process_id들로 Neo4j 추출 정보를 개별 조회한다.
+            extracted_by_proc_id: Dict[str, Dict[str, Any]] = {}
             if not job_process_ids:
                 # 이미지 슬라이드/PPT 등 "프로세스 추출이 0개"인 케이스는 정상 성공(0개)로 처리합니다.
                 # - result.processes(=추출된 프로세스 수)가 0이면 생성할 BPMN이 없음을 사용자에게 안내
@@ -1734,126 +3781,77 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 logger.info(f"[INFO] 이번 작업(processing_job_id={processing_job_id}) 프로세스 {len(job_process_ids)}개 감지")
                 for proc_id in job_process_ids:
                     try:
-                        content_response = await client.get(
-                            f"{self.pdf2bpmn_url}/api/files/bpmn/content?process_id={proc_id}"
-                        )
-                        if content_response.status_code != 200:
+                        detail_response = await client.get(f"{self.pdf2bpmn_url}/api/processes/{proc_id}")
+                        if detail_response.status_code != 200:
                             logger.warning(
-                                f"[WARN] BPMN content 조회 실패: proc_id={proc_id}, status={content_response.status_code}"
+                                f"[WARN] process detail 조회 실패: proc_id={proc_id}, status={detail_response.status_code}"
                             )
                             continue
-                        content_result = content_response.json()
-                        bpmn_files[proc_id] = {
-                            "content": content_result.get("content", ""),
-                            "process_name": content_result.get("process_name") or process_names_by_id.get(proc_id) or "",
-                            "filename": None,
+                        detail = detail_response.json()
+                        extracted_by_proc_id[proc_id] = {
+                            "detail": detail,
+                            "process_name": (detail.get("process", {}) or {}).get("name")
+                            or detail.get("name")
+                            or process_names_by_id.get(proc_id)
+                            or "",
                         }
                     except Exception as e:
-                        logger.warning(f"[WARN] BPMN content 조회 중 예외: proc_id={proc_id}, err={e}")
+                        logger.warning(f"[WARN] process detail 조회 중 예외: proc_id={proc_id}, err={e}")
 
-            bpmn_count = len(bpmn_files)
-            logger.info(f"[INFO] 이번 작업 기준 BPMN: {bpmn_count}개")
+            extracted_count2 = len(extracted_by_proc_id)
+            logger.info(f"[INFO] 이번 작업 기준 추출 프로세스: {extracted_count2}개")
             
-            # 9. 각 BPMN에 대해 이벤트 발송 및 DB 저장
+            # 9. 각 추출 프로세스에 대해 ProcessGPT 정의/유저매핑 → XML 생성 → DB 저장
             saved_processes = []
             all_bpmn_xmls = {}  # proc_def_id -> bpmn_xml 매핑
-            total_bpmn = len(bpmn_files)
+            total_bpmn = len(extracted_by_proc_id)
             
-            logger.info(f"[DEBUG] bpmn_files keys: {list(bpmn_files.keys())}")
+            logger.info(f"[DEBUG] extracted_by_proc_id keys: {list(extracted_by_proc_id.keys())}")
             
-            for idx, (proc_id, bpmn_data) in enumerate(bpmn_files.items()):
-                bpmn_xml = bpmn_data.get("content", "")
-                process_name = bpmn_data.get("process_name", f"Process {idx + 1}")
+            for idx, (proc_id, pinfo) in enumerate(extracted_by_proc_id.items()):
+                process_name = pinfo.get("process_name") or f"Process {idx + 1}"
+                detail = pinfo.get("detail") or {}
                 
-                logger.info(f"[DEBUG] Processing BPMN {idx+1}/{total_bpmn}: {process_name}")
-                logger.info(f"[DEBUG] BPMN XML length: {len(bpmn_xml)} chars")
-                
-                if not bpmn_xml:
-                    logger.warning(f"[WARN] Empty BPMN XML for process: {process_name}")
+                logger.info(f"[DEBUG] Processing extracted process {idx+1}/{total_bpmn}: {process_name}")
+
+                # extracted info -> ProcessGPT definition + BPMN XML
+                extracted_payload = {
+                    "process": detail.get("process") or {},
+                    "tasks": detail.get("tasks") or [],
+                    "roles": detail.get("roles") or [],
+                    "gateways": detail.get("gateways") or [],
+                    "events": detail.get("events") or [],
+                    "sequence_flows": detail.get("sequence_flows") or detail.get("flows") or [],
+                }
+
+                # legacy flow is intentionally removed
+
+                generated = await self._generate_processgpt_definition_and_bpmn(
+                    tenant_id=tenant_id,
+                    process_name=process_name,
+                    extracted=extracted_payload,
+                    user_request=user_input or "",
+                )
+                if not generated:
+                    logger.warning(f"[WARN] ProcessGPT generation failed: {process_name}")
                     continue
-                
-                # XML을 JSON으로 변환
-                proc_json = self._convert_xml_to_json(bpmn_xml)
-                proc_json["processDefinitionName"] = process_name
+
+                elements_model = generated.get("elements_model") or {}
+                proc_json = generated.get("definition") or {}
+                bpmn_xml = generated.get("bpmn_xml") or ""
+                if not bpmn_xml:
+                    logger.warning(f"[WARN] Empty generated BPMN XML for process: {process_name}")
+                    continue
                 
                 # proc_def_id 생성 (안전한 형식)
                 safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', process_name.lower())[:50]
-                proc_def_id = f"{safe_id}_{proc_id[:8]}"
+                # Prefer model-provided id if present
+                model_pid = str(elements_model.get("processDefinitionId") or proc_json.get("processDefinitionId") or "").strip()
+                proc_def_id = model_pid or f"{safe_id}_{proc_id[:8]}"
                 
                 proc_json["processDefinitionId"] = proc_def_id
 
-                # 조직도/에이전트 정보를 로드해 역할→에이전트 매핑까지 반영
-                await self._load_org_and_agents(tenant_id)
-
-                # 실행 가능한 수준으로 최소 보정(roles/activities/tool/outputData/sequences 등)
-                proc_json = self._enrich_process_definition(
-                    proc_json,
-                    process_name=process_name,
-                    process_definition_id=proc_def_id,
-                )
-
-                # roles/activities에 endpoint/agent/orchestration을 채움 (가능한 경우)
-                try:
-                    roles = proc_json.get("roles", [])
-                    activities = proc_json.get("activities", [])
-                    if isinstance(roles, list):
-                        for r in roles:
-                            if not isinstance(r, dict):
-                                continue
-                            rn = str(r.get("name") or "").strip()
-                            if not rn:
-                                continue
-
-                            # 1) agent 우선 매핑
-                            agent = self._pick_agent_for_role(rn)
-                            if agent and agent.get("id"):
-                                r["endpoint"] = agent.get("id")
-                                r["origin"] = "used"
-                                continue
-
-                            # 2) team 매핑 (조직도)
-                            team_id = self._org_teams_by_name.get(self._normalize_text_key(rn))
-                            if team_id:
-                                r["endpoint"] = team_id
-                                r["origin"] = "used"
-                                continue
-
-                            # 3) 생성된 역할
-                            r.setdefault("endpoint", "")
-                            r["origin"] = r.get("origin") or "created"
-
-                    # activity agent mapping
-                    if isinstance(activities, list):
-                        default_agent_mode = os.getenv("DEFAULT_AGENT_MODE", "draft")
-                        for a in activities:
-                            if not isinstance(a, dict):
-                                continue
-                            role_name = str(a.get("role") or "").strip()
-                            if not role_name:
-                                continue
-
-                            agent = self._pick_agent_for_role(role_name)
-                            if not agent or not agent.get("id"):
-                                # human/user activity
-                                a["agent"] = None
-                                a["agentMode"] = "none"
-                                a["orchestration"] = None
-                                continue
-
-                            a["agent"] = agent.get("id")
-                            a["agentMode"] = default_agent_mode
-
-                            agent_type = (agent.get("agent_type") or "agent").lower()
-                            if agent_type == "agent":
-                                a["orchestration"] = "crewai-action"
-                            elif agent_type == "a2a":
-                                a["orchestration"] = "a2a"
-                            elif agent_type == "pgagent":
-                                a["orchestration"] = agent.get("alias") or "pgagent"
-                            else:
-                                a["orchestration"] = agent.get("alias") or agent_type
-                except Exception as e:
-                    logger.warning(f"[WARN] role/agent 매핑 보정 실패: {e}")
+                # proc_json은 이미 enrich+assignment까지 끝난 상태(생성 단계에서 수행)
                 
                 # BPMN XML 저장
                 all_bpmn_xmls[proc_def_id] = bpmn_xml
@@ -1905,6 +3903,34 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                             tenant_id=tenant_id,
                             definition=proc_json,
                         )
+
+                        # -----------------------------------------------------------------
+                        # NEW: After forms exist, expand process:
+                        # - inputData wiring based on REAL saved forms (form_id + fields_json)
+                        # - (re)apply agent assignment near-final
+                        # - sanitize to avoid referencing future/non-existent form fields
+                        # -----------------------------------------------------------------
+                        try:
+                            await self._expand_process_after_forms(
+                                proc_def_id=proc_def_id,
+                                process_name=process_name,
+                                proc_json=proc_json,
+                                forms_result=forms_result,
+                                tenant_id=tenant_id,
+                                event_queue=event_queue,
+                                context_id=context_id,
+                                task_id=task_id,
+                                job_id=job_id,
+                            )
+                            # proc_json changed (inputData/agent fields), persist definition again
+                            await self._update_proc_def_definition_only(
+                                proc_def_id=proc_def_id,
+                                tenant_id=tenant_id,
+                                definition=proc_json,
+                            )
+                        except Exception as e:
+                            logger.warning(f"[WARN] expand(after-forms) stage failed: {e}")
+
                         await self._send_progress_event(
                             event_queue, context_id, task_id, job_id,
                             f"[FORM] 프로세스 폼 처리 완료: {process_name} (saved={forms_result.get('forms_saved')}/{forms_result.get('activities')})",
@@ -2006,7 +4032,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 )
             )
             
-            logger.info(f"[DONE] Task completed: {job_id} ({bpmn_count} processes)")
+            logger.info(f"[DONE] Task completed: {job_id} ({actual_count} processes)")
             
         except httpx.ConnectError as e:
             logger.error(f"[ERROR] Cannot connect to PDF2BPMN server: {e}")

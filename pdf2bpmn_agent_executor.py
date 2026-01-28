@@ -1137,6 +1137,107 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             logger.warning(f"[WARN] proc_def.definition update failed: id={proc_def_id} err={e}")
             return False
 
+    async def _update_proc_def_bpmn_only(self, *, proc_def_id: str, tenant_id: str, bpmn_xml: str) -> bool:
+        """proc_def.bpmn만 업데이트(확장 단계 이후 최종 XML 반영용)."""
+        if not self.supabase_client:
+            return False
+        try:
+            self.supabase_client.table("proc_def").update(
+                {
+                    "bpmn": bpmn_xml,
+                    "tenant_id": tenant_id,
+                    "isdeleted": False,
+                }
+            ).eq("id", proc_def_id).execute()
+            return True
+        except Exception as e:
+            logger.warning(f"[WARN] proc_def.bpmn update failed: id={proc_def_id} err={e}")
+            return False
+
+    def _apply_runtime_definition_to_elements_model(
+        self,
+        *,
+        elements_model: Dict[str, Any],
+        runtime_def: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        런타임 정의(proc_def.definition; activities/events/gateways/sequences 기반)에서
+        XML 생성에 필요한 필드(tool/inputData/outputData/checkpoints/agent 등)를
+        elements 모델(jsonModel.elements 기반)에 반영합니다.
+
+        NOTE:
+        - ProcessGPTBPMNXmlGenerator는 elements_model을 기준으로 uengine:json을 만듭니다.
+        - 따라서 폼/참조정보 확장 이후의 최종 값을 XML에 반영하려면, 생성 직전에 sync가 필요합니다.
+        """
+        em = dict(elements_model or {})
+        rd = dict(runtime_def or {})
+
+        # top-level fields
+        for k in ("processDefinitionId", "processDefinitionName", "megaProcessId", "majorProcessId", "description", "isHorizontal", "data"):
+            if k in rd and rd.get(k) is not None:
+                em[k] = rd.get(k)
+
+        # roles: lane endpoint/resolutionRule는 roles에서 읽는다
+        if isinstance(rd.get("roles"), list):
+            em["roles"] = rd.get("roles") or []
+
+        # build activity lookup by id
+        acts_by_id: Dict[str, Dict[str, Any]] = {}
+        for a in (rd.get("activities") or []):
+            if isinstance(a, dict) and a.get("id"):
+                acts_by_id[str(a.get("id"))] = a
+
+        elems = em.get("elements")
+        if not isinstance(elems, list):
+            # The generator can accept dict-shaped elements too, but this backend path uses list.
+            return em
+
+        for e in elems:
+            if not isinstance(e, dict):
+                continue
+            if e.get("elementType") != "Activity":
+                continue
+            aid = str(e.get("id") or "").strip()
+            if not aid or aid not in acts_by_id:
+                continue
+
+            a = acts_by_id[aid]
+
+            # keep canonical fields in sync
+            if a.get("name"):
+                e["name"] = a.get("name")
+            if a.get("description") is not None:
+                e["description"] = a.get("description") or ""
+            if a.get("role") is not None:
+                e["role"] = a.get("role") or ""
+            if isinstance(a.get("inputData"), list):
+                e["inputData"] = a.get("inputData") or []
+            if isinstance(a.get("outputData"), list):
+                e["outputData"] = a.get("outputData") or []
+            if isinstance(a.get("checkpoints"), list):
+                e["checkpoints"] = a.get("checkpoints") or []
+
+            # properties are serialized into uengine:json for tasks
+            props = e.get("properties") if isinstance(e.get("properties"), dict) else {}
+            props = dict(props)
+            props.update(
+                {
+                    "role": a.get("role"),
+                    "duration": a.get("duration", 5),
+                    "instruction": a.get("instruction") or "",
+                    "tool": a.get("tool") or "",
+                    "agent": a.get("agent", None),
+                    "agentMode": a.get("agentMode") or "none",
+                    "orchestration": a.get("orchestration", None),
+                    "attachments": a.get("attachments") or [],
+                    "customProperties": a.get("customProperties") or [],
+                }
+            )
+            e["properties"] = props
+
+        em["elements"] = elems
+        return em
+
     def _parse_query(self, query: str) -> Dict[str, Any]:
         """
         Query에서 PDF URL과 요청 정보를 파싱
@@ -2004,8 +2105,10 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         # Ensure required identifiers
         m.setdefault("processDefinitionName", process_name)
         if not str(m.get("processDefinitionId") or "").strip():
-            safe_id = self._snake_id(process_name or "process")
-            m["processDefinitionId"] = f"{safe_id}_{uuid.uuid4().hex[:6]}"
+            # IMPORTANT:
+            # - proc_def 저장 키(processDefinitionId)는 충돌이 나면 기존 프로세스가 덮이거나(proc_def 갱신)
+            #   proc_map / form_def 매핑이 깨질 수 있으므로 UUID로 강제합니다.
+            m["processDefinitionId"] = str(uuid.uuid4())
 
         # Normalize elements list
         elems_raw = m.get("elements") or []
@@ -2468,8 +2571,11 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         """
         (프로세스 생성 LLM) 단계:
         - 프론트 ProcessDefinitionGenerator 프롬프트와 동일한 규칙을 사용해 elements 모델 생성
-        - 백엔드 ProcessGPTBPMNXmlGenerator로 XML 생성
         - proc_def.definition(런타임) 구조로 변환하여 함께 반환
+
+        IMPORTANT:
+        - BPMN XML은 폼 생성/참조정보(inputData) 확장 이후에 최종값으로 생성/저장해야 합니다.
+          (초기 생성 후 확장 단계에서 tool/form id 등이 변경되므로, XML을 먼저 만들면 stale 됩니다.)
         """
         if not self.openai_client:
             return None
@@ -2513,25 +2619,23 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         # 5) Strict validate/normalize elements model (connectivity + ids + required fields)
         elements_model = self._validate_and_normalize_elements_model(elements_model, process_name=process_name)
 
+        # 5.5) Force proc_def id to UUID (avoid collisions on save)
+        # NOTE:
+        # - We intentionally IGNORE model-provided processDefinitionId to prevent accidental reuse.
+        # - BPMN XML generator does not use this id for <bpmn:process id="..."> (it uses Process_1),
+        #   so UUID starting with digits is safe.
+        forced_proc_def_id = str(uuid.uuid4())
+        elements_model["processDefinitionId"] = forced_proc_def_id
+
         # 6) Convert to runtime definition + enrich + assignment(again, as safety)
         runtime_def = self._elements_model_to_runtime_definition(elements_model)
         runtime_def = self._enrich_process_definition(
             runtime_def,
             process_name=str(runtime_def.get("processDefinitionName") or process_name),
-            process_definition_id=str(runtime_def.get("processDefinitionId") or elements_model.get("processDefinitionId")),
+            process_definition_id=str(elements_model.get("processDefinitionId") or runtime_def.get("processDefinitionId")),
         )
         # NOTE: 담당자/에이전트 매핑은 forms + inputData 확장 이후 마지막 단계에서 수행 후 저장한다.
-
-        # 7) Generate BPMN XML in backend (no frontend dependency)
-        bpmn_xml = await asyncio.to_thread(
-            self._generate_bpmn_xml_backend,
-            model=elements_model,
-            horizontal=elements_model.get("isHorizontal"),
-        )
-        if not bpmn_xml:
-            return None
-
-        return {"elements_model": elements_model, "definition": runtime_def, "bpmn_xml": bpmn_xml}
+        return {"elements_model": elements_model, "definition": runtime_def}
 
     async def _llm_recommend_assignee(
         self,
@@ -3969,7 +4073,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         except Exception as e:
             logger.error(f"[ERROR] XML to JSON conversion failed: {e}")
             return {
-                "processDefinitionId": f"process_{uuid.uuid4().hex[:8]}",
+                "processDefinitionId": str(uuid.uuid4()),
                 "processDefinitionName": "Converted Process",
                 "data": [],
                 "roles": [],
@@ -4557,30 +4661,23 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
                 elements_model = generated.get("elements_model") or {}
                 proc_json = generated.get("definition") or {}
-                bpmn_xml = generated.get("bpmn_xml") or ""
-                if not bpmn_xml:
-                    logger.warning(f"[WARN] Empty generated BPMN XML for process: {process_name}")
-                    continue
                 
-                # proc_def_id 생성 (안전한 형식)
-                safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', process_name.lower())[:50]
-                # Prefer model-provided id if present
-                model_pid = str(elements_model.get("processDefinitionId") or proc_json.get("processDefinitionId") or "").strip()
-                proc_def_id = model_pid or f"{safe_id}_{proc_id[:8]}"
-                
-                proc_json["processDefinitionId"] = proc_def_id
+                # proc_def_id: UUID (already forced inside _generate_processgpt_definition_and_bpmn)
+                proc_def_id = str(proc_json.get("processDefinitionId") or elements_model.get("processDefinitionId") or "").strip()
+                if not proc_def_id:
+                    # extremely defensive fallback (should not happen)
+                    proc_def_id = str(uuid.uuid4())
+                    proc_json["processDefinitionId"] = proc_def_id
 
                 # NOTE: 담당자/에이전트 매핑은 forms + 참조정보(inputData) 확장 이후 마지막 단계에서 수행됨.
-                
-                # BPMN XML 저장
-                all_bpmn_xmls[proc_def_id] = bpmn_xml
                 
                 # DB에 저장
                 proc_def_data = {
                     "id": proc_def_id,
                     "name": process_name,
                     "definition": proc_json,
-                    "bpmn": bpmn_xml,
+                    # BPMN XML은 "확장 완료 후" 최종본으로 생성/업데이트 한다.
+                    "bpmn": "",
                     "uuid": str(uuid.uuid4()),
                     "type": "bpmn",
                     "owner": None,
@@ -4659,12 +4756,40 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         )
                     except Exception as e:
                         logger.warning(f"[WARN] form generation/save stage failed unexpectedly: {e}")
+
+                    # -----------------------------------------------------------------
+                    # FINAL: 확장 단계 이후 최종 elements_model로 BPMN XML 생성 + DB 반영
+                    # -----------------------------------------------------------------
+                    final_bpmn_xml = ""
+                    try:
+                        # runtime_def(proc_json) -> elements_model sync (tool/inputData/agent etc)
+                        final_elements_model = self._apply_runtime_definition_to_elements_model(
+                            elements_model=elements_model,
+                            runtime_def=proc_json,
+                        )
+                        final_bpmn_xml = await asyncio.to_thread(
+                            self._generate_bpmn_xml_backend,
+                            model=final_elements_model,
+                            horizontal=final_elements_model.get("isHorizontal"),
+                        )
+                    except Exception as e:
+                        logger.warning(f"[WARN] final BPMN XML generation failed: proc_def_id={proc_def_id} err={e}")
+
+                    if final_bpmn_xml:
+                        all_bpmn_xmls[proc_def_id] = final_bpmn_xml
+                        try:
+                            await self._update_proc_def_bpmn_only(proc_def_id=proc_def_id, tenant_id=tenant_id, bpmn_xml=final_bpmn_xml)
+                        except Exception as e:
+                            logger.warning(f"[WARN] proc_def.bpmn update failed after final xml: {e}")
+                    else:
+                        # keep empty bpmn; still allow completion
+                        all_bpmn_xmls.setdefault(proc_def_id, "")
                 
                 # saved_processes에 bpmn_xml 포함
                 saved_processes.append({
                     "id": proc_def_id,
                     "name": process_name,
-                    "bpmn_xml": bpmn_xml  # XML 내용 포함
+                    "bpmn_xml": all_bpmn_xmls.get(proc_def_id, "")  # 최종 XML(없으면 빈 문자열)
                 })
                 
                 # 진행 이벤트 (XML 포함)
@@ -4675,7 +4800,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     {
                         "process_id": proc_def_id, 
                         "process_name": process_name,
-                        "bpmn_xml": bpmn_xml  # 이벤트에도 XML 포함
+                        "bpmn_xml": all_bpmn_xmls.get(proc_def_id, "")  # 이벤트에도 최종 XML 포함
                     }
                 )
             

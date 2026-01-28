@@ -45,7 +45,7 @@ def get_json_structure_processgpt() -> str:
             "megaProcessId": "메가 프로세스 ID(한글)",
             "majorProcessId": "메이저 프로세스 ID(한글)",
             "processDefinitionName": "프로세스 명(한글)",
-            "processDefinitionId": "process_definition_id(영문 스네이크 케이스 + '_' + 현재 timestamp(중복 생성 막기 위함)))",
+            "processDefinitionId": "프로세스 ID(UUID). 저장 시 서버에서 UUID로 자동 생성/강제되므로 비워두거나 임의값이어도 무방",
             "description": "프로세스 설명(한글)",
             "isHorizontal": true,
             "data": [

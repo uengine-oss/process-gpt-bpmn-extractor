@@ -1,8 +1,8 @@
-# PDF2BPMN Docker Image
+# ProcessGPT BPMN Extractor Docker Image
 # PDF to BPMN Converter with Agent Server
-# 
-# Build: docker build --no-cache -t ghcr.io/uengine-oss/pdf2bpmn:v0.0.1 .
-# Run: docker run -p 8000:8000 -p 8001:8001 --env-file agent.env ghcr.io/uengine-oss/pdf2bpmn:v0.0.1
+#
+# Build: docker build --no-cache -t ghcr.io/uengine-oss/process-gpt-bpmn-extractor:dev .
+# Run: docker run -p 8000:8000 -p 8001:8001 --env-file agent.env ghcr.io/uengine-oss/process-gpt-bpmn-extractor:dev
 
 FROM python:3.11-slim
 

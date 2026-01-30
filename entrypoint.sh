@@ -16,6 +16,16 @@ echo "   - Agent Orchestrator: ${AGENT_ORCH:-pdf2bpmn}"
 echo "   - Task Timeout: ${TASK_TIMEOUT:-3600}s"
 echo "=============================================="
 
+# If Supabase is running on the host and env points to localhost/127.0.0.1,
+# that won't be reachable from inside the container. Rewrite to host.docker.internal.
+if [ -n "$SUPABASE_URL" ]; then
+    if echo "$SUPABASE_URL" | grep -Eq '^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?(/.*)?$'; then
+        OLD_SUPABASE_URL="$SUPABASE_URL"
+        export SUPABASE_URL="$(echo "$SUPABASE_URL" | sed -E 's#^https?://(localhost|127\.0\.0\.1)#http://host.docker.internal#')"
+        echo "📝 SUPABASE_URL rewritten for Docker: ${OLD_SUPABASE_URL} -> ${SUPABASE_URL}"
+    fi
+fi
+
 # Wait for dependencies if needed
 if [ -n "$WAIT_FOR_NEO4J" ]; then
     echo "⏳ Waiting for Neo4j at ${NEO4J_URI}..."

@@ -1,4 +1,4 @@
-# PDF2BPMN Converter
+# ProcessGPT BPMN Extractor (PDF2BPMN)
 
 업무 편람/업무 정의서(PDF)에서 **프로세스 / 태스크 / 역할**을 추출하고, **BPMN XML**, **DMN 규칙**, **Agent Skill 문서**를 자동 생성하는 도구입니다.
 
@@ -27,7 +27,7 @@
 pip install uv
 
 # 프로젝트 클론 및 이동
-cd pdf2bpmn
+cd process-gpt-bpmn-extractor
 
 # 의존성 설치
 uv sync
@@ -73,12 +73,52 @@ cd frontend && npm install && npm run dev
 ```
 
 - **Frontend**: http://localhost:5173
-- **API Docs**: http://localhost:8000/docs
+- **API Docs**: http://localhost:8001/docs
 
 또는 한 번에 실행:
 
 ```bash
 ./start.sh
+```
+
+## Docker로 실행 (권장)
+
+이 저장소는 Docker/Compose로 바로 실행할 수 있습니다.
+
+### 1) 사전 준비
+
+- `.env`: `OPENAI_API_KEY` 등 런타임 환경변수
+- `agent.env`: ProcessGPT SDK/워크아이템 처리용 환경변수 (예: `AGENT_*`, Supabase 등)
+
+예시 파일:
+
+- `agent.env.example`
+- `api.env copy.example`
+
+### 2) Neo4j + 전체 스택(Agent + API) 실행
+
+```bash
+docker compose up --build
+```
+
+- Agent Server: `http://localhost:8000`
+- API Server: `http://localhost:8001`
+- API Docs: `http://localhost:8001/docs`
+- Neo4j Browser: `http://localhost:7474`
+
+### 3) API만 실행(로컬 변환/백엔드 테스트)
+
+```bash
+docker compose --profile api-only up --build
+```
+
+### 4) GHCR 이미지로 실행(빌드 없이)
+
+GitHub Actions가 `ghcr.io/uengine-oss/process-gpt-bpmn-extractor`로 이미지를 퍼블리시합니다.
+
+```bash
+docker pull ghcr.io/uengine-oss/process-gpt-bpmn-extractor:main
+docker run --rm -p 8000:8000 -p 8001:8001 --env-file agent.env ghcr.io/uengine-oss/process-gpt-bpmn-extractor:main
 ```
 
 ### Streamlit UI (레거시)

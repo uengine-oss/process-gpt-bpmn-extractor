@@ -1785,26 +1785,73 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         messages: List[Dict[str, str]],
         max_tokens: int = 3500,
     ) -> Optional[Dict[str, Any]]:
-        """프로세스 정의 생성용: 마크다운+코드블록 응답에서 JSON만 파싱."""
+        """프로세스 정의 생성용: JSON-only 출력 강제 + 파싱 실패 시 재시도."""
         if not self.openai_client:
             return None
-        try:
-            def _run():
-                return self.openai_client.chat.completions.create(
-                    model=self.process_definition_model,
-                    messages=messages,
-                    temperature=float(os.getenv("LLM_PROCESS_TEMPERATURE", "0.2")),
-                    max_tokens=max_tokens,
-                )
-            resp = await asyncio.to_thread(_run)
-            content = (resp.choices[0].message.content or "").strip()
-            json_block = self._extract_json_block_from_markdown(content) or ""
-            if not json_block:
-                return None
-            return json.loads(json_block)
-        except Exception as e:
-            logger.warning(f"[WARN] OpenAI process-definition call failed: {e}")
-            return None
+        # Prefer deterministic output for strict JSON parsing.
+        temperature = float(
+            os.getenv(
+                "LLM_PROCESS_DEFINITION_TEMPERATURE",
+                os.getenv("LLM_PROCESS_TEMPERATURE", "0.0"),
+            )
+        )
+
+        # Retry a few times because a single invalid character breaks JSON parsing.
+        for attempt in range(1, 4):
+            attempt_messages = messages
+            if attempt > 1:
+                attempt_messages = list(messages) + [
+                    {
+                        "role": "system",
+                        "content": (
+                            "이전 응답은 JSON 파싱에 실패했습니다.\n"
+                            "이번에는 **단 하나의 JSON 객체만** 출력하세요.\n"
+                            "- 마크다운/설명/코드블록/백틱/주석 금지\n"
+                            "- JSON 외 텍스트가 1글자라도 있으면 실패\n"
+                        ),
+                    }
+                ]
+            try:
+                def _run():
+                    # Prefer JSON mode when supported; fallback gracefully if SDK/model doesn't support it.
+                    try:
+                        return self.openai_client.chat.completions.create(
+                            model=self.process_definition_model,
+                            messages=attempt_messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            response_format={"type": "json_object"},
+                        )
+                    except TypeError:
+                        return self.openai_client.chat.completions.create(
+                            model=self.process_definition_model,
+                            messages=attempt_messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                        )
+
+                resp = await asyncio.to_thread(_run)
+                content = (resp.choices[0].message.content or "").strip()
+                if not content:
+                    continue
+
+                # First try: content itself is JSON (when response_format=json_object worked)
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    # Fallback: attempt to recover JSON from markdown/codefence responses
+                    json_block = self._extract_json_block_from_markdown(content) or ""
+                    if not json_block:
+                        continue
+                    try:
+                        return json.loads(json_block)
+                    except json.JSONDecodeError:
+                        continue
+            except Exception as e:
+                logger.warning(f"[WARN] OpenAI process-definition call failed (attempt {attempt}/3): {e}")
+                continue
+
+        return None
 
     async def _call_openai_json_messages(
         self,

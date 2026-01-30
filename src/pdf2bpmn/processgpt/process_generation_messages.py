@@ -11,6 +11,24 @@ import json
 from typing import Any, Dict, List, Optional
 
 
+def strict_json_only_system_instructions() -> str:
+    """
+    Hard guardrail to force *strict* JSON-only output.
+    This is intentionally placed as the LAST system message to override earlier formatting hints.
+    """
+    return (
+        "### (최우선) 출력 형식 강제\n"
+        "- 당신의 출력은 **반드시 단 하나의 JSON 객체**여야 합니다.\n"
+        "- 마크다운/설명 문장/코드블록(```)/백틱/머리말/꼬리말/주석을 **절대 출력하지 마세요**.\n"
+        "- JSON 외의 어떤 문자도 출력하면 실패입니다.\n"
+        "- JSON 내부에도 주석(//, /* */)은 금지입니다.\n"
+        "- 문자열에 따옴표(\")/개행이 포함되면 반드시 JSON 규칙대로 이스케이프 하세요.\n"
+        "- 만약 요구사항을 충족할 수 없거나 불확실하다면, 다음 중 하나로만 응답하세요:\n"
+        '  - {"error":"insufficient_information"}\n'
+        '  - {"error":"cannot_comply"}\n'
+    )
+
+
 def process_quality_system_instructions() -> str:
     """
     Extra constraints to improve BPMN quality beyond the baseline ProcessGPT prompt.
@@ -59,6 +77,7 @@ def build_process_definition_messages(
         {"role": "system", "content": base_system_prompt},
         {"role": "system", "content": extra_system},
         {"role": "system", "content": process_quality_system_instructions()},
+        {"role": "system", "content": strict_json_only_system_instructions()},
         {"role": "user", "content": user_prompt},
     ]
 

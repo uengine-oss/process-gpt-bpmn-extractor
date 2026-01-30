@@ -332,19 +332,12 @@ def get_definition_guide_section_processgpt(json_structure: str) -> str:
     ```
 
     
-    결과는 프로세스에 대한 설명과 함께 valid 한 json 으로 표현해줘. markdown 으로, three backticks 로 감싸. 예를 들면:
-    
-    **설명 작성 규칙:**
-    - 설명 부분은 반드시 마크다운 형식으로 작성해야 합니다.
-    - 제목은 ## 또는 ###을 사용하여 계층적으로 구성하세요.
-    - 중요한 키워드나 개념은 **굵게** 표시하세요.
-    - 단계별 설명은 번호 목록(1. 2. 3.)이나 불릿 목록(-)을 사용하세요.
-    - 프로세스의 흐름은 → 화살표를 사용하여 시각적으로 표현하세요.
-    - 역할이나 담당자는 백틱으로 강조하세요.
+    결과는 반드시 **valid JSON 객체 1개만** 출력하세요.
+    - 마크다운, 설명 문장, 코드블록(three backticks), 백틱, 주석 등 **JSON 외의 텍스트 출력은 금지**입니다.
+    - 설명이 필요하면 JSON의 description/instruction/trigger 등 **필드 값(문자열)** 안에 포함하세요.
 
-    ```
+    출력 JSON 구조(스키마)는 다음을 따릅니다:
     {json_structure}
-    ```
     """.strip()
 
 

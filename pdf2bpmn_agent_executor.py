@@ -20,6 +20,7 @@ import traceback
 import xml.etree.ElementTree as ET
 import sys
 from html.parser import HTMLParser
+from urllib.parse import urlparse, urlunparse
 
 from src.pdf2bpmn.processgpt.bpmn_xml_generator import ProcessGPTBPMNXmlGenerator
 from src.pdf2bpmn.processgpt.process_definition_prompt import build_system_prompt_processgpt
@@ -238,6 +239,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         # PDF2BPMN 서버 설정
         self.pdf2bpmn_url = os.getenv('PDF2BPMN_URL', self.config.get('pdf2bpmn_url', 'http://localhost:8001'))
         self.timeout = self.config.get('timeout', 3600)  # 1시간 타임아웃
+
+        # Docker 컨테이너 내부에서 localhost 해석 차이 보정
+        # - 일부 환경에서 localhost가 IPv6(::1) 우선으로 해석되며 0.0.0.0 바인딩 서버에 접속이 실패할 수 있어
+        #   PDF2BPMN_URL의 host가 localhost면 127.0.0.1로 고정합니다.
+        if self._is_running_in_docker():
+            self.pdf2bpmn_url = self._rewrite_localhost_url(self.pdf2bpmn_url, localhost_target="127.0.0.1")
         
         # Supabase 설정
         self.supabase_url = os.getenv('SUPABASE_URL')
@@ -246,7 +253,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
         # OpenAI client (for form generation)
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
-        self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o")
+        # Default to gpt-4.1 for longer, more stable structured outputs.
+        self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1")
         # Separate models (requested: user/agent creation vs process creation)
         self.user_mapping_model = os.getenv("USER_MAPPING_MODEL", self.openai_model)
         self.process_definition_model = os.getenv("PROCESS_DEF_MODEL", self.openai_model)
@@ -1309,8 +1317,43 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             path_parts = parsed.path.split('/')
             if path_parts:
                 result["pdf_name"] = unquote(path_parts[-1])
+
+        # Docker 환경에서 로컬 Supabase(Storage) URL이 localhost/127.0.0.1로 들어오는 경우 보정
+        # - 컨테이너 내부에서 127.0.0.1은 컨테이너 자신이므로, 호스트의 Supabase에 접근하려면 host.docker.internal로 바꿔야 함
+        if result.get("pdf_url") and self._is_running_in_docker():
+            rewritten = self._rewrite_localhost_url(result["pdf_url"], localhost_target="host.docker.internal")
+            if rewritten != result["pdf_url"]:
+                logger.info(f"[PARSE] Rewrote pdf_url for Docker: {result['pdf_url']} -> {rewritten}")
+                result["pdf_url"] = rewritten
         
         return result
+
+    @staticmethod
+    def _is_running_in_docker() -> bool:
+        """컨테이너 내부 실행 여부를 최대한 안전하게 판별"""
+        try:
+            return os.getenv("RUNNING_IN_DOCKER", "").lower() == "true" or Path("/.dockerenv").exists()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _rewrite_localhost_url(url: str, localhost_target: str) -> str:
+        """
+        URL의 host가 localhost/127.0.0.1이면 localhost_target으로 치환합니다.
+        예) http://127.0.0.1:54321/... -> http://host.docker.internal:54321/...
+        """
+        try:
+            p = urlparse(url)
+            host = (p.hostname or "").lower()
+            if host not in {"localhost", "127.0.0.1"}:
+                return url
+
+            netloc = localhost_target
+            if p.port:
+                netloc = f"{localhost_target}:{p.port}"
+            return urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+        except Exception:
+            return url
 
     async def _download_pdf(self, url: str, filename: str = None) -> Tuple[str, str, Optional[str]]:
         """(deprecated) 파일 다운로드 후 (임시 경로, 추정 파일명, content-type) 반환"""
@@ -1324,9 +1367,19 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         """
         client = await self._get_http_client()
 
-        logger.info(f"[DOWNLOAD] Downloading file from: {url}")
+        download_url = url
+        if self._is_running_in_docker():
+            download_url = self._rewrite_localhost_url(download_url, localhost_target="host.docker.internal")
+            if download_url != url:
+                logger.info(f"[DOWNLOAD] Rewrote URL for Docker: {url} -> {download_url}")
 
-        response = await client.get(url, follow_redirects=True)
+        logger.info(f"[DOWNLOAD] Downloading file from: {download_url}")
+
+        try:
+            response = await client.get(download_url, follow_redirects=True)
+        except httpx.ConnectError as e:
+            # ConnectError는 "PDF2BPMN API(8001)" 뿐 아니라 "첨부파일 다운로드 URL"에서도 발생할 수 있음
+            raise Exception(f"파일 다운로드 연결 실패: {download_url} ({e})")
         if response.status_code != 200:
             raise Exception(f"Failed to download file: {response.status_code}")
 
@@ -1788,7 +1841,146 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         """프로세스 정의 생성용: JSON-only 출력 강제 + 파싱 실패 시 재시도."""
         if not self.openai_client:
             return None
-        # Prefer deterministic output for strict JSON parsing.
+
+        def _loads_with_newlines_removed(s: str) -> Any:
+            """
+            JSON 파싱 보강:
+            - 정상 JSON은 json.loads로 바로 파싱됨(포맷팅 개행 포함 OK)
+            - 하지만 LLM이 문자열 값 내부에 '실제 개행 문자'를 넣으면 JSON이 깨짐
+              → 파싱 실패 시 \r/\n/\t 등을 공백으로 치환 후 재시도
+            - 응답이 중간에서 잘린(truncated) 경우가 있어, 아래를 추가로 시도:
+              1) 마지막 닫는 중괄호/대괄호까지 잘라서 파싱 가능한 최대 prefix를 찾기
+              2) 괄호 수가 모자라는 경우(명백히 끝만 잘린 경우) 자동으로 닫아서 재시도
+            """
+            def _try_load(raw: str) -> Any:
+                return json.loads(raw)
+
+            def _sanitize_whitespace(raw: str) -> str:
+                # Normalize raw newlines/tabs that sometimes appear inside string values.
+                s2 = re.sub(r"[\r\n\t]+", " ", raw)
+                s2 = re.sub(r"\s{2,}", " ", s2).strip()
+                return s2
+
+            def _best_effort_trim_to_json_prefix(raw: str) -> Optional[str]:
+                """
+                JSON이 뒤에서 잘린 경우(특히 로깅/전송/모델 출력 이슈),
+                마지막에 "완전한 객체"로 끝나는 prefix를 찾아 파싱을 시도합니다.
+                - 문자열 리터럴/escape를 고려한 간단 스캐너
+                """
+                start = raw.find("{")
+                if start < 0:
+                    return None
+                in_str = False
+                esc = False
+                depth_obj = 0
+                depth_arr = 0
+                last_ok_end = None
+                for i in range(start, len(raw)):
+                    ch = raw[i]
+                    if in_str:
+                        if esc:
+                            esc = False
+                            continue
+                        if ch == "\\":
+                            esc = True
+                            continue
+                        if ch == '"':
+                            in_str = False
+                        continue
+                    else:
+                        if ch == '"':
+                            in_str = True
+                            continue
+                        if ch == "{":
+                            depth_obj += 1
+                        elif ch == "}":
+                            depth_obj = max(0, depth_obj - 1)
+                        elif ch == "[":
+                            depth_arr += 1
+                        elif ch == "]":
+                            depth_arr = max(0, depth_arr - 1)
+                        # 최상위 객체가 닫히는 지점 기록
+                        if depth_obj == 0 and depth_arr == 0 and ch == "}":
+                            last_ok_end = i
+                if last_ok_end is not None:
+                    return raw[start : last_ok_end + 1].strip()
+                return None
+
+            def _autoclose_brackets_if_obvious(raw: str) -> Optional[str]:
+                """
+                문자열 상태를 고려한 괄호 카운팅으로, 끝부분이 잘린 케이스에 한해
+                부족한 ]/}를 뒤에 붙여 파싱을 시도합니다.
+                """
+                start = raw.find("{")
+                if start < 0:
+                    return None
+                in_str = False
+                esc = False
+                opens_obj = 0
+                closes_obj = 0
+                opens_arr = 0
+                closes_arr = 0
+                for ch in raw[start:]:
+                    if in_str:
+                        if esc:
+                            esc = False
+                            continue
+                        if ch == "\\":
+                            esc = True
+                            continue
+                        if ch == '"':
+                            in_str = False
+                        continue
+                    else:
+                        if ch == '"':
+                            in_str = True
+                            continue
+                        if ch == "{":
+                            opens_obj += 1
+                        elif ch == "}":
+                            closes_obj += 1
+                        elif ch == "[":
+                            opens_arr += 1
+                        elif ch == "]":
+                            closes_arr += 1
+                # 문자열이 열린 채로 끝났으면(따옴표 미종료) auto-close는 위험해서 포기
+                if in_str:
+                    return None
+                need_arr = max(0, opens_arr - closes_arr)
+                need_obj = max(0, opens_obj - closes_obj)
+                if need_arr == 0 and need_obj == 0:
+                    return None
+                # 배열을 먼저 닫고 객체를 닫는 것이 일반적으로 안전
+                return (raw.strip() + ("]" * need_arr) + ("}" * need_obj)).strip()
+
+            # 1) Raw parse
+            try:
+                return _try_load(s)
+            except json.JSONDecodeError:
+                pass
+
+            # 2) Whitespace sanitize parse
+            s2 = _sanitize_whitespace(s)
+            try:
+                return _try_load(s2)
+            except json.JSONDecodeError:
+                pass
+
+            # 3) Trim to best valid JSON prefix
+            trimmed = _best_effort_trim_to_json_prefix(s2)
+            if trimmed:
+                try:
+                    return _try_load(trimmed)
+                except json.JSONDecodeError:
+                    pass
+
+            # 4) Auto-close obvious missing brackets/braces
+            closed = _autoclose_brackets_if_obvious(s2)
+            if closed:
+                return _try_load(closed)
+
+            # Give up: let caller handle retry path
+            return _try_load(s2)        # Prefer deterministic output for strict JSON parsing.
         temperature = float(
             os.getenv(
                 "LLM_PROCESS_DEFINITION_TEMPERATURE",
@@ -1833,19 +2025,52 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 resp = await asyncio.to_thread(_run)
                 content = (resp.choices[0].message.content or "").strip()
                 if not content:
+                    logger.warning(
+                        f"[PROCDEF][LLM] empty content returned (attempt={attempt}/3, model={self.process_definition_model})"
+                    )
                     continue
 
                 # First try: content itself is JSON (when response_format=json_object worked)
                 try:
-                    return json.loads(content)
+                    parsed = _loads_with_newlines_removed(content)
+                    if isinstance(parsed, dict):
+                        elems = parsed.get("elements")
+                        elems_len = len(elems) if isinstance(elems, list) else None
+                        logger.info(
+                            f"[PROCDEF][LLM] parsed ok (attempt={attempt}/3, keys={list(parsed.keys())}, elements_len={elems_len})"
+                        )
+                    else:
+                        logger.warning(
+                            f"[PROCDEF][LLM] parsed non-dict JSON (attempt={attempt}/3, type={type(parsed).__name__})"
+                        )
+                    return parsed
                 except json.JSONDecodeError:
                     # Fallback: attempt to recover JSON from markdown/codefence responses
                     json_block = self._extract_json_block_from_markdown(content) or ""
                     if not json_block:
+                        logger.warning(
+                            "[PROCDEF][LLM] JSON decode failed and no JSON block recovered "
+                            f"(attempt={attempt}/3, content_preview={content[:300]!r})"
+                        )
                         continue
                     try:
-                        return json.loads(json_block)
+                        parsed = _loads_with_newlines_removed(json_block)
+                        if isinstance(parsed, dict):
+                            elems = parsed.get("elements")
+                            elems_len = len(elems) if isinstance(elems, list) else None
+                            logger.info(
+                                f"[PROCDEF][LLM] parsed ok from recovered block (attempt={attempt}/3, keys={list(parsed.keys())}, elements_len={elems_len})"
+                            )
+                        else:
+                            logger.warning(
+                                f"[PROCDEF][LLM] parsed non-dict JSON from recovered block (attempt={attempt}/3, type={type(parsed).__name__})"
+                            )
+                        return parsed
                     except json.JSONDecodeError:
+                        logger.warning(
+                            "[PROCDEF][LLM] JSON decode failed even after block recovery "
+                            f"(attempt={attempt}/3, block_preview={json_block[:300]!r}, content_preview={content[:300]!r})"
+                        )
                         continue
             except Exception as e:
                 logger.warning(f"[WARN] OpenAI process-definition call failed (attempt {attempt}/3): {e}")
@@ -2149,6 +2374,16 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         """
         m = dict(elements_model or {})
 
+        # --- Diagnostics: "왜 start/end만 나오나"를 확정하기 위한 로그 ---
+        try:
+            raw_elems = m.get("elements")
+            raw_elems_len = len(raw_elems) if isinstance(raw_elems, list) else None
+            logger.info(
+                f"[PROCDEF][NORMALIZE] begin: process={process_name!r} keys={list(m.keys())} elements_len={raw_elems_len}"
+            )
+        except Exception:
+            pass
+
         # Ensure required identifiers
         m.setdefault("processDefinitionName", process_name)
         if not str(m.get("processDefinitionId") or "").strip():
@@ -2166,6 +2401,14 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             elems = [e for e in elems_raw.values() if isinstance(e, dict)]
         else:
             elems = []
+
+        if not elems:
+            # 이 케이스면 이후 로직이 start/end(+직선 sequence)만 자동 삽입하게 되며,
+            # 결국 proc_def.definition이 start/end만 남는 현상이 발생할 수 있습니다.
+            logger.warning(
+                f"[PROCDEF][NORMALIZE] elements is empty BEFORE repair. This will lead to start/end-only skeleton. "
+                f"(process={process_name!r})"
+            )
 
         # Normalize elementType casing & types
         def norm_element_type(et: str) -> str:
@@ -2450,6 +2693,22 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         # Merge normalized elements list: keep non-seq + normalized seqs at end (stable parsing)
         non_seq = [e for e in elems if e.get("elementType") != "Sequence"]
         m["elements"] = non_seq + seqs
+
+        # Summary counts for debugging
+        try:
+            all_elems = m.get("elements") or []
+            if isinstance(all_elems, list):
+                c_event = sum(1 for e in all_elems if isinstance(e, dict) and e.get("elementType") == "Event")
+                c_act = sum(1 for e in all_elems if isinstance(e, dict) and e.get("elementType") == "Activity")
+                c_gw = sum(1 for e in all_elems if isinstance(e, dict) and e.get("elementType") == "Gateway")
+                c_seq = sum(1 for e in all_elems if isinstance(e, dict) and e.get("elementType") == "Sequence")
+                logger.info(
+                    f"[PROCDEF][NORMALIZE] end counts: events={c_event} activities={c_act} gateways={c_gw} sequences={c_seq} "
+                    f"(process={process_name!r})"
+                )
+        except Exception:
+            pass
+
         return m
 
     async def _prepare_assignment_hints_from_extraction(
@@ -2627,6 +2886,33 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         if not self.openai_client:
             return None
 
+        # --- Diagnostics: extracted input summary (direct cause for empty elements) ---
+        try:
+            ex_tasks = extracted.get("tasks") or extracted.get("activities") or []
+            ex_roles = extracted.get("roles") or []
+            ex_gws = extracted.get("gateways") or []
+            ex_events = extracted.get("events") or []
+            ex_flows = extracted.get("sequence_flows") or extracted.get("flows") or []
+            task_names = []
+            if isinstance(ex_tasks, list):
+                for t in ex_tasks:
+                    if isinstance(t, dict):
+                        n = str(t.get("name") or "").strip()
+                        if n:
+                            task_names.append(n)
+            logger.info(
+                f"[PROCDEF][INPUT] process={process_name!r} "
+                f"tasks={len(ex_tasks) if isinstance(ex_tasks, list) else 'n/a'} "
+                f"roles={len(ex_roles) if isinstance(ex_roles, list) else 'n/a'} "
+                f"gateways={len(ex_gws) if isinstance(ex_gws, list) else 'n/a'} "
+                f"events={len(ex_events) if isinstance(ex_events, list) else 'n/a'} "
+                f"flows={len(ex_flows) if isinstance(ex_flows, list) else 'n/a'} "
+                f"task_samples={task_names[:5]!r} "
+                f"user_request_empty={not bool(str(user_request or '').strip())}"
+            )
+        except Exception:
+            pass
+
         # 1) (프롬프트 개선) ProcessConsultingGenerator 프롬프트로 "말로 된 프로세스 초안"을 먼저 생성
         # NOTE: 담당자 매핑은 "마지막 확장 단계(after forms)"에서 수행한다.
         consulting_outline = await self._generate_process_outline_via_consulting_prompt(
@@ -2636,23 +2922,16 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             hints_simplified={},
         )
 
-        # 2) build system prompt (100% identical target: ProcessDefinitionGenerator.js, ProcessGPT mode)
-        # NOTE: In ProcessGPT backend, external system list is empty (frontend returns []).
-        system_prompt = build_system_prompt_processgpt(
-            external_systems=[],
-            organization_chart=self._org_chart or {},
-            process_definition_map={},
-            existing_process_definition={},
-            strategy={},
-        )
-
-        # 4) extracted info summary + user request
+        # 2) Build prompt inputs for create-only process definition generation
+        # NOTE:
+        # - This backend is create-only; ask/modification rules are intentionally excluded from the LLM prompt
+        #   to avoid ambiguity and {"error":"cannot_comply"} fallbacks.
         extracted_summary = {
             "process_name": process_name,
             "extracted": extracted,
         }
         messages = build_process_definition_messages(
-            base_system_prompt=system_prompt,
+            base_system_prompt="",
             hints_simplified={},
             consulting_outline=consulting_outline,
             extracted_summary=extracted_summary,
@@ -2661,7 +2940,19 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
         elements_model = await self._call_openai_process_definition(messages=messages)
         if not isinstance(elements_model, dict):
+            logger.warning(f"[PROCDEF][LLM] elements_model is not dict -> generation failed (process={process_name!r})")
             return None
+
+        # LLM raw shape summary
+        try:
+            elems = elements_model.get("elements")
+            elems_len = len(elems) if isinstance(elems, list) else None
+            logger.info(
+                f"[PROCDEF][LLM] elements_model received: keys={list(elements_model.keys())} elements_len={elems_len} "
+                f"(process={process_name!r})"
+            )
+        except Exception:
+            pass
 
         # 5) Strict validate/normalize elements model (connectivity + ids + required fields)
         elements_model = self._validate_and_normalize_elements_model(elements_model, process_name=process_name)
@@ -2681,6 +2972,23 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             process_name=str(runtime_def.get("processDefinitionName") or process_name),
             process_definition_id=str(elements_model.get("processDefinitionId") or runtime_def.get("processDefinitionId")),
         )
+
+        # runtime_def summary (this will show when activities are empty -> start/end-only)
+        try:
+            acts = runtime_def.get("activities") or []
+            evs = runtime_def.get("events") or []
+            gws = runtime_def.get("gateways") or []
+            seqs = runtime_def.get("sequences") or []
+            logger.info(
+                f"[PROCDEF][RUNTIME] activities={len(acts) if isinstance(acts, list) else 'n/a'} "
+                f"events={len(evs) if isinstance(evs, list) else 'n/a'} "
+                f"gateways={len(gws) if isinstance(gws, list) else 'n/a'} "
+                f"sequences={len(seqs) if isinstance(seqs, list) else 'n/a'} "
+                f"(process={process_name!r})"
+            )
+        except Exception:
+            pass
+
         # NOTE: 담당자/에이전트 매핑은 forms + inputData 확장 이후 마지막 단계에서 수행 후 저장한다.
         return {"elements_model": elements_model, "definition": runtime_def}
 

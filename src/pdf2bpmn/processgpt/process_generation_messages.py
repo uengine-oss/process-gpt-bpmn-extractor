@@ -29,6 +29,71 @@ def strict_json_only_system_instructions() -> str:
     )
 
 
+def strict_json_only_no_error_system_instructions() -> str:
+    """
+    JSON-only 강제(생성 전용).
+    IMPORTANT:
+    - process definition 생성은 "무조건 생성"이므로 error 폴백을 허용하면 모델이 쉽게 {"error":"cannot_comply"}로 도망갑니다.
+    - 따라서 이 경로에서는 error 폴백을 금지합니다.
+    """
+    return (
+        "### (최우선) 출력 형식 강제 (생성 전용)\n"
+        "- 당신의 출력은 **반드시 단 하나의 JSON 객체**여야 합니다.\n"
+        "- 마크다운/설명 문장/코드블록(```)/백틱/머리말/꼬리말/주석을 **절대 출력하지 마세요**.\n"
+        "- JSON 외의 어떤 문자도 출력하면 실패입니다.\n"
+        "- JSON 내부에도 주석(//, /* */)은 금지입니다.\n"
+        "- 절대로 {\"error\":...} 형태로 응답하지 마세요.\n"
+        "- 입력이 일부 불완전하더라도, 제공된 extracted/컨설팅 초안을 바탕으로 **최선의 프로세스 정의 JSON을 생성**하세요.\n"
+    )
+
+
+def create_only_process_definition_system_instructions() -> str:
+    """
+    생성 전용(Process Definition Create-Only) 규칙.
+    - 질의(askProcessDef), 수정(modifications) 등 다른 모드 규칙을 배제하여 혼선을 줄입니다.
+    """
+    return (
+        "### (목표) 프로세스 정의 생성 전용\n"
+        "- 당신의 작업은 오직 1가지: 제공된 extracted(추출 정보)와 컨설팅 초안에 기반해 **프로세스 정의 JSON**을 생성하는 것입니다.\n"
+        "- 질의(askProcessDef) 응답이나 수정(modifications) 형식은 절대 사용하지 마세요.\n"
+        "- 절대로 {\"processDefinition\":{...}} 처럼 중첩된 래퍼로 감싸지 마세요. 반드시 최상위에 processDefinitionId/processDefinitionName/elements가 있어야 합니다.\n"
+        "\n"
+        "### (필수) 구성 요소\n"
+        "- StartEvent 1개, EndEvent 1개는 반드시 포함\n"
+        "- Activity(UserActivity) 는 반드시 1개 이상 포함 (extracted.tasks 기반으로 구성)\n"
+        "- elements에는 Event/Activity/Gateway/Sequence만 사용\n"
+        "- 모든 non-sequence 요소는 sequence로 연결되어야 함(끊김 금지)\n"
+        "- sequenceFlows 같은 별도 배열로 분리하지 말고, 흐름은 반드시 elements의 Sequence로 표현하세요.\n"
+        "\n"
+        "### (출력 스키마 예시 - 이 형태로 100% 출력)\n"
+        "{\n"
+        "  \"processDefinitionId\": \"<uuid>\",\n"
+        "  \"processDefinitionName\": \"<한글 프로세스명>\",\n"
+        "  \"description\": \"<한글 설명>\",\n"
+        "  \"isHorizontal\": true,\n"
+        "  \"data\": [],\n"
+        "  \"roles\": [{\"name\":\"100센터\",\"endpoint\":\"role_100_center\",\"resolutionRule\":\"\",\"origin\":\"created\"}],\n"
+        "  \"elements\": [\n"
+        "    {\"elementType\":\"Event\",\"id\":\"start_event\",\"name\":\"프로세스 시작\",\"role\":\"100센터\",\"type\":\"StartEvent\",\"description\":\"\",\"trigger\":\"\"},\n"
+        "    {\"elementType\":\"Activity\",\"id\":\"task1\",\"name\":\"청약접수\",\"role\":\"100센터\",\"type\":\"UserActivity\",\"source\":\"start_event\",\"description\":\"\",\"instruction\":\"\",\"inputData\":[],\"outputData\":[\"청약접수 결과\"],\"checkpoints\":[],\"duration\":\"5\"},\n"
+        "    {\"elementType\":\"Sequence\",\"id\":\"seq_start_task1\",\"name\":\"\",\"source\":\"start_event\",\"target\":\"task1\",\"condition\":\"\"},\n"
+        "    {\"elementType\":\"Event\",\"id\":\"end_event\",\"name\":\"프로세스 종료\",\"role\":\"100센터\",\"type\":\"EndEvent\",\"description\":\"\",\"trigger\":\"\"}\n"
+        "  ],\n"
+        "  \"subProcesses\": [],\n"
+        "  \"participants\": []\n"
+        "}\n"
+        "\n"
+        "### (역할/태스크 사용 규칙)\n"
+        "- extracted.roles가 있으면 roles는 최대한 extracted.roles를 반영\n"
+        "- extracted.tasks가 있으면 Activity는 extracted.tasks의 이름/순서를 최대한 보존\n"
+        "- role이 불명확하면 extracted.roles 중 가장 근접한 역할을 선택하거나, 최소 1개의 역할을 생성하여 모든 Activity/Event/Gateway에 role을 부여\n"
+        "\n"
+        "### (시퀀스/게이트웨이)\n"
+        "- extracted.gateways / extracted.sequence_flows 정보가 있으면 반영\n"
+        "- gateway를 만드는 경우 outgoing이 2개 이상이어야 하며, ExclusiveGateway면 각 outgoing condition을 한글로 채우세요\n"
+    )
+
+
 def process_quality_system_instructions() -> str:
     """
     Extra constraints to improve BPMN quality beyond the baseline ProcessGPT prompt.
@@ -56,28 +121,22 @@ def build_process_definition_messages(
     """
     Build the messages array passed to the LLM for ProcessGPT process definition generation.
     """
-    extra_system = (
-        "### (추가) 역할/에이전트 매핑 힌트\n"
-        "- 아래 JSON은 Neo4j 추출정보 + 조직도/유저목록을 보고 'role/activity'별로 최소 매핑을 만든 결과입니다.\n"
-        "- 프로세스 생성 시 role 이름을 일관되게 사용하고, role에 매핑된 담당자/에이전트가 있으면 최대한 반영하세요.\n"
-        "- agentMode는 항상 \"draft\", orchestration은 항상 \"crewai-action\"으로 고정됩니다(후처리에서 강제됨).\n"
-        "- 출력 포맷은 기존 프롬프트의 JSON 형식을 그대로 따르되, role/활동 이름/ID의 일관성을 최우선으로 하세요.\n"
-        "- 가능한 경우, 역할 endpoint는 실제 agent(user_id)를 가리키도록 하세요(에이전트가 필요한 경우 자동 생성됨).\n"
-        f"\n[hints_simplified]\n{json.dumps(hints_simplified, ensure_ascii=False)}\n"
-    )
+    # IMPORTANT:
+    # - 이 백엔드는 "무조건 생성(create)"만 수행합니다.
+    # - 따라서 askProcessDef/modifications 같은 다중 모드 규칙을 프롬프트에 포함하면 모델이 혼란을 느끼고
+    #   {"error":"cannot_comply"} 같은 폴백을 선택할 수 있습니다.
+    # - 최종 입력은 "컨설팅 초안 + extracted 전체"만 포함합니다. (user_request는 컨설팅 단계에서 이미 반영됨)
 
     user_prompt = (
-        ((f"컨설팅 기반 프로세스 초안(참고):\n{consulting_outline}\n\n") if consulting_outline else "")
-        + f"사용자 생성/정의 요청:\n{user_request}\n\n"
-        + "PDF/Neo4j에서 추출된 프로세스 정보:\n"
+        ((f"컨설팅 기반 프로세스 초안:\n{consulting_outline}\n\n") if consulting_outline else "")
+        + "추출된 프로세스 정보(extracted 전체):\n"
         + f"{json.dumps(extracted_summary, ensure_ascii=False)}\n"
     )
 
     return [
-        {"role": "system", "content": base_system_prompt},
-        {"role": "system", "content": extra_system},
+        {"role": "system", "content": create_only_process_definition_system_instructions()},
         {"role": "system", "content": process_quality_system_instructions()},
-        {"role": "system", "content": strict_json_only_system_instructions()},
+        {"role": "system", "content": strict_json_only_no_error_system_instructions()},
         {"role": "user", "content": user_prompt},
     ]
 

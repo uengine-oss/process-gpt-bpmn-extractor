@@ -166,7 +166,7 @@ PDF 입력 → 텍스트 추출 → 엔티티 추출(LLM) → 정규화/중복�
 ### 기술 스택
 
 - **LangGraph**: 워크플로우 오케스트레이션
-- **OpenAI GPT-4o**: 엔티티 추출 및 분석
+- **OpenAI GPT-4.1**: 엔티티 추출 및 분석
 - **Neo4j**: 지식그래프 저장
 - **pdfplumber**: PDF 텍스트 추출
 - **Streamlit**: Web UI
@@ -179,7 +179,7 @@ PDF 입력 → 텍스트 추출 → 엔티티 추출(LLM) → 정규화/중복�
 ```env
 # OpenAI
 OPENAI_API_KEY=your_api_key
-OPENAI_MODEL=gpt-4o
+OPENAI_MODEL=gpt-4.1
 
 # Neo4j
 NEO4J_URI=bolt://localhost:7687

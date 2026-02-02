@@ -46,6 +46,8 @@ ENV LANG=ko_KR.UTF-8 \
 # Copy requirements files
 COPY pyproject.toml ./
 COPY requirements-agent.txt ./
+# Needed for `-e .` (pyproject readme points to README.md)
+COPY README.md ./
 
 # Copy application source (needed for `-e .` in requirements-agent.txt)
 COPY src/ ./src/

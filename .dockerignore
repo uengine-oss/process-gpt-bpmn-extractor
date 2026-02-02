@@ -51,6 +51,8 @@ htmlcov/
 doc/
 docs/
 *.md
+!README.md
+!README_AGENT.md
 
 # Frontend (not needed in backend image)
 frontend/

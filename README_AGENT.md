@@ -16,8 +16,6 @@ ProcessGPT SDK를 활용한 PDF to BPMN 변환 에이전트입니다.
                               ↓
             [PDF2BPMN 에이전트] ← polling (agent_orch='pdf2bpmn')
                               ↓
-                    [PDF2BPMN API 서버] (PDF 분석 & BPMN 생성)
-                              ↓
                     [Events 테이블] → 실시간 진행 상황
                               ↓
                     [proc_def, configuration 저장]
@@ -30,7 +28,7 @@ ProcessGPT SDK를 활용한 PDF to BPMN 변환 에이전트입니다.
 1. **PDF 업로드**: 사용자가 프론트엔드에서 PDF 파일 업로드 및 메시지 전송
 2. **Todolist 추가**: 메인채팅 에이전트가 MCP 도구(`create_pdf2bpmn_workitem`)로 작업 추가
 3. **작업 폴링**: PDF2BPMN 에이전트가 `agent_orch='pdf2bpmn'` 조건의 todo를 폴링
-4. **BPMN 생성**: PDF 분석 → 엔티티 추출 → BPMN XML 생성
+4. **BPMN 생성**: (에이전트 내부에서) PDF 분석 → 엔티티 추출 → BPMN XML 생성
 5. **이벤트 전송**: 각 BPMN 생성 시 events 테이블에 실시간 이벤트 전송
 6. **저장**: 생성된 BPMN을 proc_def 및 configuration(proc_map)에 저장
 7. **프론트엔드 표시**: events watch로 실시간 진행 상황 표시
@@ -48,6 +46,8 @@ pip install -r requirements-agent.txt
 uv pip install -r requirements-agent.txt
 ```
 
+> 참고: `requirements-agent.txt`에는 `-e .`가 포함되어 있어, 프로젝트 메인 의존성(neo4j/langgraph/pdfplumber 등)도 함께 설치됩니다.
+
 ### 2. 환경 설정
 
 `agent.env.example`을 `agent.env` 또는 `.env.local`로 복사하고 설정:
@@ -58,9 +58,6 @@ cp agent.env.example agent.env
 
 환경 변수:
 ```env
-# PDF2BPMN API 서버 URL
-PDF2BPMN_URL=http://localhost:8001
-
 # Supabase 설정
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_ANON_KEY=your-anon-key
@@ -72,26 +69,14 @@ POLLING_INTERVAL=5
 TASK_TIMEOUT=300
 ```
 
-### 3. PDF2BPMN API 서버 실행
-
-먼저 PDF2BPMN API 서버가 실행 중이어야 합니다:
+### 3. 에이전트 서버 실행
 
 ```bash
-# Windows
-Set-Location C:\Users\user\Desktop\pdf2bpmn
-$env:PYTHONIOENCODING="utf-8"
-uv run python run.py api --port 8001
-
-# Linux/Mac
-cd /path/to/pdf2bpmn
-python run.py api --port 8001
+uv run python pdf2bpmn_agent_server.py
 ```
 
-### 4. 에이전트 서버 실행
-
-```bash
-python pdf2bpmn_agent_server.py
-```
+> 주의: 시스템 Python(예: `C:\\Python313\\python.exe`)로 실행하면 패키지가 누락될 수 있습니다.  
+> `uv run` 또는 `.venv` 활성화 후 실행하세요.
 
 ## 파일 구조
 
@@ -223,9 +208,9 @@ CREATE TABLE proc_def (
 - todolist 테이블에 `agent_orch='pdf2bpmn'` 조건의 작업이 있는지 확인
 
 ### BPMN 생성 실패
-- PDF2BPMN API 서버가 실행 중인지 확인
-- `PDF2BPMN_URL` 환경 변수가 올바른지 확인
-- API 서버 로그 확인
+- 에이전트 로그에서 오류 메시지 확인
+- `OPENAI_API_KEY`, Neo4j 연결 정보(예: `NEO4J_URI`)가 올바른지 확인
+- 문서 다운로드 URL(`pdf_url`) 접근 가능 여부 확인
 
 ### 프론트엔드에서 이벤트가 표시되지 않음
 - Supabase Realtime이 활성화되어 있는지 확인

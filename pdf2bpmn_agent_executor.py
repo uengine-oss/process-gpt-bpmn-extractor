@@ -4705,15 +4705,14 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # if retry_count >= max_retries:
             #     raise Exception("처리 시간 초과")
             
-            client = await self._get_http_client()
-            
             # =================================================================
-            # 4. PDF URL로 처리 시작
+            # 4. PDF URL 다운로드 및 (필요 시) PDF 변환
+            #    - 내부 FastAPI(/api/*) 호출은 제거하고, 워크플로우를 직접 실행합니다.
             # =================================================================
             pdf_url = parsed.get("pdf_url", "")
             if not pdf_url:
                 raise Exception("PDF URL이 제공되지 않았습니다. query에 pdf_url을 포함해주세요.")
-            
+
             await self._send_progress_event(
                 event_queue, context_id, task_id, job_id,
                 f"[DOWNLOAD] 파일 다운로드 중: {pdf_name}",
@@ -4732,10 +4731,9 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             except Exception:
                 is_pdf = False
 
-            upload_path = temp_download_path
-            upload_name = pdf_name
+            pdf_path_for_workflow = temp_download_path
 
-            # PDF가 아니면 로컬에서 PDF로 변환 후 업로드
+            # PDF가 아니면 로컬에서 PDF로 변환
             if not is_pdf:
                 await self._send_progress_event(
                     event_queue, context_id, task_id, job_id,
@@ -4780,10 +4778,9 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     from src.pdf2bpmn.converters.file_to_pdf import convert_to_pdf, FileToPdfError  # type: ignore
 
                     converted_pdf = convert_to_pdf(str(temp_download_path), str(Path(str(temp_download_path)).parent))
-                    upload_path = converted_pdf
-                    upload_name = Path(converted_pdf).name
+                    pdf_path_for_workflow = converted_pdf
                     temp_pdf_path = converted_pdf
-                    pdf_name = upload_name
+                    pdf_name = Path(converted_pdf).name
                 except FileToPdfError as e:
                     raise Exception(f"파일을 PDF로 변환하지 못했습니다: {e}")
                 finally:
@@ -4795,186 +4792,239 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     except Exception:
                         pass
             else:
-                # PDF인데 확장자가 PDF가 아니면 업로드 파일명을 보정(서버가 변환을 오판하지 않게)
-                if not str(upload_name).lower().endswith(".pdf"):
-                    upload_name = str(Path(upload_name).with_suffix(".pdf"))
-                    pdf_name = upload_name
+                # PDF인데 확장자가 PDF가 아니면 표시용 이름만 보정
+                if not str(pdf_name).lower().endswith(".pdf"):
+                    pdf_name = str(Path(pdf_name).with_suffix(".pdf"))
 
-            await self._send_progress_event(
-                event_queue, context_id, task_id, job_id,
-                f"[UPLOAD] 파일을 분석 서버에 업로드 중: {upload_name}",
-                "tool_usage_started", 10
-            )
-
-            # PDF2BPMN API에 업로드
-            with open(upload_path, 'rb') as f:
-                # Content-Type은 일반적으로 octet-stream으로 보내고,
-                # 서버가 filename 확장자를 보고 PDF 변환 여부를 결정합니다.
-                files = {'file': (upload_name, f, 'application/octet-stream')}
-                upload_response = await client.post(f"{self.pdf2bpmn_url}/api/upload", files=files)
-            
-            if upload_response.status_code != 200:
-                raise Exception(f"PDF 업로드 실패: {upload_response.status_code} - {upload_response.text}")
-            
-            upload_result = upload_response.json()
-            processing_job_id = upload_result.get("job_id")
-            logger.info(f"[INFO] PDF 업로드 완료, job_id: {processing_job_id}")
-            
             # =================================================================
-            # 5. PDF 처리 시작 및 진행 상황 폴링
+            # 5. PDF2BPMN 워크플로우를 "직접 호출"로 실행 (FastAPI BackgroundTasks 제거)
             # =================================================================
             await self._send_progress_event(
                 event_queue, context_id, task_id, job_id,
-                "[PROCESSING] PDF 분석 및 BPMN 변환을 시작합니다...",
+                "[PROCESSING] PDF 분석 및 엔티티 추출을 시작합니다...",
                 "tool_usage_started", 15
             )
-            
-            process_response = await client.post(f"{self.pdf2bpmn_url}/api/process/{processing_job_id}")
-            if process_response.status_code != 200:
-                raise Exception(f"처리 시작 실패: {process_response.status_code}")
-            
-            # 진행 상황 폴링 (self.timeout 사용 - config에서 전달받은 값, 기본 1시간)
-            max_retries = self.timeout  # 1초 간격으로 폴링
-            retry_count = 0
-            last_progress = 15
-            logger.info(f"[INFO] PDF 처리 폴링 시작 (timeout: {self.timeout}초)")
-            
-            while retry_count < max_retries:
+
+            # Import here to keep agent startup light
+            from src.pdf2bpmn.workflow.graph import PDF2BPMNWorkflow  # type: ignore
+
+            # IMPORTANT:
+            # - 일부 단계는 asyncio.to_thread(...)에서 실행되며 progress_callback도 워커 스레드에서 호출됩니다.
+            # - ProcessGPT SDK의 event_queue.enqueue_event()는 내부적으로 asyncio.create_task(...)를 사용하므로
+            #   "실행 중인 이벤트 루프가 있는 스레드"에서만 호출되어야 합니다.
+            # - 따라서 스레드에서 콜백이 오더라도 메인 루프 스레드로 안전하게 마샬링합니다.
+            main_loop = asyncio.get_running_loop()
+
+            def _enqueue_progress(msg: str, progress: int, extra: Optional[Dict[str, Any]] = None):
+                event_data = {
+                    "message": msg,
+                    "status": "tool_usage_started",
+                    "progress": int(progress),
+                    "job_id": job_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                if extra:
+                    event_data.update(extra)
+
+                evt = TaskStatusUpdateEvent(
+                    status={
+                        "state": TaskState.working,
+                        "message": new_agent_text_message(
+                            json.dumps(event_data, ensure_ascii=False),
+                            context_id, task_id,
+                        ),
+                    },
+                    final=False,
+                    contextId=context_id,
+                    taskId=task_id,
+                    metadata={
+                        "crew_type": "pdf2bpmn",
+                        "event_type": "tool_usage_started",
+                        "job_id": job_id,
+                        "progress": int(progress),
+                    },
+                )
+
+                # Always marshal to main loop thread (safe for both same-thread and worker-thread callers)
+                try:
+                    main_loop.call_soon_threadsafe(event_queue.enqueue_event, evt)
+                except Exception:
+                    # Extremely defensive fallback: if loop is unavailable, try direct enqueue
+                    event_queue.enqueue_event(evt)
+
+            workflow = PDF2BPMNWorkflow()
+            state: Dict[str, Any] = {
+                "pdf_paths": [str(pdf_path_for_workflow)],
+                "documents": [],
+                "sections": [],
+                "reference_chunks": [],
+                "processes": [],
+                "tasks": [],
+                "roles": [],
+                "gateways": [],
+                "events": [],
+                "skills": [],
+                "dmn_decisions": [],
+                "dmn_rules": [],
+                "evidences": [],
+                "open_questions": [],
+                "resolved_questions": [],
+                "current_question": None,
+                "user_answer": None,
+                "confidence_threshold": 0.8,
+                "current_step": "ingest_pdf",
+                "error": None,
+                "bpmn_xml": None,
+                "bpmn_xmls": {},
+                "bpmn_files": {},
+                "skill_docs": {},
+                "dmn_xml": None,
+            }
+
+            try:
+                # Neo4j schema init (same as API)
+                await asyncio.to_thread(workflow.neo4j.init_schema)
+
                 if self.is_cancelled:
                     raise Exception("작업이 취소되었습니다.")
-                
-                status_response = await client.get(f"{self.pdf2bpmn_url}/api/jobs/{processing_job_id}")
-                if status_response.status_code != 200:
-                    raise Exception(f"상태 조회 실패: {status_response.status_code}")
-                
-                job_status = status_response.json()
-                current_status = job_status.get("status", "")
-                current_progress = job_status.get("progress", 0)
-                detail_message = job_status.get("detail_message", "")
-                
-                if retry_count % 10 == 0:  # 10초마다 로그
-                    logger.info(f"[POLL] status={current_status}, progress={current_progress}")
-                
-                if current_status == "completed":
-                    logger.info("[INFO] Processing completed")
-                    break
-                elif current_status == "error":
-                    error_msg = job_status.get("error", "알 수 없는 오류")
-                    raise Exception(f"처리 중 오류 발생: {error_msg}")
-                
-                # 진행률 이벤트 (변경 시에만)
-                mapped_progress = 15 + int(current_progress * 0.7)  # 15% ~ 85%
-                if current_progress != last_progress:
-                    await self._send_progress_event(
-                        event_queue, context_id, task_id, job_id,
-                        f"[PROCESSING] {detail_message or f'진행 중... ({current_progress}%)'}",
-                        "tool_usage_started", mapped_progress
-                    )
-                    last_progress = current_progress
-                
-                await asyncio.sleep(1)
-                retry_count += 1
-            
-            if retry_count >= max_retries:
-                raise Exception("처리 시간 초과")
-            
+
+                # Step 1: ingest_pdf
+                _enqueue_progress("[STEP] PDF 파싱 중...", 20)
+                state.update(await asyncio.to_thread(workflow.ingest_pdf, state))
+                page_count = 0
+                try:
+                    docs = state.get("documents") or []
+                    if docs:
+                        page_count = int(getattr(docs[0], "page_count", 0) or 0)
+                except Exception:
+                    page_count = 0
+                chunk_count = len(state.get("reference_chunks") or [])
+                _enqueue_progress(f"[STEP] PDF 파싱 완료: {page_count}페이지, {chunk_count}개 청크", 28)
+
+                if self.is_cancelled:
+                    raise Exception("작업이 취소되었습니다.")
+
+                # Step 2: segment_sections
+                _enqueue_progress("[STEP] 섹션 분석 및 임베딩 생성 중...", 32)
+                state.update(await asyncio.to_thread(workflow.segment_sections, state))
+                section_count = len(state.get("sections") or [])
+                _enqueue_progress(f"[STEP] 섹션 분석 완료: {section_count}개 섹션", 38)
+
+                if self.is_cancelled:
+                    raise Exception("작업이 취소되었습니다.")
+
+                # Step 3: extract_candidates_with_progress (LLM-heavy)
+                total_sections = len([s for s in (state.get("sections") or []) if getattr(s, "content", None) and len((s.content or "").strip()) >= 50])
+                _enqueue_progress(f"[STEP] 엔티티 추출 시작: {total_sections}개 섹션", 40, {"chunk_info": {"current": 0, "total": total_sections}})
+
+                def _progress_callback(current: int, total: int, msg: str):
+                    # Map to 40~55
+                    mapped = 40 + int((current / max(total, 1)) * 15)
+                    _enqueue_progress(f"[EXTRACT] {msg}", mapped, {"chunk_info": {"current": current, "total": total}})
+
+                state.update(await asyncio.to_thread(workflow.extract_candidates_with_progress, state, _progress_callback))
+                process_count = len(state.get("processes") or [])
+                task_count = len(state.get("tasks") or [])
+                role_count = len(state.get("roles") or [])
+                _enqueue_progress(f"[STEP] 추출 완료: 프로세스 {process_count}, 태스크 {task_count}, 역할 {role_count}", 58)
+
+                if self.is_cancelled:
+                    raise Exception("작업이 취소되었습니다.")
+
+                # Step 4: normalize_entities
+                _enqueue_progress("[STEP] 엔티티 정규화 및 중복 제거 중...", 62)
+                state.update(await asyncio.to_thread(workflow.normalize_entities, state))
+                _enqueue_progress("[STEP] 정규화 완료", 70)
+
+                if self.is_cancelled:
+                    raise Exception("작업이 취소되었습니다.")
+
+                # Step 5: generate_skills
+                _enqueue_progress("[STEP] Agent Skill 문서 생성 중...", 74)
+                state.update(await asyncio.to_thread(workflow.generate_skills, state))
+                _enqueue_progress("[STEP] Agent Skill 문서 생성 완료", 80)
+
+                if self.is_cancelled:
+                    raise Exception("작업이 취소되었습니다.")
+
+                # Step 6: generate_dmn
+                _enqueue_progress("[STEP] DMN 의사결정 테이블 생성 중...", 84)
+                state.update(await asyncio.to_thread(workflow.generate_dmn, state))
+                _enqueue_progress("[STEP] DMN 생성 완료", 88)
+
+                if self.is_cancelled:
+                    raise Exception("작업이 취소되었습니다.")
+
+                # Step 7: export_artifacts
+                _enqueue_progress("[STEP] 결과물 저장 중...", 92)
+                state.update(await asyncio.to_thread(workflow.export_artifacts, state))
+                _enqueue_progress("[STEP] PDF2BPMN 워크플로우 완료", 95)
+
+            finally:
+                try:
+                    workflow.neo4j.close()
+                except Exception:
+                    pass
+
             # =================================================================
-            # 6. 결과 가져오기 - processing_job_id 기준으로 "이번 작업" 결과만 조회
+            # 6. 이번 작업에서 생성된 process_id 목록을 state에서 직접 수집 + Neo4j에서 상세 조회
             # =================================================================
             await self._send_progress_event(
                 event_queue, context_id, task_id, job_id,
                 "[GENERATING] 이번 작업의 추출 정보(Neo4j)로 ProcessGPT 프로세스 정의/유저 매핑을 생성합니다...",
                 "tool_usage_started", 88
             )
-            # 6-1) 작업(job) 상태에서 이번 처리 결과(process_id 목록)를 가져온다.
             job_process_ids: List[str] = []
             process_names_by_id: Dict[str, str] = {}
-            last_result_info: Dict[str, Any] = {}
-            try:
-                # API 쪽에서 status=completed와 result 세팅 타이밍 레이스가 있을 수 있어
-                # process_ids가 채워질 때까지 짧게 재시도합니다.
-                for attempt in range(1, 11):  # 최대 약 5초(0.5s * 10) 대기
-                    job_status_response = await client.get(f"{self.pdf2bpmn_url}/api/jobs/{processing_job_id}")
-                    if job_status_response.status_code != 200:
-                        logger.warning(
-                            f"[WARN] job status 조회 실패: {job_status_response.status_code} - {job_status_response.text}"
-                        )
-                        break
+            processes_state = state.get("processes", []) or []
+            for p in processes_state:
+                try:
+                    pid = getattr(p, "proc_id", None) or getattr(p, "process_id", None) or getattr(p, "id", None)
+                    pname = getattr(p, "name", None)
+                    if pid:
+                        job_process_ids.append(str(pid))
+                        if pname:
+                            process_names_by_id[str(pid)] = str(pname)
+                except Exception:
+                    continue
 
-                    job_status = job_status_response.json()
-                    result_info = (job_status.get("result") or {})
-                    if isinstance(result_info, dict):
-                        last_result_info = result_info
-
-                    # 우선순위: process_ids (job 단위 스코핑) -> bpmn_files keys (구버전/옵션)
-                    result_process_ids = result_info.get("process_ids")
-                    if isinstance(result_process_ids, list) and result_process_ids:
-                        job_process_ids = [str(pid) for pid in result_process_ids if pid]
-                    else:
-                        job_bpmn_files = (result_info.get("bpmn_files") or {})
-                        if isinstance(job_bpmn_files, dict) and job_bpmn_files:
-                            job_process_ids = [str(pid) for pid in job_bpmn_files.keys() if pid]
-
-                    pn = result_info.get("process_names")
-                    if isinstance(pn, dict) and not process_names_by_id:
-                        process_names_by_id = {str(k): str(v) for k, v in pn.items() if k and v}
-
-                    if job_process_ids:
-                        if attempt > 1:
-                            logger.info(f"[INFO] job result process_ids 확인됨 (attempt={attempt})")
-                        break
-
-                    # 아직 result가 비어있을 수 있음(레이스) → 잠깐 대기 후 재시도
-                    await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.warning(f"[WARN] job status 조회 중 예외: {e}")
-
-            # 6-2) job_id 기반 process_id들로 Neo4j 추출 정보를 개별 조회한다.
             extracted_by_proc_id: Dict[str, Dict[str, Any]] = {}
             if not job_process_ids:
-                # 이미지 슬라이드/PPT 등 "프로세스 추출이 0개"인 케이스는 정상 성공(0개)로 처리합니다.
-                # - result.processes(=추출된 프로세스 수)가 0이면 생성할 BPMN이 없음을 사용자에게 안내
-                # - 그 외에는 시스템 오류로 보고 실패 처리
-                extracted_count = None
-                if isinstance(last_result_info, dict):
-                    extracted_count = last_result_info.get("processes")
-                    if extracted_count is None:
-                        extracted_count = last_result_info.get("process_count")
+                await self._send_progress_event(
+                    event_queue, context_id, task_id, job_id,
+                    "[NOTICE] 문서에서 추출된 프로세스가 없어 생성할 BPMN이 없습니다. (이미지/슬라이드 위주 문서일 수 있습니다.)",
+                    "tool_usage_finished", 100,
+                    {"process_count": 0, "reason": "no_process_extracted"},
+                )
+            else:
+                logger.info(f"[INFO] 이번 작업 기준 추출 프로세스: {len(job_process_ids)}개")
 
-                if extracted_count == 0:
-                    await self._send_progress_event(
-                        event_queue, context_id, task_id, job_id,
-                        "[NOTICE] 문서에서 추출된 프로세스가 없어 생성할 BPMN이 없습니다. (이미지/슬라이드 위주 문서일 수 있습니다.)",
-                        "tool_usage_finished", 100,
-                        {"process_count": 0, "reason": "no_process_extracted"}
-                    )
-                    # bpmn_files는 빈 상태로 유지하고, 이후 로직에서 0개 결과로 정상 완료 메시지를 발송합니다.
-                else:
-                    raise Exception(
-                        "이번 처리(job_id)에서 생성된 process_id 목록을 얻지 못했습니다. "
-                        "PDF2BPMN API가 /api/jobs/{job_id}.result.process_ids(권장) 또는 result.bpmn_files를 제공해야 합니다."
-                    )
+                # Re-open Neo4j client for detail queries (workflow.neo4j was closed)
+                from src.pdf2bpmn.graph.neo4j_client import Neo4jClient  # type: ignore
 
-            if job_process_ids:
-                logger.info(f"[INFO] 이번 작업(processing_job_id={processing_job_id}) 프로세스 {len(job_process_ids)}개 감지")
-                for proc_id in job_process_ids:
+                neo4j = Neo4jClient()
+                try:
+                    for proc_id in job_process_ids:
+                        try:
+                            detail = await asyncio.to_thread(neo4j.get_process_with_details, proc_id)
+                            if not detail:
+                                continue
+                            flows = await asyncio.to_thread(neo4j.get_sequence_flows, proc_id)
+                            if isinstance(flows, list):
+                                detail["sequence_flows"] = flows
+                            extracted_by_proc_id[proc_id] = {
+                                "detail": detail,
+                                "process_name": (detail.get("process", {}) or {}).get("name")
+                                or process_names_by_id.get(proc_id)
+                                or "",
+                            }
+                        except Exception as e:
+                            logger.warning(f"[WARN] process detail 조회 중 예외: proc_id={proc_id}, err={e}")
+                finally:
                     try:
-                        detail_response = await client.get(f"{self.pdf2bpmn_url}/api/processes/{proc_id}")
-                        if detail_response.status_code != 200:
-                            logger.warning(
-                                f"[WARN] process detail 조회 실패: proc_id={proc_id}, status={detail_response.status_code}"
-                            )
-                            continue
-                        detail = detail_response.json()
-                        extracted_by_proc_id[proc_id] = {
-                            "detail": detail,
-                            "process_name": (detail.get("process", {}) or {}).get("name")
-                            or detail.get("name")
-                            or process_names_by_id.get(proc_id)
-                            or "",
-                        }
-                    except Exception as e:
-                        logger.warning(f"[WARN] process detail 조회 중 예외: proc_id={proc_id}, err={e}")
+                        neo4j.close()
+                    except Exception:
+                        pass
 
             extracted_count2 = len(extracted_by_proc_id)
             logger.info(f"[INFO] 이번 작업 기준 추출 프로세스: {extracted_count2}개")
@@ -5235,10 +5285,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             logger.info(f"[DONE] Task completed: {job_id} ({actual_count} processes)")
             
         except httpx.ConnectError as e:
-            logger.error(f"[ERROR] Cannot connect to PDF2BPMN server: {e}")
-            error_msg = f"PDF2BPMN 서버에 연결할 수 없습니다: {self.pdf2bpmn_url}. 서버가 실행 중인지 확인하세요."
+            # 보통은 _download_file에서 ConnectError를 Exception으로 감싸 올리지만,
+            # 방어적으로 남겨둡니다(네트워크 계층 오류).
+            logger.error(f"[ERROR] Network connection error: {e}")
+            error_msg = f"네트워크 연결 오류가 발생했습니다: {str(e)}"
             await self._send_error_event(event_queue, context_id, task_id, job_id, error_msg, "connection_error")
-            
+
         except Exception as e:
             logger.error(f"[ERROR] Task execution error: {e}")
             logger.error(traceback.format_exc())

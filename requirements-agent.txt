@@ -1,9 +1,18 @@
 # PDF2BPMN Agent Server 의존성
 # pip install -r requirements-agent.txt
 
+# NOTE:
+# - agent는 이제 FastAPI를 호출하지 않고, PDF2BPMNWorkflow를 "직접 import/호출"합니다.
+# - 따라서 프로젝트 메인 의존성(neo4j/langgraph/pdfplumber 등)이 필요합니다.
+# - 아래 한 줄로 pyproject.toml의 dependencies를 함께 설치합니다.
+-e .
+
 # ProcessGPT SDK (에이전트 프레임워크)
 # PyPI: https://pypi.org/project/process-gpt-agent-sdk/
 process-gpt-agent-sdk==0.4.13
+
+# Neo4j driver (workflow import/runtime requirement)
+neo4j>=5.0.0
 
 # Supabase (데이터베이스 연동)
 supabase>=2.0.0

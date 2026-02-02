@@ -47,6 +47,13 @@ ENV LANG=ko_KR.UTF-8 \
 COPY pyproject.toml ./
 COPY requirements-agent.txt ./
 
+# Copy application source (needed for `-e .` in requirements-agent.txt)
+COPY src/ ./src/
+COPY run.py ./
+COPY pdf2bpmn_agent_executor.py ./
+COPY pdf2bpmn_agent_server.py ./
+COPY pdf2bpmn_scaledjob_worker.py ./
+
 # Install Python dependencies
 # 1. Install main package dependencies from pyproject.toml
 RUN pip install --no-cache-dir \
@@ -74,13 +81,6 @@ RUN pip install --no-cache-dir \
 # 2. Install agent-specific dependencies
 RUN pip install --no-cache-dir -r requirements-agent.txt
 
-# Copy application source
-COPY src/ ./src/
-COPY run.py ./
-COPY pdf2bpmn_agent_executor.py ./
-COPY pdf2bpmn_agent_server.py ./
-COPY pdf2bpmn_scaledjob_worker.py ./
-
 # Create necessary directories
 RUN mkdir -p /app/output /app/uploads
 
@@ -90,12 +90,13 @@ RUN chmod +x entrypoint.sh
 
 # Expose ports
 # 8000: Agent Server (ProcessGPT SDK polling)
-# 8001: FastAPI Server (PDF2BPMN API)
-EXPOSE 8000 8001
+EXPOSE 8000
 
-# Health check - check both services
+# Health check
+# - This image runs in polling mode (no FastAPI required).
+# - Check Neo4j connectivity (required for extraction pipeline).
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8001/api/health || exit 1
+    CMD python -c "from src.pdf2bpmn.graph.neo4j_client import Neo4jClient; c=Neo4jClient(); ok=c.verify_connection(); c.close(); import sys; sys.exit(0 if ok else 1)"
 
 # Run both servers via entrypoint script
 ENTRYPOINT ["./entrypoint.sh"]

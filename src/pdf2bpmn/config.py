@@ -3,8 +3,20 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env file
-load_dotenv()
+
+def _load_env_chain() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    repo_root = project_root.parent
+    root_env = repo_root / ".env"
+    project_env = project_root / ".env"
+
+    if root_env.exists():
+        load_dotenv(dotenv_path=root_env, override=False)
+    if project_env.exists():
+        load_dotenv(dotenv_path=project_env, override=True)
+
+
+_load_env_chain()
 
 
 class Config:

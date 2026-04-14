@@ -73,6 +73,7 @@ Thumbs.db
 uploads/
 output/
 
-
+# Private Datas
+p_*
 
 

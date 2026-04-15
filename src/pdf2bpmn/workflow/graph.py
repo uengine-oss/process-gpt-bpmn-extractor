@@ -762,6 +762,63 @@ class PDF2BPMNWorkflow:
             "bp_disjoint": bp_disjoint,
         }
 
+    def _decide_process_merge(self, sig_a: dict, sig_b: dict, sim_detail: dict) -> tuple[bool, str, float]:
+        """
+        Decide whether two processes should be merged using explicit rules.
+        Goal: stable and explainable merge behavior, not just one weighted score.
+        """
+        score = float(sim_detail.get("score", 0.0))
+        task_sim = float(sim_detail.get("task_sim", 0.0))
+        role_sim = float(sim_detail.get("role_sim", 0.0))
+        narrative_sim = float(sim_detail.get("narrative_sim", 0.0))
+        desc_sim = float(sim_detail.get("desc_sim", 0.0))
+        bp_overlap = bool(sim_detail.get("bp_overlap"))
+        bp_disjoint = bool(sim_detail.get("bp_disjoint"))
+        name_same = bool(sim_detail.get("name_sim"))
+        task_count_a = int(sig_a.get("task_count", 0) or 0)
+        task_count_b = int(sig_b.get("task_count", 0) or 0)
+
+        # Hard no-merge rules
+        if bp_disjoint and task_sim < 0.45:
+            return False, "business_keys_conflict", 0.99
+        if (
+            task_count_a > 0
+            and task_count_b > 0
+            and task_sim < 0.12
+            and role_sim < 0.12
+            and narrative_sim < 0.30
+        ):
+            return False, "too_little_shared_structure", 0.99
+
+        # Strong merge rules
+        if bp_overlap:
+            return True, "shared_business_key", 0.55
+        if task_count_a > 0 and task_count_b > 0 and task_sim >= 0.62:
+            return True, "high_task_overlap", 0.68
+        if name_same and (task_sim >= 0.35 or role_sim >= 0.35 or narrative_sim >= 0.50):
+            return True, "same_name_with_content_support", 0.64
+
+        # Guardrail: same name alone is never enough
+        if name_same and task_sim < 0.15 and role_sim < 0.15 and narrative_sim < 0.30:
+            return False, "same_name_but_not_same_content", 0.64
+
+        # Score-based fallback with explicit minimum content support
+        threshold = 0.68
+        if task_sim < 0.2 and narrative_sim >= 0.45:
+            threshold = 0.64
+        if (
+            score >= threshold
+            and (
+                task_sim >= 0.25
+                or role_sim >= 0.25
+                or narrative_sim >= 0.45
+                or desc_sim >= 0.45
+            )
+        ):
+            return True, "weighted_score_with_content_support", threshold
+
+        return False, "below_explicit_merge_rules", threshold
+
     def _merge_duplicate_processes(
         self,
         processes: list,
@@ -884,23 +941,9 @@ class PDF2BPMNWorkflow:
                 sim_detail = self._process_similarity(sig_a, sig_b)
                 sim = float(sim_detail.get("score", 0.0))
 
-                # Merge only when content evidence exists
-                has_content_signal = bool(
-                    sig_a.get("task_tokens")
-                    or sig_b.get("task_tokens")
-                    or sig_a.get("role_tokens")
-                    or sig_b.get("role_tokens")
-                    or sig_a.get("narrative_ngrams")
-                    or sig_b.get("narrative_ngrams")
-                )
+                should_merge, merge_reason, threshold = self._decide_process_merge(sig_a, sig_b, sim_detail)
 
-                threshold = 0.68
-                if sim_detail.get("bp_overlap"):
-                    threshold = 0.55
-                elif sim_detail.get("task_sim", 0.0) < 0.2 and sim_detail.get("narrative_sim", 0.0) >= 0.45:
-                    threshold = 0.64
-
-                if has_content_signal and sim >= threshold:
+                if should_merge:
                     union(a.proc_id, b.proc_id)
                     print(
                         f"   🔗 내용 기반 프로세스 병합 후보 채택: "
@@ -908,7 +951,8 @@ class PDF2BPMNWorkflow:
                         f"(score={sim:.2f}, task={sim_detail.get('task_sim', 0.0):.2f}, "
                         f"role={sim_detail.get('role_sim', 0.0):.2f}, "
                         f"narr={sim_detail.get('narrative_sim', 0.0):.2f}, "
-                        f"bp_overlap={sim_detail.get('bp_overlap')})"
+                        f"bp_overlap={sim_detail.get('bp_overlap')}, "
+                        f"reason={merge_reason})"
                     )
                 else:
                     # 디버깅: 왜 병합이 안 되었는지 점수 근거를 항상 남긴다.
@@ -921,7 +965,8 @@ class PDF2BPMNWorkflow:
                         f"desc={sim_detail.get('desc_sim', 0.0):.2f}, "
                         f"narr={sim_detail.get('narrative_sim', 0.0):.2f}, "
                         f"bp_overlap={sim_detail.get('bp_overlap')}, "
-                        f"bp_disjoint={sim_detail.get('bp_disjoint')})"
+                        f"bp_disjoint={sim_detail.get('bp_disjoint')}, "
+                        f"reason={merge_reason})"
                     )
 
         # Build clusters
@@ -1036,6 +1081,42 @@ class PDF2BPMNWorkflow:
         """이름 유사도를 기반으로 태스크를 병합합니다."""
         if len(tasks) <= 1:
             return tasks
+
+        strong_verbs = [
+            "접수", "검토", "승인", "반려", "작성", "제출", "통보", "발송", "지급", "정산",
+            "심사", "개최", "참석", "배부", "확정", "확인", "등록", "처리",
+        ]
+
+        def _action_markers(name: str) -> set[str]:
+            s = str(name or "").strip()
+            return {v for v in strong_verbs if v in s}
+
+        def _should_merge_task_pair(left, right) -> tuple[bool, str]:
+            left_name = str(left.name or "").strip().lower()
+            right_name = str(right.name or "").strip().lower()
+            order_gap = abs(int(getattr(left, "order", 0) or 0) - int(getattr(right, "order", 0) or 0))
+            left_actions = _action_markers(left_name)
+            right_actions = _action_markers(right_name)
+            shared_actions = left_actions & right_actions
+
+            # Different core action words usually mean different tasks.
+            if left_actions and right_actions and not shared_actions:
+                return False, "different_core_action"
+
+            if left_name == right_name:
+                return True, "same_name"
+
+            if left_name in right_name or right_name in left_name:
+                return True, "name_contains_other"
+
+            if self._have_same_core_words(left_name, right_name) and order_gap <= 2:
+                return True, "same_core_words_nearby"
+
+            similarity = self._calc_name_similarity(left_name, right_name)
+            if order_gap <= 1 and similarity > 0.72:
+                return True, "high_name_similarity_adjacent"
+
+            return False, "below_task_merge_rules"
         
         # order로 정렬
         sorted_tasks = sorted(tasks, key=lambda t: t.order)
@@ -1056,23 +1137,7 @@ class PDF2BPMNWorkflow:
                 
                 other_name = other_task.name.lower().strip()
                 
-                # 병합 조건 체크
-                should_merge = False
-                
-                # 1. 한쪽이 다른 쪽을 포함
-                if task_name in other_name or other_name in task_name:
-                    should_merge = True
-                
-                # 2. 핵심 단어가 같은 경우 (ex: "구매요청서 접수" vs "구매요청서 접수 및 검토")
-                elif self._have_same_core_words(task_name, other_name):
-                    should_merge = True
-                
-                # 3. 연속된 order이고 이름이 매우 유사
-                elif abs(task.order - other_task.order) <= 1:
-                    similarity = self._calc_name_similarity(task_name, other_name)
-                    if similarity > 0.6:
-                        should_merge = True
-                
+                should_merge, merge_reason = _should_merge_task_pair(task, other_task)
                 if should_merge:
                     merged_with.append((j, other_task))
                     skip_indices.add(j)
@@ -1125,9 +1190,16 @@ class PDF2BPMNWorkflow:
         """두 이름이 핵심 단어를 공유하는지 확인합니다."""
         # 한국어 조사/어미 제거를 위한 간단한 처리
         stop_words = {'및', '의', '을', '를', '이', '가', '에', '로', '으로', '와', '과', '에서', '부터', '까지'}
-        
-        words1 = set(name1.replace(' ', '').replace('및', ' ').split()) - stop_words
-        words2 = set(name2.replace(' ', '').replace('및', ' ').split()) - stop_words
+
+        normalized1 = name1.replace('및', ' ')
+        normalized2 = name2.replace('및', ' ')
+        words1 = {w.strip() for w in normalized1.split() if w.strip()} - stop_words
+        words2 = {w.strip() for w in normalized2.split() if w.strip()} - stop_words
+        if not words1 or not words2:
+            compact1 = re.split(r"[^0-9a-zA-Z가-힣]+", name1)
+            compact2 = re.split(r"[^0-9a-zA-Z가-힣]+", name2)
+            words1 = {w for w in compact1 if len(w) >= 2} - stop_words
+            words2 = {w for w in compact2 if len(w) >= 2} - stop_words
         
         # 공통 단어가 2개 이상이면 유사
         common = words1 & words2

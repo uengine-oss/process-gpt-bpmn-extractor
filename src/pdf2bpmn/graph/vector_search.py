@@ -1,8 +1,7 @@
 """Vector embedding and similarity search for entity matching."""
 from typing import Optional
 import numpy as np
-
-from langchain_openai import OpenAIEmbeddings
+import httpx
 
 from ..config import Config
 from .neo4j_client import Neo4jClient
@@ -13,21 +12,66 @@ class VectorSearch:
     
     def __init__(self, neo4j_client: Neo4jClient):
         self.neo4j = neo4j_client
-        self.embeddings = OpenAIEmbeddings(
-            model=Config.OPENAI_EMBEDDING_MODEL,
-            api_key=Config.OPENAI_API_KEY,
-            base_url=(Config.OPENAI_BASE_URL or None),
-        )
         self.merge_threshold = Config.SIMILARITY_MERGE_THRESHOLD
         self.review_threshold = Config.SIMILARITY_REVIEW_THRESHOLD
     
+    def _embedding_endpoint(self) -> str:
+        base_url = (Config.EMBEDDING_BASE_URL or "").rstrip("/")
+        if not base_url:
+            raise ValueError("EMBEDDING_BASE_URL 또는 LLM_BASE_URL이 설정되지 않았습니다.")
+        return f"{base_url}/embeddings"
+    
+    def _request_embeddings(self, inputs: list[str]) -> list[list[float]]:
+        if not Config.OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY가 설정되지 않았습니다.")
+        
+        headers = {
+            "Authorization": f"Bearer {Config.OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": Config.EMBEDDING_MODEL,
+            "input": inputs,
+        }
+        
+        with httpx.Client(timeout=Config.EMBEDDING_TIMEOUT_SEC) as client:
+            response = client.post(
+                self._embedding_endpoint(),
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            body = response.json()
+        
+        data = body.get("data")
+        if isinstance(data, list):
+            embeddings = [
+                item.get("embedding")
+                for item in data
+                if isinstance(item, dict) and isinstance(item.get("embedding"), list)
+            ]
+            if len(embeddings) == len(inputs):
+                return embeddings
+        
+        embeddings = body.get("embeddings")
+        if isinstance(embeddings, list) and len(embeddings) == len(inputs):
+            return embeddings
+        
+        raise ValueError(
+            "No embedding data received. "
+            f"model={Config.EMBEDDING_MODEL}, response_keys={list(body.keys())}, "
+            f"response_preview={str(body)[:500]}"
+        )
+    
     def embed_text(self, text: str) -> list[float]:
         """Generate embedding for text."""
-        return self.embeddings.embed_query(text)
+        return self._request_embeddings([text])[0]
     
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Generate embeddings for multiple texts."""
-        return self.embeddings.embed_documents(texts)
+        if not texts:
+            return []
+        return self._request_embeddings(texts)
     
     def cosine_similarity(self, vec1: list[float], vec2: list[float]) -> float:
         """Calculate cosine similarity between two vectors."""

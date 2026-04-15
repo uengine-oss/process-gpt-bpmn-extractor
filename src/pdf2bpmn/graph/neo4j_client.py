@@ -112,18 +112,16 @@ class Neo4jClient:
             "CREATE FULLTEXT INDEX role_name_idx IF NOT EXISTS FOR (r:Role) ON EACH [r.name, r.org_unit]",
             "CREATE FULLTEXT INDEX agent_name_idx IF NOT EXISTS FOR (a:Agent) ON EACH [a.name, a.role]",
             "CREATE FULLTEXT INDEX skill_name_idx IF NOT EXISTS FOR (s:Skill) ON EACH [s.name, s.summary]",
-            
-            # Vector index for embeddings (Neo4j 5.11+)
-            """
-            CREATE VECTOR INDEX chunk_embedding_idx IF NOT EXISTS
-            FOR (c:ReferenceChunk)
-            ON c.embedding
-            OPTIONS {indexConfig: {
-                `vector.dimensions`: 1536,
-                `vector.similarity_function`: 'cosine'
-            }}
-            """,
         ]
+        vector_index = f"""
+        CREATE VECTOR INDEX chunk_embedding_idx
+        FOR (c:ReferenceChunk)
+        ON c.embedding
+        OPTIONS {{indexConfig: {{
+            `vector.dimensions`: {Config.EMBEDDING_DIMENSIONS},
+            `vector.similarity_function`: 'cosine'
+        }}}}
+        """
         
         with self.session() as session:
             for constraint in constraints:
@@ -139,6 +137,12 @@ class Neo4jClient:
                 except Exception as e:
                     if "already exists" not in str(e).lower():
                         print(f"Index warning: {e}")
+            
+            try:
+                session.run("DROP INDEX chunk_embedding_idx IF EXISTS")
+                session.run(vector_index)
+            except Exception as e:
+                print(f"Vector index warning: {e}")
     
     def clear_database(self):
         """Clear all nodes and relationships (use with caution!)."""

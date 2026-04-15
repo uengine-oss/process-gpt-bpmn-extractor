@@ -15,13 +15,10 @@ current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
 
 # 환경 변수 로드
-env_files = ['.env.local', 'agent.env', '.env']
-for env_file in env_files:
-    env_path = current_dir / env_file
-    if env_path.exists():
-        load_dotenv(env_path)
-        print(f"[OK] Loaded env from: {env_path}")
-        break
+env_path = current_dir / '.env'
+if env_path.exists():
+    load_dotenv(env_path)
+    print(f"[OK] Loaded env from: {env_path}")
 
 # 로깅 설정
 logging.basicConfig(

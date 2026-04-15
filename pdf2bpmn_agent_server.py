@@ -26,25 +26,16 @@ except Exception:
 current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
 
-# .env.local 파일 로드
+# .env 파일 로드
 try:
     from dotenv import load_dotenv
-    # .env.local 먼저 시도, 없으면 .env
-    env_local = current_dir / '.env.local'
     env_file = current_dir / '.env'
-    agent_env = current_dir / 'agent.env'
-    
-    if env_local.exists():
-        load_dotenv(env_local)
-        print(f"[OK] Loaded env from: {env_local}")
-    elif agent_env.exists():
-        load_dotenv(agent_env)
-        print(f"[OK] Loaded env from: {agent_env}")
-    elif env_file.exists():
+
+    if env_file.exists():
         load_dotenv(env_file)
         print(f"[OK] Loaded env from: {env_file}")
     else:
-        print("[WARN] .env.local or .env file not found.")
+        print("[WARN] .env file not found.")
 except ImportError:
     print("[WARN] python-dotenv not installed. Using system env vars.")
 
@@ -413,7 +404,7 @@ def print_usage():
     print("  export SUPABASE_ANON_KEY='your-anon-key'")
     print("  python pdf2bpmn_agent_server.py")
     print()
-    print("또는 agent.env 파일에 환경변수를 설정하세요.")
+    print("또는 .env 파일에 환경변수를 설정하세요.")
     print()
 
 

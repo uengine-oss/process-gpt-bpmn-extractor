@@ -2,10 +2,12 @@
 import hashlib
 import os
 import re
+import time
 from pathlib import Path
 from typing import Generator
 
 import pdfplumber
+import requests
 
 from ..models.entities import Document, Section, ReferenceChunk, generate_id
 from ..config import Config
@@ -33,6 +35,9 @@ class PDFExtractor:
         
         with pdfplumber.open(path) as pdf:
             page_count = len(pdf.pages)
+            synap_page_texts: dict[int, str] = {}
+            if Config.ENABLE_OCR and (Config.OCR_ENGINE or "").lower() == "synap":
+                synap_page_texts = self._extract_text_with_synap(path, page_count=page_count)
             
             # Create document
             doc = Document(
@@ -48,10 +53,17 @@ class PDFExtractor:
             
             for i, page in enumerate(pdf.pages):
                 text = page.extract_text() or ""
+                synap_text = synap_page_texts.get(i + 1, "")
+                if synap_text:
+                    text = _merge_text_lines(text, synap_text)
 
                 # If the page contains images, always attempt OCR/Vision extraction (configurable).
                 # This is NOT a fallback only when text is empty; images can contain critical tables/steps.
-                if Config.ENABLE_OCR and i < Config.OCR_MAX_PAGES:
+                if (
+                    Config.ENABLE_OCR
+                    and i < Config.OCR_MAX_PAGES
+                    and not synap_text
+                ):
                     try:
                         has_images = bool(getattr(page, "images", None)) and len(page.images) > 0
                     except Exception:
@@ -109,6 +121,121 @@ class PDFExtractor:
                 chunks = self._create_chunks(doc.doc_id, page_texts)
             
             return doc, sections, chunks
+
+    def _extract_text_with_synap(self, pdf_path: Path, page_count: int) -> dict[int, str]:
+        """Extract OCR text for a full document via Synap DocuAnalyzer."""
+        base_url = (Config.SYNAP_OCR_BASE_URL or "").rstrip("/")
+        api_key = (Config.SYNAP_OCR_API_KEY or "").strip()
+        if not base_url or not api_key:
+            print("[WARN] Synap OCR is enabled but SYNAP_OCR_BASE_URL or SYNAP_OCR_API_KEY is missing.")
+            return {}
+
+        timeout_sec = max(5.0, float(Config.SYNAP_OCR_TIMEOUT_SEC))
+        poll_interval_sec = max(0.2, float(Config.SYNAP_OCR_POLL_INTERVAL_SEC))
+        max_pages = max(0, min(int(Config.OCR_MAX_PAGES), int(page_count)))
+        if max_pages == 0:
+            return {}
+
+        fid: str | None = None
+        try:
+            with pdf_path.open("rb") as fh:
+                upload_response = requests.post(
+                    f"{base_url}/da",
+                    data={
+                        "api_key": api_key,
+                        "type": "upload",
+                    },
+                    files={
+                        "file": (
+                            pdf_path.name,
+                            fh,
+                            "application/octet-stream",
+                        )
+                    },
+                    timeout=timeout_sec,
+                )
+            upload_response.raise_for_status()
+            upload_body = upload_response.json()
+            fid = str(((upload_body.get("result") or {}).get("fid") or "")).strip()
+            if not fid:
+                raise ValueError(f"Synap upload response missing fid: {upload_body}")
+
+            status_result = self._wait_for_synap_completion(
+                base_url=base_url,
+                api_key=api_key,
+                fid=fid,
+                timeout_sec=timeout_sec,
+                poll_interval_sec=poll_interval_sec,
+            )
+            total_pages = int((status_result or {}).get("total_pages") or page_count or 0)
+            result_pages = min(max_pages, total_pages or max_pages)
+            texts: dict[int, str] = {}
+
+            for page_index in range(1, result_pages + 1):
+                page_response = requests.post(
+                    f"{base_url}/result/{fid}",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "api_key": api_key,
+                        "page_index": page_index,
+                        # Keep Synap output aligned with the legacy OCR path:
+                        # downstream expects plain OCR text with preserved line breaks.
+                        "type": "text",
+                    },
+                    timeout=timeout_sec,
+                )
+                page_response.raise_for_status()
+                page_text = (page_response.text or "").strip()
+                if page_text:
+                    texts[page_index] = page_text
+            return texts
+        except Exception as exc:
+            print(f"[WARN] Synap OCR failed, falling back to local OCR path: {exc}")
+            return {}
+        finally:
+            if fid:
+                try:
+                    requests.post(
+                        f"{base_url}/delete/{fid}",
+                        json={"api_key": api_key},
+                        timeout=timeout_sec,
+                    )
+                except Exception:
+                    pass
+
+    def _wait_for_synap_completion(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        fid: str,
+        timeout_sec: float,
+        poll_interval_sec: float,
+    ) -> dict:
+        """Poll Synap until the uploaded document reaches SUCCESS status."""
+        deadline = time.time() + timeout_sec
+        last_payload: dict = {}
+
+        while time.time() < deadline:
+            response = requests.post(
+                f"{base_url}/filestatus/{fid}",
+                json={"api_key": api_key},
+                timeout=timeout_sec,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            last_payload = payload
+            result = payload.get("result") or {}
+            status = str(result.get("filestatus") or "").upper()
+
+            if status == "SUCCESS":
+                return result
+            if status and status not in {"RUNNING", "QUEUED", "PENDING"}:
+                raise RuntimeError(f"Synap OCR failed with status={status}: {payload}")
+
+            time.sleep(poll_interval_sec)
+
+        raise TimeoutError(f"Timed out waiting for Synap OCR completion: {last_payload}")
 
     def _should_use_heading_sections(
         self,
@@ -186,6 +313,8 @@ class PDFExtractor:
             """당신은 문서 구조 분석 전문가입니다.
 가장 중요한 목표:
 - 목표는 문서를 최대한 많이 자르는 것이 아니라, **업무적으로 의미 있는 적절한 단위로 안정적으로 분할하는 것**입니다.
+- 아래에 정의된 **명시적 규칙만** 사용해 SOP 경계를 판단하세요.
+- 이 규칙에 없는 이유로 SOP를 새로 만들거나 없애지 마세요.
 
 주어진 문서에서 SOP(표준작업절차) 또는 독립적인 업무 프로세스의 경계를 식별해주세요.
 
@@ -201,6 +330,19 @@ class PDFExtractor:
 - SOP 하나는 어느 정도 독립적인 업무 목적/절차 흐름을 가져야 하며, 지나치게 잘게 쪼개어 20개, 30개, 40개 이상으로 불필요하게 분할하지 마세요.
 - 문서 구조를 존중하되, **비슷한 목적의 연속 단계**는 하나의 SOP로 묶으세요.
 - 경계가 보이면 분리하고, 비슷한 목적의 연속 단계는 묶어 **업무적으로 의미 있는 적절한 단위**로 분할하세요.
+- 섹션 개수를 늘리는 것보다, **명시적인 업무 경계와 문서 구조를 기준으로 안정적으로 분할**하는 것을 우선하세요.
+- 사소한 표현 차이, 문장 길이 차이, 설명 문체 차이 때문에 경계를 바꾸지 마세요.
+- 경계는 문서의 명시적 구조와 업무 흐름 변화에 근거해 결정하세요.
+
+- SOP 경계 판단 규칙(반드시 아래 순서대로 적용):
+  1) 문서에 명시적인 장/절/단계 제목 변화가 있으면, 새 SOP 시작을 우선 검토하세요.
+  2) 업무 목적이 바뀌면 새 SOP를 시작하세요.
+  3) 주요 담당 역할/부서가 바뀌면 새 SOP를 시작하세요.
+  4) 주요 입력 문서 또는 출력 문서가 바뀌면 새 SOP를 시작하세요.
+  5) 승인/판단/검토 게이트가 새로 등장하면 새 SOP를 시작하세요.
+  6) 준비 단계에서 본처리 단계로 전환되면 새 SOP를 시작하세요.
+  7) 처리 단계에서 결과 통보/사후관리 단계로 전환되면 새 SOP를 시작하세요.
+  8) 위 조건이 없으면 새 SOP를 만들지 말고 기존 SOP에 포함하세요.
 
 - 새 SOP를 시작해야 하는 대표 조건(체크리스트):
   - 업무 목적이 바뀜
@@ -217,6 +359,8 @@ class PDFExtractor:
   - 단순 설명 보강, 예시, 주의사항
   - 같은 절차 안의 하위 체크리스트
   - 앞 절차의 세부 실행 방법만 더 자세히 풀어쓴 부분
+  - 같은 절차를 다른 말로 반복 설명한 부분
+  - 같은 입력과 같은 목적을 가진 연속 업무 설명
 
 - 1개 SOP만 반환하는 것은 다음 경우에만 허용됩니다:
   1) 문서 길이가 매우 짧고
@@ -233,6 +377,15 @@ class PDFExtractor:
 - 비슷한 하위 절차가 연속으로 반복될 때는 개별 단계마다 SOP를 만들지 말고 상위 절차 단위로 통합하세요.
 - 각 SOP 경계는 왜 분리되는지 내부적으로 판단하세요.
 - 경계 이유 없이 페이지를 기계적으로 자르지 마세요.
+- 한 문서 안에서는 가능한 한 **동일한 granularity(분할 세기)**를 유지하세요.
+- 앞부분은 크게 묶고 뒷부분은 잘게 쪼개는 식으로 불균형하게 분할하지 마세요.
+- 같은 유형의 절차 묶음이 반복되면 비슷한 수준으로 묶으세요.
+- 한 SOP는 최소한 다음 중 하나를 설명해야 합니다:
+  - 하나의 독립적인 업무 목적
+  - 하나의 독립적인 검토/판단 단계
+  - 하나의 독립적인 승인/처리 단계
+  - 하나의 독립적인 통보/사후관리 단계
+- 위 기준 없이 단순히 문장이 바뀌었다는 이유만으로 SOP를 새로 만들지 마세요.
 
 응답 형식(JSON):
 {{"sops":[{{"title":"SOP 제목","page_from":1,"page_to":3}}]}}
@@ -274,8 +427,11 @@ class PDFExtractor:
   - 전체 문서를 1개로 과도하게 묶지 않았는가?
   - 반대로 사소한 단계 차이만으로 과도하게 쪼개지 않았는가?
   - 각 SOP는 독립적인 업무 목적과 흐름을 가지는가?
+  - 경계 판단을 제목/목적/역할/입출력/게이트 변화 같은 명시적 기준에 근거해 수행했는가?
 - 1개로 과소분할하지 마세요.
 - 40개 이상처럼 과도하게 과분할하지 마세요.
+- 같은 문장을 반복 설명한 부분 때문에 SOP 수를 늘리지 마세요.
+- 경계 근거가 약하면 새 SOP를 만들기보다 기존 SOP 포함 여부를 먼저 검토하세요.
 - 문서 구조가 보이면 그 구조를 적극 반영하세요.
 - 확신이 낮을 때는 무조건 합치거나 무조건 쪼개지 말고, 업무적으로 더 자연스러운 단위를 선택하세요.
 
@@ -284,9 +440,9 @@ class PDFExtractor:
 """
         )
         llm = ChatOpenAI(
-            model=Config.OPENAI_MODEL,
+            model=Config.LLM_MODEL,
             api_key=Config.OPENAI_API_KEY,
-            base_url=(Config.OPENAI_BASE_URL or None),
+            base_url=(Config.LLM_BASE_URL or None),
             temperature=0,
             timeout=_llm_timeout_sec(),
         )
@@ -375,6 +531,8 @@ class PDFExtractor:
         # OCR engine selection
         engine = (Config.OCR_ENGINE or "tesseract").lower()
 
+        if engine == "synap":
+            return self._ocr_with_tesseract(image)
         if engine == "openai_vision":
             return self._ocr_with_openai_vision(image)
 
@@ -413,9 +571,9 @@ class PDFExtractor:
             b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
             llm = ChatOpenAI(
-                model=Config.OPENAI_MODEL,
+                model=Config.OCR_MODEL,
                 api_key=Config.OPENAI_API_KEY,
-                base_url=(Config.OPENAI_BASE_URL or None),
+                base_url=(Config.OCR_BASE_URL or None),
                 temperature=0,
                 timeout=_llm_timeout_sec(),
             )

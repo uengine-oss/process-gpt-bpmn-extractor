@@ -264,12 +264,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         self.supabase_client: Optional[Client] = None
 
         # OpenAI-compatible client (for form generation)
-        self.openai_api_key = (os.getenv("LLM_PROXY_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
-        self.openai_base_url = (os.getenv("LLM_PROXY_URL") or os.getenv("OPENAI_BASE_URL") or "").strip()
+        self.openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        self.openai_base_url = (os.getenv("LLM_BASE_URL") or "").strip()
         # Keep for logging/debug compatibility only.
         self.openai_timeout_sec = 0.0
         # Default to gpt-4.1 for longer, more stable structured outputs.
-        self.openai_model = (os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4.1").strip()
+        self.openai_model = (os.getenv("LLM_MODEL") or "gpt-4.1").strip()
         # Separate models (requested: user/agent creation vs process creation)
         self.user_mapping_model = os.getenv("USER_MAPPING_MODEL", self.openai_model)
         self.process_definition_model = os.getenv("PROCESS_DEF_MODEL", self.openai_model)
@@ -710,7 +710,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
     async def _call_openai_for_form_html(self, request_text: str) -> str:
         """LLM 호출로 폼 HTML 생성. 실패 시 예외를 던집니다(상위에서 폴백 처리)."""
         if not self.openai_client:
-            raise RuntimeError("OpenAI client is not configured (missing LLM_PROXY_API_KEY/OPENAI_API_KEY or openai package).")
+            raise RuntimeError("OpenAI client is not configured (missing OPENAI_API_KEY or openai package).")
 
         messages = self._build_form_generator_base_messages()
         # FormDesignGenerator의 noteMessage와 유사: alias는 한국어, name은 영어 권장

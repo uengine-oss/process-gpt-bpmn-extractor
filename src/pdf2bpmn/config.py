@@ -6,14 +6,9 @@ from dotenv import load_dotenv
 
 def _load_env_chain() -> None:
     project_root = Path(__file__).resolve().parents[2]
-    repo_root = project_root.parent
-    root_env = repo_root / ".env"
     project_env = project_root / ".env"
-
-    if root_env.exists():
-        load_dotenv(dotenv_path=root_env, override=False)
     if project_env.exists():
-        load_dotenv(dotenv_path=project_env, override=True)
+        load_dotenv(dotenv_path=project_env, override=False)
 
 
 _load_env_chain()
@@ -22,18 +17,24 @@ _load_env_chain()
 class Config:
     """Application configuration."""
     
-    # Unified LLM proxy settings (OpenAI-compatible API)
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "").strip()
-    LLM_PROXY_URL: str = os.getenv("LLM_PROXY_URL", "").strip()
-    LLM_PROXY_API_KEY: str = os.getenv("LLM_PROXY_API_KEY", "").strip()
+    # OpenAI-compatible API settings
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "").strip()
+    LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "").strip()
+    OCR_BASE_URL: str = (os.getenv("OCR_BASE_URL") or LLM_BASE_URL).strip()
+    EMBEDDING_BASE_URL: str = (os.getenv("EMBEDDING_BASE_URL") or LLM_BASE_URL).strip()
 
-    # OpenAI
-    OPENAI_API_KEY: str = LLM_PROXY_API_KEY or os.getenv("OPENAI_API_KEY", "")
+    # Models
     # Default to gpt-4.1 for longer, more stable structured outputs.
-    OPENAI_MODEL: str = LLM_MODEL or os.getenv("OPENAI_MODEL", "gpt-4.1")
-    OPENAI_EMBEDDING_MODEL: str = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-    # OpenAI-compatible endpoint (e.g., OpenRouter: https://openrouter.ai/api/v1)
-    OPENAI_BASE_URL: str = LLM_PROXY_URL or os.getenv("OPENAI_BASE_URL", "")
+    LLM_MODEL: str = (os.getenv("LLM_MODEL") or "gpt-4.1").strip()
+    OCR_MODEL: str = (os.getenv("OCR_MODEL") or LLM_MODEL).strip()
+    EMBEDDING_MODEL: str = (os.getenv("EMBEDDING_MODEL") or "text-embedding-3-small").strip()
+    EMBEDDING_DIMENSIONS: int = int(
+        os.getenv(
+            "EMBEDDING_DIMENSIONS",
+            "2560" if "qwen3-embedding-4b" in EMBEDDING_MODEL.lower() else "1536",
+        )
+    )
+    EMBEDDING_TIMEOUT_SEC: float = float(os.getenv("EMBEDDING_TIMEOUT_SEC", "60"))
     
     # Neo4j
     NEO4J_URI: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -63,12 +64,16 @@ class Config:
     # - If a PDF page contains images, OCR should run even if text exists.
     ENABLE_OCR: bool = os.getenv("ENABLE_OCR", "true").lower() == "true"
     OCR_ALWAYS_IF_IMAGES: bool = os.getenv("OCR_ALWAYS_IF_IMAGES", "true").lower() == "true"
-    # "tesseract" | "openai_vision" (will fallback automatically if deps unavailable)
+    # "tesseract" | "openai_vision" | "synap"
     OCR_ENGINE: str = os.getenv("OCR_ENGINE", "tesseract").lower()
     OCR_DPI: int = int(os.getenv("OCR_DPI", "200"))
     # Safety limits
     OCR_MAX_PAGES: int = int(os.getenv("OCR_MAX_PAGES", "50"))
     OCR_MAX_IMAGE_PIXELS: int = int(os.getenv("OCR_MAX_IMAGE_PIXELS", str(2000 * 2000)))
+    SYNAP_OCR_BASE_URL: str = os.getenv("SYNAP_OCR_BASE_URL", "").strip()
+    SYNAP_OCR_API_KEY: str = os.getenv("SYNAP_OCR_API_KEY", "").strip()
+    SYNAP_OCR_POLL_INTERVAL_SEC: float = float(os.getenv("SYNAP_OCR_POLL_INTERVAL_SEC", "1"))
+    SYNAP_OCR_TIMEOUT_SEC: float = float(os.getenv("SYNAP_OCR_TIMEOUT_SEC", "120"))
 
     # SOP segmentation (optional but improves multi-process docs)
     # When enabled and OpenAI key is available, detect SOP boundaries and create sections per SOP.

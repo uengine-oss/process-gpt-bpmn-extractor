@@ -88,13 +88,11 @@ uv run python pdf2bpmn_agent_server.py
 
 ### 1) 사전 준비
 
-- `.env`: `OPENAI_API_KEY` 등 런타임 환경변수
-- `agent.env`: ProcessGPT SDK/워크아이템 처리용 환경변수 (예: `AGENT_*`, Supabase 등)
+- `.env`: API 서버와 에이전트 서버가 함께 사용하는 통합 런타임 환경변수
 
 예시 파일:
 
-- `agent.env.example`
-- `api.env copy.example`
+- `.env.example`
 
 ### 2) Neo4j + 전체 스택(Agent + API) 실행
 
@@ -119,7 +117,7 @@ GitHub Actions가 `ghcr.io/uengine-oss/process-gpt-bpmn-extractor`로 이미지�
 
 ```bash
 docker pull ghcr.io/uengine-oss/process-gpt-bpmn-extractor:main
-docker run --rm -p 8000:8000 -p 8001:8001 --env-file agent.env ghcr.io/uengine-oss/process-gpt-bpmn-extractor:main
+docker run --rm -p 8000:8000 -p 8001:8001 --env-file .env ghcr.io/uengine-oss/process-gpt-bpmn-extractor:main
 ```
 
 ### Streamlit UI (레거시)
@@ -180,9 +178,28 @@ PDF 입력 → 텍스트 추출 → 엔티티 추출(LLM) → 정규화/중복�
 ```env
 # OpenAI
 OPENAI_API_KEY=your_api_key
-OPENAI_MODEL=gpt-4.1
-# OpenAI 호환 엔드포인트 (선택, OpenRouter 등)
-# OPENAI_BASE_URL=https://openrouter.ai/api/v1
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_MODEL=openai/gpt-oss-120b
+OCR_BASE_URL=
+OCR_MODEL=openai/gpt-4.1-mini
+EMBEDDING_BASE_URL=
+EMBEDDING_MODEL=text-embedding-3-small
+
+# OCR
+ENABLE_OCR=true
+OCR_ENGINE=openai_vision  # tesseract | openai_vision | synap
+OCR_ALWAYS_IF_IMAGES=true
+SYNAP_OCR_BASE_URL=
+SYNAP_OCR_API_KEY=
+SYNAP_OCR_POLL_INTERVAL_SEC=1
+SYNAP_OCR_TIMEOUT_SEC=120
+
+# 에이전트/API 공통 설정
+PDF2BPMN_URL=http://localhost:8001
+AGENT_ORCH=pdf2bpmn
+POLLING_INTERVAL=5
+TASK_TIMEOUT=3600
+ENABLE_AUTO_AGENT_CREATION=true
 
 # Neo4j
 NEO4J_URI=bolt://localhost:7687

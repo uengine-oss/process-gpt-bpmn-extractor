@@ -50,14 +50,21 @@ uv pip install -r requirements-agent.txt
 
 ### 2. 환경 설정
 
-`agent.env.example`을 `agent.env` 또는 `.env.local`로 복사하고 설정:
+`.env.example`을 `.env`로 복사하고 설정:
 
 ```bash
-cp agent.env.example agent.env
+cp .env.example .env
 ```
 
 환경 변수:
 ```env
+# OpenAI 호환 API 설정
+OPENAI_API_KEY=sk-your-openai-compatible-api-key
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_MODEL=openai/gpt-oss-120b
+OCR_MODEL=openai/gpt-4.1-mini
+EMBEDDING_MODEL=text-embedding-3-small
+
 # Supabase 설정
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_ANON_KEY=your-anon-key
@@ -84,7 +91,7 @@ uv run python pdf2bpmn_agent_server.py
 pdf2bpmn/
 ├── pdf2bpmn_agent_executor.py  # AgentExecutor 구현 (핵심 로직)
 ├── pdf2bpmn_agent_server.py    # 에이전트 서버 진입점
-├── agent.env.example           # 환경 설정 예제
+├── .env.example               # 통합 환경 설정 예제
 ├── requirements-agent.txt      # 에이전트 의존성
 └── src/pdf2bpmn/              # 기존 PDF2BPMN API
     ├── api/main.py            # FastAPI 서버

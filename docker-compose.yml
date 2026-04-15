@@ -35,7 +35,6 @@ services:
       - PYTHONIOENCODING=utf-8
     env_file:
       - ./.env
-      - ./agent.env
     extra_hosts:
       # Ensure host.docker.internal resolves (esp. on Linux)
       - "host.docker.internal:host-gateway"

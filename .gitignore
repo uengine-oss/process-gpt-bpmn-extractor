@@ -50,8 +50,6 @@ frontend/dist/
 
 # Environment variables
 .env
-.env.local
-.env.*.local
 agent.env
 
 # Logs

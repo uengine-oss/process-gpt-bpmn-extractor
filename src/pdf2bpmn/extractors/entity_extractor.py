@@ -39,6 +39,13 @@ class ExtractedEntities(BaseModel):
 EXTRACTION_PROMPT = """You are an expert at extracting business process elements from Korean business documents.
 Your goal is to extract ALL relevant process elements from ANY type of business document, regardless of format.
 
+Use the following explicit rules:
+- Create or split entities only when the document provides a clear business reason.
+- Do NOT create or split entities because of minor wording differences, sentence style differences, repeated explanation, or page change alone.
+- Prefer stable business structure over creative inference.
+- If the text clearly describes the same business purpose, keep it under the same process.
+- If the text clearly describes the same business action by the same role, keep it under the same task.
+
 {existing_context}
 
 Analyze the following text and extract:
@@ -67,6 +74,34 @@ For each entity, provide:
 - confidence: Your confidence level (0.0 to 1.0)
 - order: Sequential order number if identifiable (1, 2, 3...)
 
+PROCESS DECISION RULES:
+- Start a NEW process only when at least one of these is clearly true:
+  1. business purpose changes
+  2. trigger/start condition changes
+  3. final outcome changes
+  4. the document explicitly introduces a separate procedure/process/workflow
+- Do NOT start a new process when:
+  1. the same process is described in more detail
+  2. the same process continues on a later page
+  3. wording/style changes but business purpose stays the same
+  4. supporting notes/examples/exceptions are added
+
+TASK DECISION RULES:
+- Create a NEW task only when at least one of these is clearly true:
+  1. performer role changes
+  2. there is a real handoff or stage transition
+  3. there is an approval/review/waiting/decision point between actions
+  4. the business action itself is different
+- Do NOT create a new task when:
+  1. the same role continues the same purpose with more detail
+  2. the text only adds explanation, checklist items, or execution notes
+  3. two adjacent lines describe the same business action with slightly different wording
+
+GATEWAY DECISION RULES:
+- Create a gateway only when the text indicates a real split, merge, or decision point.
+- Do NOT create a gateway for simple sequential explanation or detail expansion.
+- If there is no real branching evidence, keep the flow linear.
+
 For tasks, also identify:
 - task_type: "human" (사람이 수행), "agent" (AI/자동화 가능), "system" (시스템 자동)
 - performer_role: Name of the role that performs this task (IMPORTANT!)
@@ -79,6 +114,8 @@ For tasks, also identify:
 - order: Sequential order within the process (1, 2, 3...)
 - next_task: Name of the task that follows this one (if identifiable)
 - previous_task: Name of the task that precedes this one (if identifiable)
+- Prefer one stable representative name for the same business action.
+- Avoid near-duplicate task names that differ only by modifiers, suffixes, or wording order.
 
 For gateways (IMPORTANT: Gateway is just a BRANCHING POINT, NOT the condition itself):
 - gateway_type: "exclusive" (XOR - only one path taken), "parallel" (AND - all paths), "inclusive" (OR)
@@ -136,6 +173,12 @@ For task_process_mappings:
     "<주제>인 경우" / "<주제>이 아닌 경우"
   - Prefer source wording from document ("승인인 경우", "미승인 시", "요건 충족 시", "재검토 필요 시")
 - process_name: Name of the process this flow belongs to
+
+SELF-CHECK BEFORE OUTPUT:
+- Did I create a new process only when the business purpose truly changed?
+- Did I avoid creating duplicate tasks from repeated explanation?
+- Did I avoid creating gateways without real branching evidence?
+- Are the names stable and reusable as business labels?
 
 Example of correct extraction:
 If text says: "승인권자가 승인하면 발주 처리를 진행하고, 거부하면 구매요청자에게 반려 통보한다"
@@ -212,9 +255,9 @@ class EntityExtractor:
         llm_retries = max(0, llm_retries)
 
         self.llm = ChatOpenAI(
-            model=Config.OPENAI_MODEL,
+            model=Config.LLM_MODEL,
             api_key=Config.OPENAI_API_KEY,
-            base_url=(Config.OPENAI_BASE_URL or None),
+            base_url=(Config.LLM_BASE_URL or None),
             temperature=0,
             # 원복: 응답이 늦어도 완료될 때까지 대기
             timeout=None,

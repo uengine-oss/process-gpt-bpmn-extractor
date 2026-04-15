@@ -23,7 +23,7 @@ def read_env(path: Path) -> dict[str, str]:
 
 
 def main() -> None:
-    env = read_env(Path("agent.env"))
+    env = read_env(Path(".env"))
     base = env["SUPABASE_URL"]
     token = env["SERVICE_ROLE_KEY"]
 

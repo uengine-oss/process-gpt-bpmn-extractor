@@ -37,9 +37,9 @@ class Config:
     EMBEDDING_TIMEOUT_SEC: float = float(os.getenv("EMBEDDING_TIMEOUT_SEC", "60"))
     
     # Neo4j
-    NEO4J_URI: str = os.getenv("NEO4J_URI", "").strip()
-    NEO4J_USER: str = os.getenv("NEO4J_USER", "").strip()
-    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", "").strip()
+    NEO4J_URI: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    NEO4J_USER: str = os.getenv("NEO4J_USER", "neo4j")
+    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", "1234567bpmn")
     
     # Paths
     BASE_DIR: Path = Path(__file__).parent.parent.parent.parent
@@ -92,41 +92,6 @@ class Config:
         """Ensure output directories exist."""
         cls.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         cls.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-    @classmethod
-    def assert_neo4j_config(
-        cls,
-        uri: str = "",
-        user: str = "",
-        password: str = "",
-    ) -> tuple[str, str, str]:
-        """Validate required Neo4j settings and return normalized values."""
-        effective_uri = (uri or cls.NEO4J_URI or "").strip()
-        effective_user = (user or cls.NEO4J_USER or "").strip()
-        effective_password = (password or cls.NEO4J_PASSWORD or "").strip()
-
-        missing = []
-        if not effective_uri:
-            missing.append("NEO4J_URI")
-        if not effective_user:
-            missing.append("NEO4J_USER")
-        if not effective_password:
-            missing.append("NEO4J_PASSWORD")
-        if missing:
-            joined = ", ".join(missing)
-            raise RuntimeError(
-                f"Missing required Neo4j configuration: {joined}. "
-                "Set all required environment variables before starting pdf2bpmn."
-            )
-
-        # In container/Kubernetes environments, localhost almost always means wrong target.
-        if os.getenv("KUBERNETES_SERVICE_HOST") and "localhost" in effective_uri:
-            raise RuntimeError(
-                f"Invalid NEO4J_URI for Kubernetes: {effective_uri}. "
-                "Use a reachable service endpoint (e.g. neo4j+s://... or service DNS), not localhost."
-            )
-
-        return effective_uri, effective_user, effective_password
 
 
 # Initialize directories

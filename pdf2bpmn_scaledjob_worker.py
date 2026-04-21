@@ -20,6 +20,7 @@ import os
 import logging
 
 from pdf2bpmn_agent_executor import PDF2BPMNAgentExecutor
+from src.pdf2bpmn.graph.neo4j_client import Neo4jClient
 
 try:
     from processgpt_agent_sdk import ProcessGPTAgentServer
@@ -34,6 +35,14 @@ logger = logging.getLogger("pdf2bpmn_scaledjob_worker")
 
 async def main() -> int:
     agent_orch = os.getenv("AGENT_ORCH", "pdf2bpmn")
+
+    # Fail fast on broken Neo4j env/auth before claiming todo.
+    neo4j = Neo4jClient()
+    try:
+        if not neo4j.verify_connection():
+            raise RuntimeError("Neo4j connection verification failed")
+    finally:
+        neo4j.close()
 
     # 1) SDK DB 초기화 (SUPABASE_URL + SERVICE_ROLE_KEY(권장) 또는 SUPABASE_KEY 필요)
     initialize_db()

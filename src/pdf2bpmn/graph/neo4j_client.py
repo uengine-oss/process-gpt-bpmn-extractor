@@ -36,9 +36,11 @@ class Neo4jClient:
         user: str = None,
         password: str = None
     ):
-        self.uri = uri or Config.NEO4J_URI
-        self.user = user or Config.NEO4J_USER
-        self.password = password or Config.NEO4J_PASSWORD
+        self.uri, self.user, self.password = Config.assert_neo4j_config(
+            uri=uri or "",
+            user=user or "",
+            password=password or "",
+        )
         self._driver = None
     
     @property

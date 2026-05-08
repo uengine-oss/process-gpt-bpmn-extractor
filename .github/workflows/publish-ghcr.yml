@@ -18,15 +18,9 @@ concurrency:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    outputs:
-      short_sha: ${{ steps.short_sha.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Compute short SHA
-        id: short_sha
-        run: echo "sha=$(echo ${GITHUB_SHA} | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -59,73 +53,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
-  update-gitops:
-    name: Update GitOps manifest (process-gpt-k8s)
-    needs: build-and-push
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout GitOps repository
-        uses: actions/checkout@v4
-        with:
-          repository: uengine-oss/process-gpt-k8s
-          token: ${{ secrets.GITOPS_PAT }}
-          path: gitops-repo
-
-      - name: Install yq
-        run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
-
-      - name: Update pdf2bpmn-scaledjob image tag
-        env:
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.short_sha }}
-        run: |
-          cd gitops-repo
-          IMAGE="ghcr.io/uengine-oss/process-gpt-bpmn-extractor:${IMAGE_TAG}"
-          MANIFEST="keda/pdf2bpmn-scaledjob.yaml"
-
-          # ScaledJob 의 Pod template 컨테이너(name=pdf2bpmn-worker) 의 image 를 정확히 갱신
-          yq eval -i \
-            '(.spec.jobTargetRef.template.spec.containers[] | select(.name == "pdf2bpmn-worker") | .image) = strenv(IMAGE)' \
-            "$MANIFEST"
-
-          echo "Updated $MANIFEST -> $IMAGE"
-          grep -n "image:" "$MANIFEST" || true
-        # IMAGE 를 strenv 로 넘기기 위해 env 에 노출
-        # (yq 의 strenv 는 환경변수에서 안전하게 값을 읽기 위함)
-
-      - name: Commit and push changes
-        env:
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.short_sha }}
-        run: |
-          cd gitops-repo
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-
-          git add keda/pdf2bpmn-scaledjob.yaml
-          if git diff --cached --quiet; then
-            echo "No changes to commit (image already up-to-date)."
-            exit 0
-          fi
-
-          git commit -m "Update pdf2bpmn image to ${IMAGE_TAG}"
-          git push
-
-      - name: Create deployment summary
-        env:
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.short_sha }}
-        run: |
-          {
-            echo "## PDF2BPMN Deployment Summary"
-            echo ""
-            echo "| Field | Value |"
-            echo "|-------|-------|"
-            echo "| Image | \`ghcr.io/uengine-oss/process-gpt-bpmn-extractor:${IMAGE_TAG}\` |"
-            echo "| Tag | \`${IMAGE_TAG}\` |"
-            echo "| Commit | [\`${{ github.sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) |"
-            echo "| GitOps Repo | [process-gpt-k8s](https://github.com/uengine-oss/process-gpt-k8s) |"
-            echo ""
-            echo "ArgoCD will automatically sync the changes from the GitOps repository."
-          } >> "$GITHUB_STEP_SUMMARY"

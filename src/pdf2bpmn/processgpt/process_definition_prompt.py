@@ -107,6 +107,7 @@ def get_json_structure_processgpt() -> str:
                     "description": "액티비티 설명(한글)",
                     "instruction": "사용자 지침(한글)",
                     "role": "역할명",
+                    "skills": ["재사용 가능한 스킬 ID(선택)"],
                     "inputData": ["입력 데이터명"],
                     "outputData": ["출력 데이터명"],
                     "checkpoints": ["체크포인트1", "체크포인트2"],
@@ -181,6 +182,7 @@ def get_json_structure_processgpt() -> str:
                       "properties": "{}",
                       "description": "액티비티 설명(한글)",
                       "instruction": "사용자 지침(한글)",
+                      "skills": ["재사용 가능한 스킬 ID(선택)"],
                       "attachedEvents": null
                     }
                   ],

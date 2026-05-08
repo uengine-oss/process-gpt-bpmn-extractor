@@ -82,7 +82,7 @@ EXPOSE 8000
 
 # Health check
 # - This image runs in polling mode (no FastAPI required).
-# - Check Neo4j connectivity (required for extraction pipeline).
+# - Check Apache AGE connectivity (required for extraction pipeline).
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python -c "from src.pdf2bpmn.graph.neo4j_client import Neo4jClient; c=Neo4jClient(); ok=c.verify_connection(); c.close(); import sys; sys.exit(0 if ok else 1)"
 

@@ -34,6 +34,8 @@ OFFICE_EXTENSIONS = {
     ".odp",
     ".ods",
     ".rtf",
+    ".hwp",
+    ".hwpx",
 }
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -177,7 +179,7 @@ def _office_to_pdf(src: Path, out_dir: Path, allow_unknown: bool = False) -> str
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=120,
+            timeout=180,
             env=run_env,
         )
     except subprocess.TimeoutExpired as e:

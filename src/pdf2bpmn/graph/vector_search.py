@@ -84,19 +84,31 @@ class VectorSearch:
         embedding: list[float], 
         top_k: int = 5
     ) -> list[dict]:
-        """Find similar reference chunks using vector index."""
+        """Find similar reference chunks with app-level cosine search (AGE fallback)."""
         query = """
-        CALL db.index.vector.queryNodes('chunk_embedding_idx', $top_k, $embedding)
-        YIELD node, score
-        RETURN node {.*, similarity: score} as chunk
+        MATCH (c:ReferenceChunk)
+        WHERE c.embedding IS NOT NULL
+        RETURN c {.*} as chunk
+        LIMIT $limit
         """
         with self.neo4j.session() as session:
             try:
-                result = session.run(query, {
-                    "embedding": embedding,
-                    "top_k": top_k
-                })
-                return [record["chunk"] for record in result]
+                limit = max(top_k * 30, 200)
+                result = session.run(query, {"limit": limit})
+                scored = []
+                for record in result:
+                    chunk = record["chunk"] or {}
+                    vec = chunk.get("embedding")
+                    if not isinstance(vec, list) or not vec:
+                        continue
+                    try:
+                        score = self.cosine_similarity(embedding, vec)
+                    except Exception:
+                        continue
+                    chunk["similarity"] = score
+                    scored.append(chunk)
+                scored.sort(key=lambda x: x.get("similarity", 0), reverse=True)
+                return scored[:top_k]
             except Exception as e:
                 print(f"Vector search warning: {e}")
                 return []
@@ -199,13 +211,33 @@ class VectorSearch:
             })
     
     def batch_embed_chunks(self, chunks: list) -> list:
-        """Embed multiple chunks and update in Neo4j."""
-        texts = [chunk.text for chunk in chunks]
-        embeddings = self.embed_texts(texts)
-        
-        for chunk, embedding in zip(chunks, embeddings):
-            chunk.embedding = embedding
-            self.update_chunk_embedding(chunk.chunk_id, embedding)
+        """Embed chunks only when embedding is missing/invalid."""
+        if not chunks:
+            return chunks
+
+        valid_ready = 0
+        to_embed = []
+        for chunk in chunks:
+            vec = getattr(chunk, "embedding", None)
+            if isinstance(vec, (list, tuple)) and len(vec) == Config.EMBEDDING_DIMENSIONS:
+                valid_ready += 1
+                continue
+            to_embed.append(chunk)
+
+        if to_embed:
+            texts = [chunk.text for chunk in to_embed]
+            embeddings = self.embed_texts(texts)
+            for chunk, embedding in zip(to_embed, embeddings):
+                chunk.embedding = embedding
+                # Existing behavior kept: best-effort DB update (may no-op before node creation).
+                self.update_chunk_embedding(chunk.chunk_id, embedding)
+
+        if valid_ready:
+            print(f"[EMBED] Reused existing embeddings: {valid_ready} chunks")
+        print(
+            f"[EMBED] batch summary: total={len(chunks)}, "
+            f"reused={valid_ready}, reembedded={len(to_embed)}"
+        )
         
         return chunks
     

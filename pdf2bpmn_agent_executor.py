@@ -12,7 +12,6 @@ import uuid
 import json
 import re
 import httpx
-import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Set, Tuple
@@ -28,6 +27,14 @@ from src.pdf2bpmn.processgpt.bpmn_xml_generator import ProcessGPTBPMNXmlGenerato
 from src.pdf2bpmn.processgpt.process_definition_prompt import build_system_prompt_processgpt
 from src.pdf2bpmn.processgpt.process_consulting_prompt import get_process_consulting_system_prompt
 from src.pdf2bpmn.processgpt.process_generation_messages import build_process_definition_messages
+from src.pdf2bpmn.config import Config
+from src.pdf2bpmn.models.entities import Document as PdfDocument, Section, ReferenceChunk
+from src.pdf2bpmn.process_post_processor import ProcessPostProcessor
+from src.pdf2bpmn.skill_enricher import (
+    SkillEnricher,
+    build_activity_index,
+    render_skill_markdown,
+)
 
 # OpenAI
 try:
@@ -313,6 +320,26 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         # Temporary runtime switch:
         # - false: skip skill document generation/upload/sync paths
         self._enable_skill_generation: bool = os.getenv("ENABLE_SKILL_GENERATION", "false").lower() == "true"
+        # Post-process policy: task instruction 기반 스킬 추출 + lane-role 기준 agent 생성
+        self._skill_extraction_min_ratio: float = float(
+            os.getenv("SKILL_EXTRACTION_MIN_RATIO", str(Config.SKILL_EXTRACTION_MIN_RATIO))
+        )
+        self._skill_extraction_min_count: int = int(
+            os.getenv("SKILL_EXTRACTION_MIN_COUNT", str(Config.SKILL_EXTRACTION_MIN_COUNT))
+        )
+        self._agent_creation_min_tasks_per_skill_per_lane: int = int(
+            os.getenv(
+                "AGENT_CREATION_MIN_TASKS_PER_SKILL_PER_LANE",
+                str(Config.AGENT_CREATION_MIN_TASKS_PER_SKILL_PER_LANE),
+            )
+        )
+        self._agent_creation_require_automation: bool = (
+            os.getenv(
+                "AGENT_CREATION_REQUIRE_AUTOMATION",
+                "true" if Config.AGENT_CREATION_REQUIRE_AUTOMATION else "false",
+            ).lower()
+            == "true"
+        )
         # Process definition generation mode:
         # - true: use LLM generation first, then fallback/normalize
         # - false: skip LLM and build deterministic definition from extracted data
@@ -1242,6 +1269,280 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             out[tid] = cleaned
         return out
 
+    async def _postprocess_skills_and_tasks(
+        self,
+        *,
+        proc_json: Dict[str, Any],
+        process_name: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        activity 지침에서 반복 패턴을 스킬로 추출 → LLM 으로 풍부한 스킬 카드(SOP) 생성
+        → activity.skills 에 부착 → process-scope 메타로 채움.
+
+        - LLM 호출이 비활성화/실패하면 캐노니컬 문장 기반 폴백 카드를 그대로 사용한다.
+        - 반환되는 metas 에는 후속 단계(_apply_assignment_..., SKILL.md 직렬화)가 그대로
+          쓸 수 있도록 풍부한 필드 (description/when_to_use/procedure/...) 가 포함된다.
+        """
+        try:
+            processor = ProcessPostProcessor(
+                min_ratio=self._skill_extraction_min_ratio,
+                min_count=self._skill_extraction_min_count,
+                lane_skill_min_tasks=self._agent_creation_min_tasks_per_skill_per_lane,
+                require_automation=self._agent_creation_require_automation,
+            )
+
+            # 1) 클러스터링만 수행
+            cluster_result = processor.build_skill_clusters(proc_json)
+            reusable = cluster_result.get("reusable") or []
+            threshold = cluster_result.get("threshold")
+
+            if not reusable:
+                logger.info(
+                    "[SKILL][POST] process=%r skills=0 threshold=%s (no reusable cluster)",
+                    process_name, threshold,
+                )
+                processor.apply_enriched_skills(proc_json, [])
+                return []
+
+            # 2) LLM 으로 enrich (실패/비활성 시 자동 폴백)
+            enricher = SkillEnricher()
+            activity_by_id = build_activity_index(proc_json)
+            try:
+                cards = await enricher.enrich_clusters(
+                    clusters=reusable,
+                    process_name=process_name,
+                    activity_by_id=activity_by_id,
+                    post_processor=processor,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[SKILL][LLM] enrich_clusters failed (%s) → fallback for %d clusters",
+                    e, len(reusable),
+                )
+                cards = [
+                    processor.fallback_skill_card(c, idx)
+                    for idx, c in enumerate(reusable, start=1)
+                ]
+
+            # 3) proc_json 에 부착
+            processor.apply_enriched_skills(proc_json, cards)
+
+            logger.info(
+                "[SKILL][POST] process=%r skills=%d threshold=%s",
+                process_name, len(cards), threshold,
+            )
+
+            # 4) downstream 메타 (이미 LLM 카드 형식이므로 그대로 통과)
+            metas: List[Dict[str, Any]] = []
+            for s in cards:
+                if not isinstance(s, dict):
+                    continue
+                name = str(s.get("name") or "").strip()
+                safe = str(s.get("safe_name") or "").strip()
+                if not name or not safe:
+                    continue
+                meta = dict(s)
+                # 필수 호환 키 보강
+                meta["id"] = safe
+                meta["safe_name"] = safe
+                meta["purpose"] = meta.get("description") or meta.get("summary") or ""
+                meta.setdefault("procedure_text", "")
+                metas.append(meta)
+            return metas
+        except Exception as e:
+            logger.warning(f"[WARN] postprocess_skills_and_tasks failed: {e}")
+            proc_json["skills"] = []
+            return []
+
+    def _pick_existing_agent_for_lane_skill(
+        self,
+        *,
+        role_name: str,
+        skill_names: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        """역할 + 스킬 키워드로 기존 agent 재사용 후보를 찾음."""
+        role_key = self._normalize_text_key(role_name)
+        skill_keys = [self._normalize_text_key(s) for s in skill_names if str(s or "").strip()]
+        best: Optional[Dict[str, Any]] = None
+        best_score = -1.0
+
+        for a in (self._agents or []):
+            if not isinstance(a, dict) or not a.get("id"):
+                continue
+            text = " ".join(
+                str(x or "")
+                for x in (
+                    a.get("username"),
+                    a.get("role"),
+                    a.get("alias"),
+                    a.get("description"),
+                    a.get("goal"),
+                    a.get("persona"),
+                    " ".join(a.get("skills") or []) if isinstance(a.get("skills"), list) else "",
+                )
+            )
+            tkey = self._normalize_text_key(text)
+            if not tkey:
+                continue
+            score = 0.0
+            if role_key and role_key in tkey:
+                score += 1.0
+            score += sum(0.5 for sk in skill_keys if sk and sk in tkey)
+            if score > best_score:
+                best_score = score
+                best = a
+        if best_score <= 0:
+            return None
+        return best
+
+    async def _assign_or_create_agents_by_lane_skill(
+        self,
+        *,
+        proc_json: Dict[str, Any],
+        tenant_id: str,
+        process_name: str,
+    ) -> Dict[str, Set[str]]:
+        """
+        lane(role)-skill 집계로 agent를 생성/재사용하고 activities/roles를 업데이트.
+        반환: {agent_id: {skill_name...}}
+        """
+        await self._load_org_and_agents(tenant_id)
+        activities = proc_json.get("activities") or []
+        roles = proc_json.get("roles") or []
+        if not isinstance(activities, list):
+            activities = []
+        if not isinstance(roles, list):
+            roles = []
+        proc_skills = proc_json.get("skills") or []
+        skill_name_by_id = {
+            str(s.get("id") or "").strip(): str(s.get("name") or "").strip()
+            for s in proc_skills
+            if isinstance(s, dict)
+        }
+
+        processor = ProcessPostProcessor(
+            min_ratio=self._skill_extraction_min_ratio,
+            min_count=self._skill_extraction_min_count,
+            lane_skill_min_tasks=self._agent_creation_min_tasks_per_skill_per_lane,
+            require_automation=self._agent_creation_require_automation,
+        )
+        candidates = processor.collect_lane_skill_candidates(proc_json)
+        logger.info("[ASSIGN][LANE] process=%r candidates=%d", process_name, len(candidates))
+
+        activity_by_id = {
+            str(a.get("id") or "").strip(): a
+            for a in activities
+            if isinstance(a, dict) and str(a.get("id") or "").strip()
+        }
+        role_agent_by_name: Dict[str, str] = {}
+        agent_skill_names: Dict[str, Set[str]] = {}
+
+        for cand in candidates:
+            role_name = str(cand.get("role") or "").strip()
+            skill_id = str(cand.get("skill_id") or "").strip()
+            activity_ids = [str(x).strip() for x in (cand.get("activity_ids") or []) if str(x).strip()]
+            if not role_name or not skill_id or not activity_ids:
+                continue
+
+            skill_name = skill_name_by_id.get(skill_id) or skill_id
+            agent_id = role_agent_by_name.get(role_name)
+
+            if not agent_id:
+                existing = self._pick_existing_agent_for_lane_skill(
+                    role_name=role_name,
+                    skill_names=[skill_name],
+                )
+                if existing and existing.get("id"):
+                    agent_id = str(existing.get("id"))
+
+            if not agent_id:
+                team_id = self._org_teams_by_name.get(self._normalize_text_key(role_name)) or ""
+                team_name = self._org_team_name_by_id.get(team_id) or role_name or "미분류"
+                snippets: List[str] = []
+                for aid in activity_ids[:6]:
+                    a = activity_by_id.get(aid, {})
+                    snippets.append(
+                        " ".join(
+                            str(x or "")
+                            for x in (
+                                a.get("name"),
+                                a.get("instruction"),
+                                a.get("description"),
+                            )
+                        )
+                    )
+                user_input = (
+                    f"프로세스 '{process_name}'의 역할 '{role_name}'에 대해 다음 공통 스킬을 수행할 에이전트를 설계하세요.\n"
+                    f"- 공통 스킬: {skill_name}\n"
+                    f"- 대표 태스크 맥락: {' | '.join(snippets)}\n"
+                    "불필요한 일반 업무는 제외하고 자동화 가능한 작업 중심으로 설계하세요."
+                )
+                mcp_tools = self._safe_json_loads(os.getenv("MCP_TOOLS_JSON", "")) or {}
+                profile = await self._llm_generate_agent_profile(
+                    team_name=team_name,
+                    user_input=user_input,
+                    mcp_tools=mcp_tools,
+                )
+                if profile:
+                    created = await self._insert_agent_user(
+                        tenant_id=tenant_id,
+                        agent_profile=profile,
+                        agent_type="agent",
+                    )
+                    if created and created.get("id"):
+                        agent_id = str(created.get("id"))
+                        if team_id:
+                            await self._update_org_chart_add_member(
+                                tenant_id=tenant_id,
+                                team_id=team_id,
+                                member_user=created,
+                            )
+
+            if not agent_id:
+                continue
+
+            role_agent_by_name[role_name] = agent_id
+            agent_skill_names.setdefault(agent_id, set()).add(skill_name)
+
+            for aid in activity_ids:
+                a = activity_by_id.get(aid)
+                if not isinstance(a, dict):
+                    continue
+                a["agent"] = agent_id
+                # fixed policy for skill-assigned tasks
+                a["agentMode"] = "complete"
+                a["orchestration"] = "deepagents"
+
+        # Candidates가 아닌 activity는 명시적으로 none 처리
+        for a in activities:
+            if not isinstance(a, dict):
+                continue
+            if isinstance(a.get("skills"), list) and a.get("skills"):
+                a["agentMode"] = "complete"
+                a["orchestration"] = "deepagents"
+                continue
+            if str(a.get("agent") or "").strip():
+                continue
+            a["agent"] = None
+            a["agentMode"] = "none"
+            a["orchestration"] = None
+
+        # roles.endpoint 갱신 (lane/role에 agent 배치)
+        for r in roles:
+            if not isinstance(r, dict):
+                continue
+            rname = str(r.get("name") or "").strip()
+            if not rname:
+                continue
+            agent_id = role_agent_by_name.get(rname)
+            if agent_id:
+                r["endpoint"] = agent_id
+                r["origin"] = "used"
+
+        proc_json["activities"] = activities
+        proc_json["roles"] = roles
+        return agent_skill_names
+
     async def _expand_process_after_forms(
         self,
         *,
@@ -1258,24 +1559,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
     ) -> Dict[str, Any]:
         """
         Post-processing step AFTER forms exist:
-        - Ensure agent fields are consistent (agentMode/orchestration)
         - Set inputData using real form_id + fields_json from earlier tasks
         """
-        # 0) Final-stage assignee mapping:
-        # - Do it AFTER forms exist and process is enriched, so we can use:
-        #   (a) generated process info (activities/roles/tools)
-        #   (b) extracted info (from PDF/Neo4j) if provided
-        #   (c) organization chart + agent profiles
-        try:
-            await self._apply_assignment_and_maybe_create_agents(
-                proc_json=proc_json,
-                tenant_id=tenant_id,
-                process_name=process_name,
-                extracted=extracted,
-            )
-        except Exception as e:
-            logger.warning(f"[WARN] assignment apply failed in expand stage: {e}")
-
         # 1) Build predecessors based on sequences
         pred_map = self._build_predecessor_activity_map(proc_json)
 
@@ -1328,8 +1613,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     continue
 
                 # normalize agent fields (final)
+                has_skills = isinstance(a.get("skills"), list) and len(a.get("skills") or []) > 0
                 agent_id = str(a.get("agent") or "").strip()
-                if agent_id:
+                if has_skills:
+                    # fixed policy for skill-assigned tasks
+                    a["agentMode"] = "complete"
+                    a["orchestration"] = "deepagents"
+                elif agent_id:
                     a["agentMode"] = "draft"
                     a["orchestration"] = "crewai-action"
                 else:
@@ -1497,6 +1787,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 e["outputData"] = a.get("outputData") or []
             if isinstance(a.get("checkpoints"), list):
                 e["checkpoints"] = a.get("checkpoints") or []
+            if isinstance(a.get("skills"), list):
+                e["skills"] = a.get("skills") or []
 
             # properties are serialized into uengine:json for tasks
             props = e.get("properties") if isinstance(e.get("properties"), dict) else {}
@@ -1511,6 +1803,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     "agentMode": a.get("agentMode") or "none",
                     "orchestration": a.get("orchestration", None),
                     "attachments": a.get("attachments") or [],
+                    "skills": a.get("skills") or [],
                     "customProperties": a.get("customProperties") or [],
                 }
             )
@@ -1536,6 +1829,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             "pdf_names": [],
             "input_files": [],
             "description": "",
+            "room_id": "",
+            "tenant_id": "",
             "raw_query": query
         }
 
@@ -1581,6 +1876,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
         def _normalize_files_from_input(data: Dict[str, Any]) -> List[Dict[str, str]]:
             files: List[Dict[str, str]] = []
+            default_room_id = str(data.get("room_id") or "").strip()
+            default_tenant_id = str(data.get("tenant_id") or "").strip()
 
             def _pick_url(item: Dict[str, Any]) -> str:
                 return str(
@@ -1613,11 +1910,22 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         {
                             "url": u,
                             "name": _pick_name(candidate),
+                            "path": str(candidate.get("path") or "").strip().rstrip("?"),
+                            "room_id": str(candidate.get("room_id") or default_room_id).strip(),
+                            "tenant_id": str(candidate.get("tenant_id") or default_tenant_id).strip(),
                         }
                     )
                     return
                 if isinstance(candidate, str) and candidate.strip():
-                    files.append({"url": candidate.strip(), "name": ""})
+                    files.append(
+                        {
+                            "url": candidate.strip(),
+                            "name": "",
+                            "path": "",
+                            "room_id": default_room_id,
+                            "tenant_id": default_tenant_id,
+                        }
+                    )
 
             # 단일 파일 호환 키
             for key in ("file", "pdf_file", "attachment"):
@@ -1644,10 +1952,20 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 if not u or u in seen:
                     continue
                 seen.add(u)
-                deduped.append({"url": u, "name": str(f.get("name") or "").strip()})
+                deduped.append(
+                    {
+                        "url": u,
+                        "name": str(f.get("name") or "").strip(),
+                        "path": str(f.get("path") or "").strip().rstrip("?"),
+                        "room_id": str(f.get("room_id") or default_room_id).strip(),
+                        "tenant_id": str(f.get("tenant_id") or default_tenant_id).strip(),
+                    }
+                )
             return deduped
 
         def _apply_parsed_data(data: Dict[str, Any]):
+            result["room_id"] = str(data.get("room_id") or result.get("room_id") or "").strip()
+            result["tenant_id"] = str(data.get("tenant_id") or result.get("tenant_id") or "").strip()
             normalized_files = _normalize_files_from_input(data)
             if normalized_files:
                 result["input_files"] = normalized_files
@@ -1732,7 +2050,15 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 new_url = self._rewrite_localhost_url(old_url, localhost_target="host.docker.internal")
                 if old_url and new_url != old_url:
                     logger.info(f"[PARSE] Rewrote file URL for Docker: {old_url} -> {new_url}")
-                rewritten_files.append({"url": new_url or old_url, "name": str(item.get("name") or "")})
+                rewritten_files.append(
+                    {
+                        "url": new_url or old_url,
+                        "name": str(item.get("name") or ""),
+                        "path": str(item.get("path") or "").strip().rstrip("?"),
+                        "room_id": str(item.get("room_id") or result.get("room_id") or "").strip(),
+                        "tenant_id": str(item.get("tenant_id") or result.get("tenant_id") or "").strip(),
+                    }
+                )
             if rewritten_files:
                 result["input_files"] = rewritten_files
                 result["pdf_urls"] = [f.get("url", "") for f in rewritten_files if f.get("url")]
@@ -1769,117 +2095,231 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         except Exception:
             return url
 
-    async def _download_pdf(self, url: str, filename: str = None) -> Tuple[str, str, Optional[str]]:
-        """(deprecated) 파일 다운로드 후 (임시 경로, 추정 파일명, content-type) 반환"""
-        return await self._download_file(url, filename)
-
-    async def _download_file(self, url: str, filename: str = None) -> Tuple[str, str, Optional[str]]:
-        """
-        파일 다운로드 후 (임시 파일 경로, 추정 파일명, content-type)을 반환합니다.
-        - docx2pdf 프로젝트처럼 Content-Disposition / URL / Content-Type으로 파일명/확장자를 최대한 추정합니다.
-        - 확장자가 불명확하면 `.bin`으로 저장합니다(이 경우 변환이 실패할 수 있음).
-        """
-        client = await self._get_http_client()
-
-        download_url = url
-        if self._is_running_in_docker():
-            download_url = self._rewrite_localhost_url(download_url, localhost_target="host.docker.internal")
-            if download_url != url:
-                logger.info(f"[DOWNLOAD] Rewrote URL for Docker: {url} -> {download_url}")
-
-        logger.info(f"[DOWNLOAD] Downloading file from: {download_url}")
-
-        try:
-            response = await client.get(download_url, follow_redirects=True)
-        except httpx.ConnectError as e:
-            # ConnectError는 "PDF2BPMN API(8001)" 뿐 아니라 "첨부파일 다운로드 URL"에서도 발생할 수 있음
-            raise Exception(f"파일 다운로드 연결 실패: {download_url} ({e})")
-        if response.status_code != 200:
-            raise Exception(f"Failed to download file: {response.status_code}")
-
-        def _sanitize_filename(name: str) -> str:
-            name = (name or "").replace("\\", "/").split("/")[-1]
-            name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" ._")
-            name = re.sub(r"\s+", " ", name).strip()
-            return name[:150] if name else ""
-
-        def _guess_filename_from_headers() -> str:
-            cd = response.headers.get("content-disposition") or response.headers.get("Content-Disposition") or ""
-            if cd:
-                m = re.search(r"filename\*=UTF-8''([^;]+)", cd, flags=re.IGNORECASE)
-                if m:
-                    try:
-                        from urllib.parse import unquote
-
-                        v = _sanitize_filename(unquote(m.group(1)))
-                        if v:
-                            return v
-                    except Exception:
-                        pass
-                m = re.search(r'filename="([^"]+)"', cd, flags=re.IGNORECASE)
-                if m:
-                    v = _sanitize_filename(m.group(1))
-                    if v:
-                        return v
-                m = re.search(r"filename=([^;]+)", cd, flags=re.IGNORECASE)
-                if m:
-                    v = _sanitize_filename(m.group(1).strip().strip('"'))
-                    if v:
-                        return v
-
-            try:
-                from urllib.parse import urlparse, unquote
-
-                parsed = urlparse(str(response.url))
-                base = _sanitize_filename(unquote(Path(parsed.path).name))
-                if base:
-                    return base
-            except Exception:
-                pass
-
-            return ""
-
-        content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower() or None
-        content_type_to_ext = {
-            "application/pdf": ".pdf",
-            "application/msword": ".doc",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-            "application/vnd.ms-excel": ".xls",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-            "application/vnd.ms-powerpoint": ".ppt",
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
-            "text/plain": ".txt",
-            "text/csv": ".csv",
-            "text/html": ".html",
-            "application/rtf": ".rtf",
-            "application/vnd.oasis.opendocument.text": ".odt",
-            "application/vnd.oasis.opendocument.spreadsheet": ".ods",
-            "application/vnd.oasis.opendocument.presentation": ".odp",
-        }
-
-        inferred_name = _sanitize_filename(filename) if filename else ""
-        if not inferred_name:
-            inferred_name = _guess_filename_from_headers() or "input"
-
-        ext = Path(inferred_name).suffix.lower()
-        body_head = response.content[:6] if response.content else b""
-        is_pdf_by_magic = body_head.startswith(b"%PDF-")
-        if (not ext) or (ext == ".pdf" and (not is_pdf_by_magic) and content_type and content_type != "application/pdf"):
-            mapped = content_type_to_ext.get(content_type or "")
-            if mapped:
-                inferred_name = str(Path(inferred_name).with_suffix(mapped))
-                ext = mapped
-
-        suffix = ext or ".bin"
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        temp_file.write(response.content)
-        temp_file.close()
-
-        logger.info(f"[DOWNLOAD] File saved to: {temp_file.name} (inferred={inferred_name}, ct={content_type})")
-        return temp_file.name, inferred_name, content_type
+    # NOTE: _download_file / _extract_storage_file_path 는 메멘토 재사용 흐름 도입으로 제거됨.
+    # 파일 다운로드/PDF 변환은 모두 메멘토(`save-to-storage`)가 수행하며, pdf2bpmn 은
+    # `_fetch_memento_chunks` 를 통해 사전 처리된 청크/임베딩만 가져온다.
 
     def _normalize_text_key(self, s: str) -> str:
         return re.sub(r"\s+", "", (s or "").strip().lower())
+
+    # NOTE: _parse_with_synap / _extract_text_from_hwp_or_hwpx / _build_state_from_page_texts 는
+    # 메멘토 재사용 흐름 도입으로 모두 제거되었다. 동일 기능은 메멘토가 수행하며,
+    # 결과는 GET /documents/chunks-with-embeddings 로 그대로 가져와 사용한다.
+
+    # =========================================================================
+    # Memento integration helpers
+    # -------------------------------------------------------------------------
+    # 사용 흐름은 메인채팅(프론트) → 메멘토(`save-to-storage`) → 메인채팅 에이전트
+    # → pdf2bpmn 으로 고정되어 있다.
+    # 즉, pdf2bpmn 시점에는 이미 메멘토가 다음 작업을 마친 상태이다:
+    #   - Supabase Storage 업로드 (PDF가 아니면 PDF로 변환된 페이지 텍스트를 보유)
+    #   - 페이지/문서 텍스트 추출 후 chunking
+    #   - 임베딩 (Chroma + Supabase documents)
+    # 따라서 pdf2bpmn은 더 이상 "다운로드 → 변환 → ingest_pdf → embed" 를 직접 하지 않고
+    # 메멘토에서 청크/임베딩을 가져와 그대로 활용한다.
+    # =========================================================================
+
+    def _memento_base_url(self) -> str:
+        base = (os.getenv("MEMENTO_BASE_URL") or self.config.get("memento_base_url") or "").strip()
+        if not base:
+            base = (Config.MEMENTO_BASE_URL or "http://localhost:8005").strip()
+        base = base.rstrip("/")
+        if self._is_running_in_docker():
+            base = self._rewrite_localhost_url(base, localhost_target="host.docker.internal")
+        return base
+
+    async def _fetch_memento_chunks(
+        self,
+        *,
+        tenant_id: str,
+        file_path: str = "",
+        file_name: str = "",
+        room_id: str = "",
+        include_embeddings: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        메멘토에서 사전 처리된 청크/임베딩을 가져온다.
+        - tenant_id + (file_path 또는 file_name) 기준 조회
+        - 반환: [{page_content, metadata, embedding?}, ...]
+        - 실패 시 빈 리스트 반환 (호출 측에서 명시적 에러를 만들도록 함)
+        """
+        if not tenant_id:
+            return []
+        if not file_path and not file_name:
+            return []
+
+        base_url = self._memento_base_url()
+        if not base_url:
+            logger.warning("[MEMENTO] MEMENTO_BASE_URL이 비어있어 청크 조회를 건너뜁니다.")
+            return []
+
+        params: Dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "include_embeddings": "true" if include_embeddings else "false",
+        }
+        if file_path:
+            params["file_path"] = file_path
+        if file_name:
+            params["file_name"] = file_name
+        if room_id:
+            params["room_id"] = room_id
+
+        url = f"{base_url}/documents/chunks-with-embeddings"
+        client = await self._get_http_client()
+        try:
+            resp = await client.get(
+                url,
+                params=params,
+                timeout=float(Config.MEMENTO_TIMEOUT_SEC or 60.0),
+            )
+        except httpx.ConnectError as e:
+            raise Exception(f"메멘토 연결 실패: {url} ({e})")
+
+        if resp.status_code != 200:
+            logger.warning(
+                "[MEMENTO] chunks-with-embeddings 응답 비정상: status=%s body=%s",
+                resp.status_code, resp.text[:300],
+            )
+            return []
+
+        body = resp.json() or {}
+        chunks = body.get("chunks") or []
+        logger.info(
+            "[MEMENTO] chunks fetched: file_path=%r file_name=%r room=%r tenant=%r "
+            "→ chunks=%d embeddings=%d",
+            file_path, file_name, room_id, tenant_id,
+            len(chunks), int(body.get("embedding_count") or 0),
+        )
+        return chunks
+
+    def _build_state_from_memento_chunks(
+        self,
+        *,
+        display_name: str,
+        source: str,
+        memento_chunks: List[Dict[str, Any]],
+    ) -> Tuple[List[PdfDocument], List[Section], List[ReferenceChunk]]:
+        """
+        메멘토 청크를 그대로 활용해 (Document, [Section], [ReferenceChunk]) 를 구성한다.
+
+        설계 원칙:
+        - 청크는 "메멘토가 만든 그대로" ReferenceChunk 로 변환한다 (재청킹 X).
+        - 임베딩은 메멘토에서 받은 값을 chunk.embedding 에 직접 세팅한다.
+          → 이후 workflow.segment_sections 의 batch_embed_chunks 가
+            embedding 이 이미 있는 청크는 자동 스킵하므로 재임베딩이 일어나지 않는다.
+        - 섹션은 메멘토 청크의 page_number 별로 묶어 page_texts 를 재구성한 뒤
+          기존 PDFExtractor 의 heading/SOP 분리 로직을 그대로 사용한다.
+        """
+        if not memento_chunks:
+            return [], [], []
+
+        from src.pdf2bpmn.extractors.pdf_extractor import PDFExtractor  # type: ignore
+        import hashlib as _hashlib
+
+        # 1) 청크들을 page_number 기준으로 정리 (page_number(1-based) 우선,
+        #    없으면 0-based page +1, 둘 다 없으면 1로 폴백)
+        def _resolve_page(meta: Dict[str, Any]) -> int:
+            pno = meta.get("page_number")
+            if pno is None and meta.get("page") is not None:
+                try:
+                    pno = int(meta.get("page")) + 1
+                except (TypeError, ValueError):
+                    pno = None
+            try:
+                return max(1, int(pno)) if pno is not None else 1
+            except (TypeError, ValueError):
+                return 1
+
+        page_to_texts: Dict[int, List[str]] = {}
+        normalized_chunks: List[Tuple[Dict[str, Any], str, int]] = []
+        for ch in memento_chunks:
+            text = str(ch.get("page_content") or "").strip()
+            if not text:
+                continue
+            meta = ch.get("metadata") or {}
+            page = _resolve_page(meta)
+            page_to_texts.setdefault(page, []).append(text)
+            normalized_chunks.append((ch, text, page))
+
+        if not page_to_texts:
+            return [], [], []
+
+        page_texts: Dict[int, str] = {
+            p: "\n\n".join(parts) for p, parts in page_to_texts.items() if parts
+        }
+        sorted_pages = sorted(page_texts.keys())
+
+        # 2) Document
+        doc = PdfDocument(
+            title=Path(display_name).stem or display_name or "document",
+            source=source,
+            page_count=max(sorted_pages),
+        )
+
+        # 3) Section: 기존 heading/SOP 분리 로직 재사용
+        extractor = PDFExtractor()
+        all_text = [(p, page_texts[p]) for p in sorted_pages]
+        sop_sections: List[Section] = []
+        heading_sections: List[Section] = extractor._extract_sections(doc.doc_id, all_text)
+        if Config.ENABLE_SOP_SEGMENTATION and Config.OPENAI_API_KEY:
+            try:
+                sop_sections = extractor._extract_sop_sections(doc.doc_id, page_texts)
+            except Exception as e:
+                logger.warning(f"[SECTION] SOP 분할 실패, heading 분할로 폴백: {e}")
+                sop_sections = []
+
+        if extractor._should_use_heading_sections(
+            sop_sections=sop_sections,
+            heading_sections=heading_sections,
+            page_count=doc.page_count,
+        ):
+            sections = heading_sections
+        else:
+            sections = sop_sections or heading_sections
+
+        if Config.FORCE_SINGLE_SECTION:
+            sections = extractor._force_single_section(doc.doc_id, page_texts)
+
+        # 4) ReferenceChunk: 메멘토 청크 그대로 변환 + 임베딩 설정
+        ref_chunks: List[ReferenceChunk] = []
+        reused_embedding_count = 0
+        for ch, text, page in normalized_chunks:
+            meta = ch.get("metadata") or {}
+            try:
+                chunk_index = int(meta.get("chunk_index") or 0)
+            except (TypeError, ValueError):
+                chunk_index = 0
+            # span 은 정확한 원본 위치가 아니어도 downstream에서는 식별용으로만 쓰여
+            # chunk_index 기준의 가짜 span 으로 충분하다.
+            start = chunk_index * 1000
+            text_hash = _hashlib.md5(text.encode("utf-8", errors="replace")).hexdigest()
+
+            embedding = ch.get("embedding")
+            if isinstance(embedding, list) and len(embedding) == Config.EMBEDDING_DIMENSIONS:
+                reused_embedding_count += 1
+            else:
+                # 차원 불일치/None 인 경우 None 으로 두면 segment_sections 의
+                # batch_embed_chunks 가 해당 청크만 다시 임베딩한다.
+                embedding = None
+
+            ref_chunks.append(
+                ReferenceChunk(
+                    doc_id=doc.doc_id,
+                    page=page,
+                    span=f"{start}:{start + len(text)}",
+                    text=text,
+                    hash=text_hash,
+                    embedding=embedding,
+                )
+            )
+
+        logger.info(
+            "[MEMENTO] state built: doc=%r pages=%d sections=%d chunks=%d "
+            "reused_embeddings=%d/%d",
+            doc.title, doc.page_count, len(sections), len(ref_chunks),
+            reused_embedding_count, len(ref_chunks),
+        )
+        return [doc], sections, ref_chunks
 
     def _is_placeholder_gateway_name(self, name: str) -> bool:
         key = self._normalize_text_key(name)
@@ -2747,6 +3187,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         "properties": "{}",
                         "description": e.get("description") or "",
                         "instruction": e.get("instruction") or "",
+                        "skills": e.get("skills") or [],
                         "attachedEvents": None,
                         # agent fields will be filled later
                         "agent": None,
@@ -5143,390 +5584,15 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         process_name: str,
         extracted: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        proc_json.roles / proc_json.activities에 대해:
-        - 기존 룰 기반 매핑(사용자/에이전트/팀)
-        - LLM 기반 추천(선택)
-        - 필요 시 에이전트 자동 생성(users insert) + 조직도 반영(선택)
-        """
-        await self._load_org_and_agents(tenant_id)
-        roles = proc_json.get("roles") or []
-        activities = proc_json.get("activities") or []
-        if not isinstance(roles, list):
-            roles = []
-        if not isinstance(activities, list):
-            activities = []
-
-        # -------------------------------------------------------------------
-        # NEW (요구사항): 프로세스 "단건" 맥락에서 자동화 가능 부분을 판단하고
-        # - 기존 에이전트 매핑
-        # - 없으면 생성(create_agent)까지
-        # 를 한 번에 계획/적용한다. (키워드 기반 human_required는 폴백으로만 남김)
-        # -------------------------------------------------------------------
-        plan = await self._llm_plan_assignments_for_process(
-            tenant_id=tenant_id,
-            process_name=process_name,
-            proc_json=proc_json,
-            extracted_context=extracted,
-        )
-
-        users_by_id = {str(u.get("id")): u for u in (self._users or []) if isinstance(u, dict) and u.get("id")}
-
-        def _clean_text(s: Any) -> str:
-            return " ".join(str(s or "").split())
-
-        def _is_agent_user_id(user_id: str) -> bool:
-            u = users_by_id.get(str(user_id) or "")
-            return bool(u and u.get("is_agent") is True and u.get("id"))
-
-        default_agent_mode = "draft"  # fixed
-        unresolved_activity_ids: Optional[Set[str]] = None
-
-        if isinstance(plan, dict) and isinstance(plan.get("decisions"), list):
-            decisions = plan.get("decisions") or []
-            by_aid: Dict[str, Dict[str, Any]] = {}
-            activity_name_to_id: Dict[str, str] = {}
-            for a in activities:
-                if isinstance(a, dict):
-                    aid0 = _clean_text(a.get("id"))
-                    aname0 = self._normalize_text_key(_clean_text(a.get("name")))
-                    if aid0 and aname0:
-                        activity_name_to_id[aname0] = aid0
-            for d in decisions:
-                if isinstance(d, dict):
-                    aid = str(d.get("activity_id") or "").strip()
-                    if not aid:
-                        dname = self._normalize_text_key(
-                            str(d.get("activity_name") or d.get("task_name") or d.get("name") or "")
-                        )
-                        aid = activity_name_to_id.get(dname, "")
-                    if aid:
-                        d["activity_id"] = aid
-                        by_aid[aid] = d
-
-            plan_handled_ids: Set[str] = set()
-            for a in activities:
-                if not isinstance(a, dict):
-                    continue
-                aid = _clean_text(a.get("id"))
-                aname = _clean_text(a.get("name"))
-                rn = _clean_text(a.get("role"))
-
-                d = by_aid.get(aid)
-                if not isinstance(d, dict):
-                    # no decision => leave unassigned (fallback later)
-                    continue
-                plan_handled_ids.add(aid)
-
-                action = str(d.get("action") or "none").strip()
-                conf = d.get("confidence")
-                reason = str(d.get("reason") or "")[:200]
-
-                if action == "existing_user":
-                    target_user_id = str(d.get("target_user_id") or "").strip()
-                    if target_user_id and _is_agent_user_id(target_user_id):
-                        a["agent"] = target_user_id
-                        a["agentMode"] = default_agent_mode
-                        a["orchestration"] = "crewai-action"
-                        logger.info(
-                            f"[ASSIGN][PLAN] activity id={aid!r} name={aname!r} role={rn!r} -> existing_user id={target_user_id!r} conf={conf} reason={reason!r}"
-                        )
-                        continue
-                    # invalid => treat as none
-                    action = "none"
-
-                if action == "create_agent":
-                    create_agent = d.get("create_agent") or {}
-                    if not isinstance(create_agent, dict):
-                        create_agent = {}
-                    team_id_for_new = str(create_agent.get("team_id") or "").strip()
-                    team_name = self._org_team_name_by_id.get(team_id_for_new) or ""
-                    if not team_name:
-                        team_name = "미분류"
-                    user_input = str(create_agent.get("user_input") or "").strip()
-                    if not user_input:
-                        user_input = (
-                            f"다음 태스크를 자동화할 에이전트를 생성해주세요.\n"
-                            f"- 프로세스: {process_name}\n"
-                            f"- 역할: {rn}\n"
-                            f"- 태스크: {aname}\n"
-                            f"- 지침: {_clean_text(a.get('instruction'))}\n"
-                            "자동화 기준/입력/출력/검증 방법을 포함해 설계해 주세요."
-                        )
-                    mcp_tools = self._safe_json_loads(os.getenv("MCP_TOOLS_JSON", "")) or {}
-                    agent_profile = await self._llm_generate_agent_profile(team_name=team_name, user_input=user_input, mcp_tools=mcp_tools)
-                    if agent_profile:
-                        new_agent_type = str(create_agent.get("agent_type") or "agent").strip() or "agent"
-                        created = await self._insert_agent_user(tenant_id=tenant_id, agent_profile=agent_profile, agent_type=new_agent_type)
-                        if created and created.get("id"):
-                            if team_id_for_new:
-                                await self._update_org_chart_add_member(
-                                    tenant_id=tenant_id, team_id=team_id_for_new, member_user=created
-                                )
-                            a["agent"] = created.get("id")
-                            a["agentMode"] = default_agent_mode
-                            a["orchestration"] = "crewai-action"
-                            logger.info(
-                                f"[ASSIGN][PLAN] activity id={aid!r} name={aname!r} role={rn!r} -> create_agent id={created.get('id')!r} conf={conf} reason={reason!r}"
-                            )
-                            continue
-                    # creation failed => none
-                    action = "none"
-
-                # none/default
-                a["agent"] = None
-                a["agentMode"] = "none"
-                a["orchestration"] = None
-                logger.info(
-                    f"[ASSIGN][PLAN] activity id={aid!r} name={aname!r} role={rn!r} -> none conf={conf} reason={reason!r}"
-                )
-
-            all_activity_ids = {
-                _clean_text(a.get("id"))
-                for a in activities
-                if isinstance(a, dict) and _clean_text(a.get("id"))
-            }
-            if all_activity_ids and plan_handled_ids >= all_activity_ids:
-                proc_json["activities"] = activities
-                return
-            unresolved_activity_ids = all_activity_ids - plan_handled_ids
-            logger.warning(
-                f"[ASSIGN][PLAN] partial plan coverage: handled={len(plan_handled_ids)} total={len(all_activity_ids)} -> fallback per-activity"
+        """lane(role)-skill 규칙 기반 에이전트 배정/생성."""
+        try:
+            await self._assign_or_create_agents_by_lane_skill(
+                proc_json=proc_json,
+                tenant_id=tenant_id,
+                process_name=process_name,
             )
-
-        # -------------------------------------------------------------------
-        # Fallback (legacy): per-activity heuristics + LLM
-        # -------------------------------------------------------------------
-        # Build per-role activity context (LLM 입력으로 활용)
-        role_ctx: Dict[str, List[Dict[str, Any]]] = {}
-        for a in activities:
-            if not isinstance(a, dict):
-                continue
-            rn = str(a.get("role") or "").strip()
-            if not rn:
-                continue
-            role_ctx.setdefault(rn, [])
-            role_ctx[rn].append(
-                {
-                    "activityId": str(a.get("id") or ""),
-                    "activityName": str(a.get("name") or ""),
-                    "instruction": str(a.get("instruction") or ""),
-                    "description": str(a.get("description") or ""),
-                    "tool": str(a.get("tool") or ""),
-                }
-            )
-
-        # -------------------------------------------------------------------
-        # Activity-based assignment (요구사항):
-        # - roles.endpoint/default는 '기준'으로 쓰지 않고, activities를 기준으로 agent를 채운다.
-        # - 역할명이 추상적이거나(신청자 등) 역할만으로는 판단이 어려운 경우에도
-        #   activity name/instruction/tool 컨텍스트로 매핑/생성을 시도한다.
-        # -------------------------------------------------------------------
-        # users_by_id/_clean_text/_is_agent_user_id/default_agent_mode already defined above
-
-        # 사람이 직접 수행해야 하는 태스크를 매우 보수적으로 걸러서
-        # "모든 태스크에 에이전트가 붙는" 현상을 방지한다.
-        # (LLM 프롬프트에도 동일 규칙이 있지만, 휴리스틱이 먼저 붙이는 케이스를 막기 위함)
-        _HUMAN_REQUIRED_KWS = [
-            "신청", "등록", "접수", "제출", "결재", "결제", "입금", "납부", "승인", "서명",
-            "대면", "회의", "면담", "전화", "방문", "출석", "참석", "수령", "발급", "실물", "현장",
-        ]
-        _AUTOMATION_HINT_KWS = [
-            # NOTE: "작성"은 신청/제출 같은 인간업무에도 자주 등장하므로 자동화 힌트로 쓰지 않는다.
-            "자동", "에이전트", "봇", "생성", "요약", "정리", "분석", "검증", "추출", "조회", "검색",
-            "분류", "추천", "채점", "퀴즈", "문항", "리포트", "보고서", "취합", "집계",
-        ]
-
-        def _looks_strongly_human_required(activity: Dict[str, Any]) -> bool:
-            text = f"{activity.get('name') or ''} {activity.get('instruction') or ''} {activity.get('description') or ''}"
-            key = self._normalize_text_key(text)
-            if not key:
-                return False
-            # 자동화 힌트가 있으면 사람 업무로 단정하지 않는다(예: '신청서 자동 작성')
-            for kw in _AUTOMATION_HINT_KWS:
-                if self._normalize_text_key(kw) in key:
-                    return False
-            return any(self._normalize_text_key(kw) in key for kw in _HUMAN_REQUIRED_KWS)
-
-        def _heuristic_pick_agent(activity: Dict[str, Any], *, allow_on_human_required: bool = False) -> Optional[Dict[str, Any]]:
-            human_required = _looks_strongly_human_required(activity)
-            if human_required and not allow_on_human_required:
-                return None
-            # IMPORTANT:
-            # - human_required 태스크에서는 role명(팀/신청자 등)으로 매칭하면 오탐이 많으므로 role 기반 매칭을 건너뛴다.
-            if not human_required:
-                rn = _clean_text(activity.get("role"))
-                if rn:
-                    hit = self._pick_user_for_role(rn)
-                    if hit and hit.get("is_agent") is True:
-                        return hit
-            # match by activity name/instruction/description keywords vs agent username/role/alias
-            key = self._normalize_text_key(f"{activity.get('name') or ''} {activity.get('instruction') or ''} {activity.get('description') or ''}")
-            if not key:
-                return None
-            for a in (self._agents or []):
-                if not isinstance(a, dict) or not a.get("id"):
-                    continue
-                for field in ("username", "role", "alias"):
-                    cand = self._normalize_text_key(a.get(field)) or ""
-                    if cand and (cand in key or key in cand):
-                        return a
-            return None
-
-        default_agent_mode = "draft"  # fixed
-        assign_llm_concurrency = max(1, int(os.getenv("ASSIGN_LLM_CONCURRENCY", "4")))
-        rec_targets: List[Dict[str, Any]] = []
-
-        # 1) Fast-path (already assigned / heuristic) and collect LLM recommend jobs
-        for a in activities:
-            if not isinstance(a, dict):
-                continue
-            aid = _clean_text(a.get("id"))
-            if unresolved_activity_ids is not None and aid and aid not in unresolved_activity_ids:
-                continue
-            aname = _clean_text(a.get("name"))
-            rn = _clean_text(a.get("role"))
-
-            # already assigned and valid
-            if a.get("agent") and _is_agent_user_id(str(a.get("agent"))):
-                a["agentMode"] = default_agent_mode
-                a["orchestration"] = "crewai-action"
-                continue
-
-            human_required = _looks_strongly_human_required(a)
-            hit = _heuristic_pick_agent(a, allow_on_human_required=human_required)
-            if hit and hit.get("id"):
-                a["agent"] = hit.get("id")
-                a["agentMode"] = default_agent_mode
-                a["orchestration"] = "crewai-action"
-                logger.info(
-                    f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> existing_agent{'(human_required)' if human_required else ''} id={hit.get('id')}"
-                )
-                continue
-
-            activity_ctx = [
-                {
-                    "activityId": aid,
-                    "activityName": aname,
-                    "role": rn,
-                    "instruction": _clean_text(a.get("instruction")),
-                    "description": _clean_text(a.get("description")),
-                    "tool": _clean_text(a.get("tool")),
-                }
-            ]
-            role_query = _clean_text(f"{rn} {aname} {a.get('instruction') or ''} {a.get('description') or ''}") or aid
-            rec_targets.append(
-                {
-                    "activity": a,
-                    "aid": aid,
-                    "aname": aname,
-                    "rn": rn,
-                    "activity_ctx": activity_ctx,
-                    "role_query": role_query,
-                    "allow_create_agent": (not human_required),
-                }
-            )
-
-        # 2) Parallel recommend calls only (apply/create/save는 아래에서 순차)
-        sem = asyncio.Semaphore(assign_llm_concurrency)
-
-        async def _recommend_one(target: Dict[str, Any]) -> Dict[str, Any]:
-            async with sem:
-                rec = await self._llm_recommend_assignee(
-                    tenant_id=tenant_id,
-                    process_name=process_name,
-                    role_name=target.get("role_query") or "",
-                    activities_context=target.get("activity_ctx") or [],
-                    extracted_context=extracted,
-                    allow_create_agent=bool(target.get("allow_create_agent")),
-                )
-            out = dict(target)
-            out["rec"] = rec
-            return out
-
-        rec_results: List[Dict[str, Any]] = []
-        if rec_targets:
-            raw_results = await asyncio.gather(*[asyncio.create_task(_recommend_one(t)) for t in rec_targets], return_exceptions=True)
-            for rr in raw_results:
-                if isinstance(rr, Exception):
-                    logger.warning(f"[ASSIGN] recommend call failed: {rr}")
-                    continue
-                rec_results.append(rr)
-
-        # 3) Apply recommendations sequentially (safe side-effects)
-        for item in rec_results:
-            a = item.get("activity") or {}
-            aid = str(item.get("aid") or "")
-            aname = str(item.get("aname") or "")
-            rn = str(item.get("rn") or "")
-            allow_create_agent = bool(item.get("allow_create_agent"))
-            rec = item.get("rec")
-
-            if not isinstance(a, dict):
-                continue
-            if not isinstance(rec, dict):
-                a["agent"] = None
-                a["agentMode"] = "none"
-                a["orchestration"] = None
-                continue
-
-            action = str(rec.get("action") or "none").strip()
-            target_uid_dbg = str(rec.get("target_user_id") or "").strip()
-            target_tid_dbg = str(rec.get("target_team_id") or "").strip()
-            logger.info(
-                f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} "
-                f"LLM action={action} target_user_id={target_uid_dbg!r} target_team_id={target_tid_dbg!r} "
-                f"conf={rec.get('confidence')} reason={str(rec.get('reason') or '')[:120]!r}"
-            )
-
-            if action == "existing_user":
-                target_user_id = str(rec.get("target_user_id") or "").strip()
-                if target_user_id and _is_agent_user_id(target_user_id):
-                    a["agent"] = target_user_id
-                    a["agentMode"] = default_agent_mode
-                    a["orchestration"] = "crewai-action"
-                    if not allow_create_agent:
-                        logger.info(f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> existing_user(human_required) id={target_user_id}")
-                    continue
-
-            if action == "create_agent" and allow_create_agent:
-                create_agent = rec.get("create_agent") or {}
-                if not isinstance(create_agent, dict):
-                    create_agent = {}
-                team_id_for_new = str(create_agent.get("team_id") or rec.get("target_team_id") or "").strip()
-                team_name = self._org_team_name_by_id.get(team_id_for_new) or ""
-                if not team_name:
-                    team_name = "미분류"
-                user_input = str(create_agent.get("user_input") or "").strip()
-                if not user_input:
-                    user_input = (
-                        f"다음 태스크를 자동화할 에이전트를 생성해주세요.\n"
-                        f"- 역할: {rn}\n"
-                        f"- 태스크: {aname}\n"
-                        f"- 지침: {_clean_text(a.get('instruction'))}\n"
-                        "필요 시 사용자에게 확인을 요청하고 결과를 정리해 주세요."
-                    )
-                mcp_tools = self._safe_json_loads(os.getenv("MCP_TOOLS_JSON", "")) or {}
-                agent_profile = await self._llm_generate_agent_profile(team_name=team_name, user_input=user_input, mcp_tools=mcp_tools)
-                if agent_profile:
-                    new_agent_type = str(create_agent.get("agent_type") or "agent").strip() or "agent"
-                    created = await self._insert_agent_user(tenant_id=tenant_id, agent_profile=agent_profile, agent_type=new_agent_type)
-                    if created and created.get("id"):
-                        if team_id_for_new:
-                            await self._update_org_chart_add_member(tenant_id=tenant_id, team_id=team_id_for_new, member_user=created)
-                        a["agent"] = created.get("id")
-                        a["agentMode"] = default_agent_mode
-                        a["orchestration"] = "crewai-action"
-                        continue
-
-            # default: no agent
-            a["agent"] = None
-            a["agentMode"] = "none"
-            a["orchestration"] = None
-            if not allow_create_agent:
-                logger.info(f"[ASSIGN] activity id={aid!r} name={aname!r} role={rn!r} -> human_required => no agent (creation disabled)")
-
-        proc_json["activities"] = activities
+        except Exception as e:
+            logger.warning(f"[WARN] lane-skill assignment failed: {e}")
 
     async def _send_progress_event(
         self, 
@@ -5707,6 +5773,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             a.setdefault("agentMode", "none")
             a.setdefault("orchestration", None)
             a.setdefault("attachments", [])
+            if not isinstance(a.get("skills"), list):
+                a["skills"] = []
             a.setdefault("customProperties", [])
 
         # STRICT: 이벤트 신규 생성 금지
@@ -6252,6 +6320,18 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # 3. Query 파싱 (PDF 정보 추출)
             parsed = self._parse_query(user_input or "")
             input_files = parsed.get("input_files") or []
+            parsed_room_id = str(parsed.get("room_id") or "").strip()
+            parsed_tenant_id = str(parsed.get("tenant_id") or "").strip() or str(tenant_id or "")
+            effective_tenant_id = parsed_tenant_id or str(tenant_id or "")
+            from src.pdf2bpmn.graph.neo4j_client import Neo4jClient  # type: ignore
+            age_graph_name = Neo4jClient.build_graph_name(
+                tenant_id=effective_tenant_id,
+                todo_id=str(task_id or ""),
+            )
+            logger.info(
+                f"[GRAPH] AGE graph scope selected: tenant='{effective_tenant_id}', "
+                f"todo='{task_id}', graph='{age_graph_name}'"
+            )
             if not input_files:
                 pdf_url_fallback = (parsed.get("pdf_url") or "").strip()
                 if pdf_url_fallback:
@@ -6323,120 +6403,99 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             #     raise Exception("처리 시간 초과")
             
             # =================================================================
-            # 4. PDF URL 다운로드 및 (필요 시) PDF 변환
-            #    - 내부 FastAPI(/api/*) 호출은 제거하고, 워크플로우를 직접 실행합니다.
+            # 4. 메멘토(process-gpt-memento)에서 사전 처리된 청크/임베딩 로드
+            #    - 메인 채팅 → 메멘토 → 메인 에이전트 → pdf2bpmn 흐름이 고정이므로
+            #      pdf2bpmn 시점에는 메멘토가 이미 다음을 끝낸 상태이다:
+            #        · Storage 업로드 (PDF 변환 포함)
+            #        · 페이지/문서 텍스트 추출 + chunking
+            #        · 임베딩(Chroma + Supabase documents)
+            #    - 따라서 pdf2bpmn은 더 이상 다운로드/변환/Synap/HWP 분기 처리를 하지 않고,
+            #      파일 형식과 무관하게 동일하게 메멘토의 청크를 받아 섹션 분할/노드 추출에
+            #      이어 사용한다.
             # =================================================================
             if not input_files:
                 raise Exception("파일 URL이 제공되지 않았습니다. query의 [InputData]에 file/files를 포함해주세요.")
 
-            pdf_paths_for_workflow: List[str] = []
+            pdf_paths_for_workflow: List[str] = []  # 더 이상 사용하지 않음 (호환용 placeholder)
             input_file_names: List[str] = []
-            download_errors: List[str] = []
+            fetch_errors: List[str] = []
+            preloaded_documents: List[PdfDocument] = []
+            preloaded_sections: List[Section] = []
+            preloaded_chunks: List[ReferenceChunk] = []
+            total_reused_embeddings = 0
 
             for idx, file_info in enumerate(input_files, start=1):
                 file_url = (file_info.get("url") or "").strip()
                 display_name = (file_info.get("name") or f"document_{idx}").strip() or f"document_{idx}"
-                if not file_url:
+                file_path = (file_info.get("path") or "").strip().rstrip("?")
+                file_room_id = (file_info.get("room_id") or parsed_room_id or "").strip()
+                file_tenant_id = (file_info.get("tenant_id") or effective_tenant_id or "").strip()
+
+                if not file_url and not file_path and not display_name:
                     continue
 
                 await self._send_progress_event(
                     event_queue, context_id, task_id, job_id,
-                    f"[DOWNLOAD] 파일 다운로드 중 ({idx}/{len(input_files)}): {display_name}",
+                    f"[MEMENTO] 청크/임베딩 조회 중 ({idx}/{len(input_files)}): {display_name}",
                     "tool_usage_started", 8
                 )
 
-                temp_download_path: Optional[str] = None
-                temp_pdf_path: Optional[str] = None
                 try:
-                    # 파일 다운로드(헤더/URL/Content-Type 기반 파일명 추정 포함)
-                    temp_download_path, inferred_name, inferred_ct = await self._download_file(file_url, display_name)
-                    temp_paths_to_cleanup.add(temp_download_path)
-                    resolved_name = inferred_name or display_name
-
-                    # PDF 여부 판별(확장자보다 매직바이트 우선)
-                    is_pdf = False
-                    try:
-                        with open(temp_download_path, "rb") as _f:
-                            is_pdf = (_f.read(6) or b"").startswith(b"%PDF-")
-                    except Exception:
-                        is_pdf = False
-
-                    pdf_path_for_workflow = temp_download_path
-
-                    # PDF가 아니면 로컬에서 PDF로 변환
-                    if not is_pdf:
-                        await self._send_progress_event(
-                            event_queue, context_id, task_id, job_id,
-                            f"[CONVERT] PDF 변환 중 ({idx}/{len(input_files)}): {resolved_name}",
-                            "tool_usage_started", 9
+                    memento_chunks = await self._fetch_memento_chunks(
+                        tenant_id=file_tenant_id,
+                        file_path=file_path,
+                        file_name=display_name,
+                        room_id=file_room_id,
+                        include_embeddings=True,
+                    )
+                    if not memento_chunks:
+                        raise Exception(
+                            f"메멘토에 사전 처리된 청크가 없습니다 (tenant={file_tenant_id}, "
+                            f"file_path={file_path or 'N/A'}, file_name={display_name})"
                         )
 
-                        # 확장자가 ".pdf"인데 실제 PDF가 아닌 경우(잘못된 힌트/URL) → Content-Type/파일명으로 보정 후 변환
-                        try:
-                            src_p = Path(temp_download_path)
-                            name_ext = Path(resolved_name).suffix.lower()
-                            if src_p.suffix.lower() == ".pdf":
-                                fixed_ext = ""
-                                if name_ext and name_ext != ".pdf":
-                                    fixed_ext = name_ext
-                                else:
-                                    ct_map = {
-                                        "application/msword": ".doc",
-                                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-                                        "application/vnd.ms-excel": ".xls",
-                                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-                                        "application/vnd.ms-powerpoint": ".ppt",
-                                        "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
-                                        "text/plain": ".txt",
-                                        "text/csv": ".csv",
-                                        "text/html": ".html",
-                                        "application/rtf": ".rtf",
-                                        "application/vnd.oasis.opendocument.text": ".odt",
-                                        "application/vnd.oasis.opendocument.spreadsheet": ".ods",
-                                        "application/vnd.oasis.opendocument.presentation": ".odp",
-                                    }
-                                    fixed_ext = ct_map.get((inferred_ct or "").lower(), "")
-                                if fixed_ext and fixed_ext != ".pdf":
-                                    new_path = str(src_p.with_suffix(fixed_ext))
-                                    os.replace(temp_download_path, new_path)
-                                    temp_paths_to_cleanup.discard(temp_download_path)
-                                    temp_download_path = new_path
-                                    temp_paths_to_cleanup.add(temp_download_path)
-                                    resolved_name = str(Path(resolved_name).with_suffix(fixed_ext))
-                        except Exception:
-                            pass
+                    docs, secs, chs = self._build_state_from_memento_chunks(
+                        display_name=display_name,
+                        source=f"memento://{file_path or display_name}",
+                        memento_chunks=memento_chunks,
+                    )
+                    if not docs or not chs:
+                        raise Exception(
+                            f"메멘토 청크로부터 문서 상태를 구성하지 못했습니다: {display_name}"
+                        )
 
-                        try:
-                            from src.pdf2bpmn.converters.file_to_pdf import convert_to_pdf, FileToPdfError  # type: ignore
+                    reused = sum(1 for c in chs if isinstance(c.embedding, list) and len(c.embedding) > 0)
+                    total_reused_embeddings += reused
 
-                            converted_pdf = convert_to_pdf(
-                                str(temp_download_path),
-                                str(Path(str(temp_download_path)).parent),
-                            )
-                            pdf_path_for_workflow = converted_pdf
-                            temp_pdf_path = converted_pdf
-                            temp_paths_to_cleanup.add(temp_pdf_path)
-                            resolved_name = Path(converted_pdf).name
-                        except FileToPdfError as e:
-                            raise Exception(f"파일을 PDF로 변환하지 못했습니다: {e}")
-                    else:
-                        # PDF인데 확장자가 PDF가 아니면 표시용 이름만 보정
-                        if not str(resolved_name).lower().endswith(".pdf"):
-                            resolved_name = str(Path(resolved_name).with_suffix(".pdf"))
+                    preloaded_documents.extend(docs)
+                    preloaded_sections.extend(secs)
+                    preloaded_chunks.extend(chs)
+                    input_file_names.append(display_name)
 
-                    pdf_paths_for_workflow.append(str(pdf_path_for_workflow))
-                    input_file_names.append(resolved_name)
+                    await self._send_progress_event(
+                        event_queue, context_id, task_id, job_id,
+                        f"[MEMENTO] 재사용 완료 ({idx}/{len(input_files)}): {display_name} "
+                        f"(chunks={len(chs)}, embeddings={reused}/{len(chs)})",
+                        "tool_usage_started", 10
+                    )
                 except Exception as e:
-                    download_errors.append(f"{display_name}: {e}")
-                    logger.warning(f"[WARN] 파일 처리 실패({idx}/{len(input_files)}): {display_name} - {e}")
+                    fetch_errors.append(f"{display_name}: {e}")
+                    logger.warning(
+                        f"[WARN] 메멘토 청크 로드 실패({idx}/{len(input_files)}): {display_name} - {e}"
+                    )
 
-            if not pdf_paths_for_workflow:
+            if not preloaded_chunks:
                 raise Exception(
-                    "업로드된 파일을 처리하지 못했습니다: "
-                    + ("; ".join(download_errors) if download_errors else "유효한 파일이 없습니다.")
+                    "메멘토에서 사전 처리된 청크를 가져오지 못했습니다: "
+                    + ("; ".join(fetch_errors) if fetch_errors else "유효한 파일이 없습니다.")
                 )
 
             pdf_name = input_file_names[0] if input_file_names else (pdf_name or "document.pdf")
+            logger.info(
+                "[MEMENTO] preload summary: files=%d sections=%d chunks=%d reused_embeddings=%d",
+                len(preloaded_documents), len(preloaded_sections),
+                len(preloaded_chunks), total_reused_embeddings,
+            )
 
             # =================================================================
             # 5. 선행 정리: 기존 프로세스 핵심 라벨만 삭제 (교차 실행 데이터 혼합 방지)
@@ -6448,10 +6507,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             )
 
             try:
-                from src.pdf2bpmn.graph.neo4j_client import Neo4jClient  # type: ignore
-
                 def _clear_process_core_labels_sync() -> Dict[str, Any]:
-                    client = Neo4jClient()
+                    client = Neo4jClient(graph_name=age_graph_name)
                     try:
                         return client.clear_process_core_labels()
                     finally:
@@ -6532,12 +6589,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     # Extremely defensive fallback: if loop is unavailable, try direct enqueue
                     event_queue.enqueue_event(evt)
 
-            workflow = PDF2BPMNWorkflow()
+            workflow = PDF2BPMNWorkflow(graph_name=age_graph_name)
             state: Dict[str, Any] = {
-                "pdf_paths": [str(p) for p in pdf_paths_for_workflow],
-                "documents": [],
-                "sections": [],
-                "reference_chunks": [],
+                # pdf_paths 는 메멘토 재사용 흐름에서는 사용하지 않지만, 워크플로우 state 스키마 호환을 위해 빈 리스트로 둔다.
+                "pdf_paths": [],
+                "documents": list(preloaded_documents),
+                "sections": list(preloaded_sections),
+                "reference_chunks": list(preloaded_chunks),
                 "processes": [],
                 "tasks": [],
                 "roles": [],
@@ -6563,9 +6621,15 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 if self.is_cancelled:
                     raise Exception("작업이 취소되었습니다.")
 
-                # Step 1: ingest_pdf
-                _enqueue_progress("[STEP] PDF 파싱 중...", 20)
-                state.update(await asyncio.to_thread(workflow.ingest_pdf, state))
+                # Step 1: ingest_pdf 는 더 이상 호출하지 않는다.
+                # - 메멘토에서 받아온 청크/임베딩으로 이미 documents/sections/reference_chunks 를 채웠으므로
+                #   재파싱 없이 Neo4j에만 문서/섹션 노드를 등록한다.
+                if preloaded_documents:
+                    _enqueue_progress("[STEP] 메멘토 청크 기반 문서/섹션 그래프 등록 중...", 20)
+                    for doc in preloaded_documents:
+                        workflow.neo4j.create_document(doc)
+                    for sec in preloaded_sections:
+                        workflow.neo4j.create_section(sec)
                 page_count = 0
                 try:
                     docs = state.get("documents") or []
@@ -6574,9 +6638,11 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 except Exception:
                     page_count = 0
                 chunk_count = len(state.get("reference_chunks") or [])
+                parsed_file_count = len(preloaded_documents)
                 _enqueue_progress(
-                    f"[STEP] 문서 파싱 완료: 파일 {len(pdf_paths_for_workflow)}개, "
-                    f"총 {page_count}페이지, {chunk_count}개 청크",
+                    f"[STEP] 메멘토 재사용 완료: 파일 {parsed_file_count}개, "
+                    f"총 {page_count}페이지, {chunk_count}개 청크 "
+                    f"(재사용 임베딩 {total_reused_embeddings}/{chunk_count})",
                     28
                 )
 
@@ -6621,16 +6687,11 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 if self.is_cancelled:
                     raise Exception("작업이 취소되었습니다.")
 
-                # Step 5: generate_skills (temporary skip supported)
-                if self._enable_skill_generation:
-                    _enqueue_progress("[STEP] Agent Skill 문서 생성 중...", 74)
-                    state.update(await asyncio.to_thread(workflow.generate_skills, state))
-                    _enqueue_progress("[STEP] Agent Skill 문서 생성 완료", 80)
-                else:
-                    # Keep workflow moving while bypassing skill generation/upload paths.
-                    state["skills"] = []
-                    state["skill_docs"] = {}
-                    _enqueue_progress("[STEP] Agent Skill 문서 생성 스킵", 80)
+                # Step 5: ontology skill generation is disabled by policy.
+                # Skill creation now happens from runtime task instructions per process definition.
+                state["skills"] = []
+                state["skill_docs"] = {}
+                _enqueue_progress("[STEP] 온톨로지 스킬 생성 스킵(지침 기반 후처리 사용)", 80)
 
                 if self.is_cancelled:
                     raise Exception("작업이 취소되었습니다.")
@@ -6690,9 +6751,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 logger.info(f"[INFO] 이번 작업 기준 추출 프로세스: {len(job_process_ids)}개")
 
                 # Re-open Neo4j client for detail queries (workflow.neo4j was closed)
-                from src.pdf2bpmn.graph.neo4j_client import Neo4jClient  # type: ignore
-
-                neo4j = Neo4jClient()
+                neo4j = Neo4jClient(graph_name=age_graph_name)
                 try:
                     for proc_id in job_process_ids:
                         try:
@@ -6871,6 +6930,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 integrated_graph = {
                     "run_id": request_graph_run_id,
                     "task_id": str(task_id or ""),
+                    "graph_name": age_graph_name,
                     "process_ids": list(extracted_by_proc_id.keys()),
                     "elements": integrated_elements,
                     "counts": {
@@ -6880,10 +6940,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
 
-                from src.pdf2bpmn.graph.neo4j_client import Neo4jClient  # type: ignore
-
                 def _save_graph_snapshots_sync():
-                    client = Neo4jClient()
+                    client = Neo4jClient(graph_name=age_graph_name)
                     try:
                         return client.save_request_graph_snapshots(
                             run_id=request_graph_run_id,
@@ -6891,7 +6949,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                             process_graphs=process_graphs,
                             metadata={
                                 "task_id": str(task_id or ""),
-                                "tenant_id": str(tenant_id or ""),
+                                "tenant_id": str(effective_tenant_id or ""),
+                                "graph_name": age_graph_name,
                                 "process_count": len(process_graphs),
                             },
                         )
@@ -6920,24 +6979,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             }
             uploaded_skill_names: List[str] = []
 
-            # 온톨로지에서 추출/생성된 스킬 메타(에이전트와 독립 생성)
+            # 프로세스 후처리(지침 기반)에서 생성된 스킬 메타 누적
             generated_skill_metas: List[Dict[str, Any]] = []
-            for s in (state.get("skills") or []):
-                try:
-                    name = str(getattr(s, "name", "") or "").strip()
-                    if not name:
-                        continue
-                    generated_skill_metas.append(
-                        {
-                            "name": name,
-                            "safe_name": self._normalize_skill_key(name),
-                            "summary": str(getattr(s, "summary", "") or ""),
-                            "purpose": str(getattr(s, "purpose", "") or ""),
-                            "procedure_text": " ".join(getattr(s, "procedure", []) or []),
-                        }
-                    )
-                except Exception:
-                    continue
 
             def _sync_agent_graph_for_process_sync(
                 neo4j_proc_id: str,
@@ -6947,14 +6990,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 """Runtime assignment 결과를 Neo4j 그래프(Agent 노드/엣지)에 반영."""
                 if not neo4j_proc_id:
                     return
-                from src.pdf2bpmn.graph.neo4j_client import Neo4jClient  # type: ignore
-
                 users_by_id = {
                     str(u.get("id")): u
                     for u in (self._users or [])
                     if isinstance(u, dict) and u.get("id")
                 }
-                neo4j = Neo4jClient()
+                neo4j = Neo4jClient(graph_name=age_graph_name)
                 try:
                     # 1) Agent node + Role -> Agent
                     for role_name, agent_id in role_agent_pairs:
@@ -7025,14 +7066,20 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     process_name=process_name,
                 )
 
-                # NEW: proc_def.definition에 "추출에 사용된 Neo4j proc_id"를 저장
+                # NEW: proc_def.definition에 "추출에 사용된 Neo4j proc_id/그래프"를 저장
                 # - 프론트에서 실제 Neo4j 그래프(노드/관계)를 조회할 때 사용
+                # - tenant_id/todo_id 도 함께 저장하여 프론트가 그래프 식별자를
+                #   재구성할 수 있도록 한다 (graph_name 도 동일 값을 가짐)
                 try:
                     ex = proc_json.get("extraction")
                     if not isinstance(ex, dict):
                         ex = {}
                     ex["source"] = "pdf2bpmn"
                     ex["neo4j_proc_id"] = str(proc_id)
+                    ex["neo4j_graph_name"] = age_graph_name
+                    ex["tenant_id"] = str(effective_tenant_id or "")
+                    ex["todo_id"] = str(task_id or "")
+                    ex["task_id"] = str(task_id or "")
                     ex["graph_run_id"] = request_graph_run_id
                     ex["graph_snapshot_ref"] = {
                         "run_id": request_graph_run_id,
@@ -7042,6 +7089,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     ex["integrated_graph_ref"] = {
                         "run_id": request_graph_run_id,
                         "snapshot_type": "integrated",
+                        "tenant_id": str(effective_tenant_id or ""),
+                        "task_id": str(task_id or ""),
                     }
                     # 가벼운 임베드(디버깅/복구용): 실제 조회는 GraphSnapshot API 권장
                     if isinstance(pinfo.get("graph_elements"), dict):
@@ -7060,7 +7109,21 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     proc_def_id = str(uuid.uuid4())
                     proc_json["processDefinitionId"] = proc_def_id
 
-                # NOTE: 담당자/에이전트 매핑은 forms + 참조정보(inputData) 확장 이후 마지막 단계에서 수행됨.
+                # NEW: task instruction 기반 스킬 추출 + LLM enrichment + task 스킬 할당
+                process_skill_metas = await self._postprocess_skills_and_tasks(
+                    proc_json=proc_json,
+                    process_name=process_name,
+                )
+                if process_skill_metas:
+                    generated_skill_metas.extend(process_skill_metas)
+
+                # NEW: lane(role)-skill 집계 기반 에이전트 생성/재사용 + 활동 배정
+                await self._apply_assignment_and_maybe_create_agents(
+                    proc_json=proc_json,
+                    tenant_id=tenant_id,
+                    process_name=process_name,
+                    extracted=extracted_payload,
+                )
                 
                 # DB에 저장
                 proc_def_data = {
@@ -7171,6 +7234,18 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 # 스킬 매핑용: activity에 매핑된 agent user_id 수집(best-effort)
                 try:
                     acts = proc_json.get("activities") or []
+                    proc_skill_name_by_key = {
+                        str(s.get("id") or "").strip(): str(s.get("name") or "").strip()
+                        for s in (proc_json.get("skills") or [])
+                        if isinstance(s, dict)
+                    }
+                    for s in (proc_json.get("skills") or []):
+                        if not isinstance(s, dict):
+                            continue
+                        safe_name = str(s.get("safe_name") or "").strip()
+                        name = str(s.get("name") or "").strip()
+                        if safe_name and name and safe_name not in proc_skill_name_by_key:
+                            proc_skill_name_by_key[safe_name] = name
                     process_role_agent_pairs: List[tuple[str, str]] = []
                     process_agent_skill_names: Dict[str, Set[str]] = {}
                     process_agent_activity_texts: Dict[str, List[str]] = {}
@@ -7198,20 +7273,19 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                                             )
                                         )
                                     )
-                                    # 생성된 스킬 중에서 activity와 연관성이 높은 것만 에이전트에 할당 후보로 누적
-                                    if generated_skill_metas:
-                                        ranked: List[tuple[float, str]] = []
-                                        for sm in generated_skill_metas:
-                                            score = self._match_skill_score_for_activity(a, sm)
-                                            if score >= 0.35:
-                                                skill_name = str(sm.get("name") or "").strip()
-                                                if skill_name:
-                                                    ranked.append((score, skill_name))
-                                        if ranked:
-                                            ranked.sort(key=lambda x: x[0], reverse=True)
-                                            top_skill_names = [n for _, n in ranked[:5]]
-                                            agent_skill_names_for_sync.setdefault(aid, set()).update(top_skill_names)
-                                            process_agent_skill_names.setdefault(aid, set()).update(top_skill_names)
+                                    # task->skill 기준으로 에이전트 스킬 동기화 후보 누적
+                                    task_skill_ids = [
+                                        str(x).strip()
+                                        for x in (a.get("skills") or [])
+                                        if str(x).strip()
+                                    ]
+                                    task_skill_names = [
+                                        proc_skill_name_by_key.get(sid) or sid
+                                        for sid in task_skill_ids
+                                    ]
+                                    if task_skill_names:
+                                        agent_skill_names_for_sync.setdefault(aid, set()).update(task_skill_names)
+                                        process_agent_skill_names.setdefault(aid, set()).update(task_skill_names)
 
                     # 에이전트 프로필(역할/goal/persona/tools) 기반으로 스킬 매칭 보강
                     users_by_id = {
@@ -7272,6 +7346,36 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # - 워크플로우에서 만든 skill_docs(markdown)를 제품이 쓰는 스킬 저장소로 등록
             try:
                 skill_docs: Dict[str, str] = state.get("skill_docs") or {}
+                if (not isinstance(skill_docs, dict) or not skill_docs) and generated_skill_metas:
+                    # LLM 으로 enrich 된 스킬 카드를 풍부한 SKILL.md 로 직렬화해 업로드 대상 구성.
+                    # (개요/사용 시점/입력/산출물/절차/예시/주의사항/출처 섹션 포함)
+                    skill_docs = {}
+                    for sm in generated_skill_metas:
+                        if not isinstance(sm, dict):
+                            continue
+                        sname = str(sm.get("name") or "").strip()
+                        if not sname:
+                            continue
+                        key = self._normalize_skill_key(sname)
+                        try:
+                            md = render_skill_markdown(sm)
+                        except Exception as e:
+                            logger.warning(
+                                "[SKILL] render_skill_markdown failed for %r: %s → minimal fallback",
+                                sname, e,
+                            )
+                            summary = str(sm.get("summary") or "").strip()
+                            procedure_text = str(sm.get("procedure_text") or "").strip()
+                            source_ids = sm.get("source_activity_ids") or []
+                            src_line = ", ".join(str(x) for x in source_ids if str(x).strip())
+                            md = (
+                                f"---\nname: {sname}\n---\n\n"
+                                f"# {sname}\n\n"
+                                f"## 개요\n{summary or '반복 지침 기반 공통 스킬'}\n\n"
+                                f"## 절차\n{procedure_text or summary or sname}\n\n"
+                                f"## 출처\n{src_line or '-'}\n"
+                            )
+                        skill_docs[key] = md
                 if isinstance(skill_docs, dict) and skill_docs:
                     await self._send_progress_event(
                         event_queue, context_id, task_id, job_id,

@@ -6,9 +6,9 @@
 echo "🚀 Starting PDF2BPMN Development Environment"
 echo "=============================================="
 
-# Check if Neo4j is running
-echo "📊 Checking Neo4j connection..."
-python -c "from src.pdf2bpmn.graph.neo4j_client import Neo4jClient; c = Neo4jClient(); print('✅ Neo4j OK' if c.verify_connection() else '❌ Neo4j not running'); c.close()" 2>/dev/null || echo "❌ Neo4j check failed"
+# Check if Apache AGE is running
+echo "📊 Checking Apache AGE connection..."
+python -c "from src.pdf2bpmn.graph.neo4j_client import Neo4jClient; c = Neo4jClient(); print('✅ Apache AGE OK' if c.verify_connection() else '❌ Apache AGE not running'); c.close()" 2>/dev/null || echo "❌ Apache AGE check failed"
 
 # Start backend API server
 echo ""

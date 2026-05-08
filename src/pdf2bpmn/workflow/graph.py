@@ -18,13 +18,65 @@ from ..generators.skill_generator import SkillGenerator
 from ..config import Config
 
 
+# ---------------------------------------------------------------------------
+# Role / Task 정규화용 휴리스틱 사전
+# ---------------------------------------------------------------------------
+# - 의미상 동일하지만 표현만 다른 Role / Task 가 별개로 추출되는 문제를 줄이기
+#   위한 deterministic 한 규칙 기반 정규화.
+# - LLM 임계값을 낮추면 잘못된 병합이 늘어나기 때문에, 문서 도메인을 가리지
+#   않는 일반적인 한국어 절차서 어휘 위주로 매핑한다.
+# ---------------------------------------------------------------------------
+
+# Role 이름 정규화 시 제거할 노이즈 패턴 (괄호/구분기호 등).
+# 직급 접미사는 의도적으로 보존하여 "기획처장" / "기획본부장" 등 직급이 다른
+# 역할은 분리된 채로 두고, 책임 task signature 가 거의 동일한 경우에만 합친다.
+# (사용자 피드백: "직급은 너무 다양하니까 추출된 대로 사용하자")
+_ROLE_NOISE_PATTERNS: tuple[str, ...] = (
+    r"\([^)]*\)",       # ()
+    r"\[[^\]]*\]",      # []
+    r"<[^>]*>",         # <>
+    r"[·,/]",           # 구분 기호
+)
+
+# Task 동사 동의어 클래스: 같은 "행위 유형"으로 묶기 위한 사전
+_TASK_VERB_SYNONYMS: dict[str, set[str]] = {
+    "share":     {"제공", "제출", "송부", "배부", "발송", "통보", "전달", "안내", "회람", "공유"},
+    "review":    {"검토", "심사", "심의", "검증", "확인", "점검", "확정"},
+    "draft":     {"작성", "기안", "등록", "입력", "수정", "보완"},
+    "approve":   {"승인", "결재", "결정", "의결", "표결", "재가"},
+    "open":      {"개최", "진행", "주관", "운영", "실시"},
+    "attend":    {"참석", "출석", "참여", "참가"},
+    "explain":   {"설명", "발표", "보고", "진술", "공시"},
+    "select":    {"선정", "지명", "위촉", "임명", "구성", "선임"},
+    "release":   {"해촉", "해임", "면직", "제외", "철회", "해지"},
+    "request":   {"요청", "신청", "의뢰", "요구", "건의"},
+    "receive":   {"접수", "수령", "수신", "수집"},
+    "pay":       {"지급", "정산", "환급", "납부", "결제"},
+    "publish":   {"공고", "공시", "게시"},
+    "register":  {"등록", "기록", "기재", "보관"},
+    "preserve":  {"보관", "보존", "관리"},
+}
+
+# 위 동사 사전을 평탄화 (set-of-strings)
+_TASK_ALL_VERB_TOKENS: set[str] = {v for vs in _TASK_VERB_SYNONYMS.values() for v in vs}
+
+# Task 핵심 명사 추출 시 제거할 stop tokens (의미 약한 일반 어휘)
+_TASK_NOUN_STOP_TOKENS: set[str] = {
+    "및", "의", "을", "를", "이", "가", "에", "로", "으로", "와", "과",
+    "에서", "부터", "까지", "또는", "혹은", "or", "and",
+    "추가", "사전", "사후", "결과", "관련", "대상", "기타", "이상", "이하",
+    "최종", "최초", "초안", "안", "여부", "수정", "변경", "내용", "사항",
+    "단계", "절차", "건", "회", "차", "상정", "협조",
+}
+
+
 class PDF2BPMNWorkflow:
     """Orchestrates the PDF to BPMN conversion workflow."""
     
-    def __init__(self):
+    def __init__(self, graph_name: str | None = None):
         self.pdf_extractor = PDFExtractor()
         self.entity_extractor = EntityExtractor()
-        self.neo4j = Neo4jClient()
+        self.neo4j = Neo4jClient(graph_name=graph_name)
         self.vector_search = VectorSearch(self.neo4j)
         self.bpmn_generator = BPMNGenerator()
         self.dmn_generator = DMNGenerator()
@@ -422,15 +474,29 @@ class PDF2BPMNWorkflow:
         
         # 4. task_process_map도 업데이트
         self._update_task_process_map(process_id_mapping)
-        
-        # 5. 유사한 태스크 병합 (같은 역할의 연속 업무)
+
+        # 5. 유사한 태스크 먼저 병합 (의미적 중복 제거)
+        # - 동사 동의어 클래스 + 핵심 명사 overlap 기반 의미 비교
+        # - role 경계 안/밖 모두에서 정규화
         tasks, task_id_mapping = self._merge_similar_tasks(tasks)
         print(f"   Tasks after merge: {len(tasks)}")
-        
+
+        # 5.5 ROLE 정규화 (직급은 보존, 이름 + 책임 task signature 기반)
+        # - 직급 접미사를 인위로 제거하지 않음 ("기획처장" / "기획본부장" 은 분리 유지)
+        # - 정규화된 task signature 가 거의 동일한 role 들만 같은 역할로 흡수
+        # - task_role_map / role_decision_map / role_skill_map 도 동시에 갱신
+        roles_before = len(roles)
+        roles, role_id_remap = self._normalize_roles_by_responsibility(roles)
+        if role_id_remap:
+            print(
+                f"   🔀 Role normalize (by responsibility): {roles_before} → {len(roles)} "
+                f"(remapped {len(role_id_remap)} ids)"
+            )
+
         # Deduplicate tasks
         unique_tasks = self._deduplicate_entities(tasks, "Task")
-        
-        # Deduplicate roles
+
+        # Deduplicate roles (이름 정확 일치 - 이미 위에서 의미 클러스터링 완료)
         unique_roles = self._deduplicate_entities(roles, "Role")
         
         # Deduplicate decisions
@@ -442,6 +508,24 @@ class PDF2BPMNWorkflow:
         print(f"   Roles: {len(roles)} → {len(unique_roles)}")
         print(f"   Decisions: {len(decisions)} → {len(unique_decisions)}")
         print(f"   Skills: {len(skills)} → {len(unique_skills)}")
+
+        # task 0 role 통계 출력 (위원 후보 풀 / 자문 풀 같은 비활성 role 식별).
+        # task 가 1개도 할당되지 않은 role 은 BPMN 의 lane 으로 사용해도 빈 swimlane 만
+        # 만들기 때문에, 시각화/BPMN 생성 단계에서 별도 처리 후보가 된다.
+        role_task_counts: dict[str, int] = {}
+        for rid in self.task_role_map.values():
+            if rid:
+                role_task_counts[rid] = role_task_counts.get(rid, 0) + 1
+        idle_roles = [
+            r for r in unique_roles
+            if role_task_counts.get(getattr(r, "role_id", ""), 0) == 0
+        ]
+        if idle_roles:
+            idle_names = [getattr(r, "name", "") for r in idle_roles]
+            print(
+                f"   ⚠️ Task 0 role {len(idle_roles)}/{len(unique_roles)}개 (위원 후보/자문 풀 가능성): "
+                f"{idle_names}"
+            )
         
         # Store in Neo4j
         for proc in unique_processes:
@@ -594,13 +678,7 @@ class PDF2BPMNWorkflow:
         for task in tasks:
             if not task.process_id:
                 task.process_id = default_process_id
-                self.neo4j.link_task_to_role  # Link via HAS_TASK
-                with self.neo4j.session() as session:
-                    session.run("""
-                        MATCH (p:Process {proc_id: $proc_id})
-                        MATCH (t:Task {task_id: $task_id})
-                        MERGE (p)-[:HAS_TASK]->(t)
-                    """, {"proc_id": default_process_id, "task_id": task.task_id})
+                self.neo4j.link_task_to_process(task.task_id, default_process_id)
     
     def _normalize_process_text(self, value: str) -> str:
         """Normalize text for process similarity scoring."""
@@ -1057,24 +1135,38 @@ class PDF2BPMNWorkflow:
         merged_tasks = []
         
         for proc_id, proc_tasks in tasks_by_process.items():
-            # 역할별로 그룹화
+            # 1차: 같은 role 안에서 인접 task 병합 (보수적, 기존 로직 유지)
             tasks_by_role = {}
             for task in proc_tasks:
                 role_id = self.task_role_map.get(task.task_id, "no_role")
                 if role_id not in tasks_by_role:
                     tasks_by_role[role_id] = []
                 tasks_by_role[role_id].append(task)
-            
+
+            intermediate: list = []
             for role_id, role_tasks in tasks_by_role.items():
-                # 같은 역할의 태스크들 중 유사한 것들 병합
                 merged_role_tasks = self._merge_tasks_by_similarity(role_tasks, task_id_mapping)
-                merged_tasks.extend(merged_role_tasks)
-        
+                intermediate.extend(merged_role_tasks)
+
+            # 2차: process 단위 cross-role 의미 병합 (verb class + 핵심 명사 일치)
+            #  - "투심위 참석 (추가설명 및 의견진술)" / "투심위 참석 및 사업설명 및 의견진술"
+            #    같이 role 이 약간 다르거나 표현만 다른 동일 활동을 흡수.
+            after_cross = self._merge_tasks_cross_role(intermediate, task_id_mapping)
+
+            # 3차: 임베딩 cosine + 휴리스틱 교차검증 의미 병합
+            #  - 휴리스틱(verb 사전)에 없는 도메인 동사로 표현된 동일 활동을 잡는다.
+            #  - cosine ≥ 임계 AND verb_class 교집합(둘 다 명확할 때)을 모두 충족할 때만 merge.
+            #  - cross-process 비교는 하지 않음 (false positive 방지).
+            if Config.ENABLE_SEMANTIC_DEDUP and len(after_cross) >= 2:
+                after_cross = self._merge_tasks_by_embedding(after_cross, task_id_mapping)
+
+            merged_tasks.extend(after_cross)
+
         # task_role_map 업데이트
         for old_id, new_id in task_id_mapping.items():
             if old_id in self.task_role_map and old_id != new_id:
                 self.task_role_map[new_id] = self.task_role_map[old_id]
-        
+
         return merged_tasks, task_id_mapping
     
     def _merge_tasks_by_similarity(self, tasks: list, task_id_mapping: dict) -> list:
@@ -1082,26 +1174,19 @@ class PDF2BPMNWorkflow:
         if len(tasks) <= 1:
             return tasks
 
-        strong_verbs = [
-            "접수", "검토", "승인", "반려", "작성", "제출", "통보", "발송", "지급", "정산",
-            "심사", "개최", "참석", "배부", "확정", "확인", "등록", "처리",
-        ]
-
-        def _action_markers(name: str) -> set[str]:
-            s = str(name or "").strip()
-            return {v for v in strong_verbs if v in s}
-
         def _should_merge_task_pair(left, right) -> tuple[bool, str]:
             left_name = str(left.name or "").strip().lower()
             right_name = str(right.name or "").strip().lower()
             order_gap = abs(int(getattr(left, "order", 0) or 0) - int(getattr(right, "order", 0) or 0))
-            left_actions = _action_markers(left_name)
-            right_actions = _action_markers(right_name)
-            shared_actions = left_actions & right_actions
 
-            # Different core action words usually mean different tasks.
-            if left_actions and right_actions and not shared_actions:
-                return False, "different_core_action"
+            # 동사 동의어 클래스 비교 (예: 제공/제출 → "share")
+            left_classes = self._task_verb_class(left_name)
+            right_classes = self._task_verb_class(right_name)
+            shared_classes = left_classes & right_classes
+
+            # 둘 다 명확한 동사 클래스가 있는데 겹치지 않으면 다른 활동
+            if left_classes and right_classes and not shared_classes:
+                return False, "different_verb_class"
 
             if left_name == right_name:
                 return True, "same_name"
@@ -1109,12 +1194,23 @@ class PDF2BPMNWorkflow:
             if left_name in right_name or right_name in left_name:
                 return True, "name_contains_other"
 
-            if self._have_same_core_words(left_name, right_name) and order_gap <= 2:
+            if self._have_same_core_words(left_name, right_name) and order_gap <= 3:
                 return True, "same_core_words_nearby"
 
             similarity = self._calc_name_similarity(left_name, right_name)
-            if order_gap <= 1 and similarity > 0.72:
+            if order_gap <= 2 and similarity > 0.65:
                 return True, "high_name_similarity_adjacent"
+
+            # verb class 가 겹치고 핵심 명사도 충분히 겹치면 거리 무관 병합
+            # (한쪽 명사가 1개뿐이면 단어 하나로 묶이는 사고 방지 → 거부)
+            if shared_classes:
+                left_nouns = self._task_core_nouns(left_name)
+                right_nouns = self._task_core_nouns(right_name)
+                if left_nouns and right_nouns:
+                    overlap = left_nouns & right_nouns
+                    min_size = min(len(left_nouns), len(right_nouns))
+                    if min_size >= 2 and overlap and len(overlap) >= max(2, min_size // 2):
+                        return True, "shared_verb_class_and_core_nouns"
 
             return False, "below_task_merge_rules"
         
@@ -1186,6 +1282,544 @@ class PDF2BPMNWorkflow:
         
         return merged
     
+    def _task_verb_class(self, name: str) -> set[str]:
+        """Task 이름에 나타나는 동사를 동의어 클래스 집합으로 매핑."""
+        if not name:
+            return set()
+        s = str(name)
+        classes: set[str] = set()
+        for cls, verbs in _TASK_VERB_SYNONYMS.items():
+            for v in verbs:
+                if v in s:
+                    classes.add(cls)
+                    break
+        return classes
+
+    def _task_core_nouns(self, name: str) -> set[str]:
+        """Task 이름에서 동사/조사/일반 stopword 를 제거한 핵심 명사 토큰."""
+        if not name:
+            return set()
+        cleaned = re.sub(r"[^0-9a-zA-Z가-힣\s]", " ", str(name))
+        # 괄호 안 부연(예: "(추가설명 및 의견진술)") 도 제거
+        cleaned = re.sub(r"\([^)]*\)", " ", cleaned)
+        tokens = {tok for tok in cleaned.split() if len(tok) >= 2}
+        # 동사 토큰 제거
+        tokens = {tok for tok in tokens if tok not in _TASK_ALL_VERB_TOKENS}
+        # 일반 stopword 제거
+        tokens = {tok for tok in tokens if tok not in _TASK_NOUN_STOP_TOKENS}
+        return tokens
+
+    def _are_same_task_semantic(self, a, b) -> bool:
+        """role 경계 너머에서도 의미상 동일한 task 인지 보수적으로 판정.
+
+        chain 폭주(예: '자료' 한 단어로 'investo심위 ...' task 들이 한 그룹으로 묶이는 사고) 방지 위해:
+          - verb class 는 양쪽 다 존재하고 교집합이 있어야 함 (한쪽만 있을 때는 매칭 안 함)
+          - 핵심 명사 overlap 임계: min_size 별로 단계적 강화
+              · min_size == 1: 거부 (단어 하나만으로 묶이지 않음)
+              · min_size == 2: overlap == 2 (양쪽 명사 셋이 완전 일치해야 함)
+              · min_size 3~4: overlap >= 2
+              · min_size >= 5: overlap >= 3
+          - substring 매칭은 6글자 이상에서만 허용 (짧은 공통 단어로 묶이는 것 방지)
+        """
+        an = str(getattr(a, "name", "") or "")
+        bn = str(getattr(b, "name", "") or "")
+        al, bl = an.lower().strip(), bn.lower().strip()
+        if not al or not bl:
+            return False
+        if al == bl:
+            return True
+        # substring 매칭: 충분히 긴 경우만
+        if len(al) >= 6 and al in bl:
+            return True
+        if len(bl) >= 6 and bl in al:
+            return True
+
+        a_verbs = self._task_verb_class(an)
+        b_verbs = self._task_verb_class(bn)
+
+        # verb class 가 한쪽만 있으면 의미 비교가 어려우므로 매칭하지 않음
+        # (한쪽이 verb 없는 짧은 phrase 인 경우 anchor 로 잘못 묶이는 사고 방지)
+        if not (a_verbs and b_verbs):
+            return False
+        # verb class 교집합 필수
+        if not (a_verbs & b_verbs):
+            return False
+
+        a_nouns = self._task_core_nouns(an)
+        b_nouns = self._task_core_nouns(bn)
+        if not a_nouns or not b_nouns:
+            return False
+        overlap = a_nouns & b_nouns
+        if not overlap:
+            return False
+        min_size = min(len(a_nouns), len(b_nouns))
+
+        # 단계적 임계
+        if min_size <= 1:
+            # 한쪽 명사가 1개뿐이면 anchor 가 너무 약함 → 거부
+            return False
+        if min_size == 2:
+            # 양쪽 다 작은 명사 셋 → 완전 일치 요구
+            return len(overlap) == 2
+        if min_size <= 4:
+            return len(overlap) >= 2
+        # min_size >= 5
+        return len(overlap) >= 3
+
+    def _merge_tasks_cross_role(self, tasks: list, task_id_mapping: dict) -> list:
+        """role 경계 너머에서 의미상 동일한 task 를 한 번 더 묶는다."""
+        if len(tasks) <= 1:
+            return tasks
+
+        sorted_tasks = sorted(tasks, key=lambda t: getattr(t, "order", 0) or 0)
+        skip: set[int] = set()
+        result: list = []
+
+        for i, t in enumerate(sorted_tasks):
+            if i in skip:
+                continue
+            cluster = [t]
+            for j in range(i + 1, len(sorted_tasks)):
+                if j in skip:
+                    continue
+                other = sorted_tasks[j]
+                if self._are_same_task_semantic(t, other):
+                    cluster.append(other)
+                    skip.add(j)
+
+            if len(cluster) > 1:
+                # 대표: 가장 긴 이름 (정보량 많음). 동률이면 가장 처음.
+                rep = max(cluster, key=lambda x: (len(getattr(x, "name", "") or ""),))
+                # description 통합
+                descs = [getattr(x, "description", "") for x in cluster if getattr(x, "description", "")]
+                if descs:
+                    rep.description = " | ".join(dict.fromkeys(descs))
+                # instruction 통합 (라인 단위 dedup)
+                instrs = [getattr(x, "instruction", "") for x in cluster if getattr(x, "instruction", "")]
+                if instrs:
+                    seen_lines: set[str] = set()
+                    merged_lines: list[str] = []
+                    for src in instrs:
+                        for ln in (src or "").splitlines():
+                            s = ln.strip()
+                            if s and s not in seen_lines:
+                                seen_lines.add(s)
+                                merged_lines.append(s)
+                    rep.instruction = "\n".join(merged_lines).strip()
+                # ID 매핑 (기존 매핑도 transitively 갱신)
+                rep_id = rep.task_id
+                for x in cluster:
+                    if x.task_id != rep_id:
+                        task_id_mapping[x.task_id] = rep_id
+                # 기존 매핑 중 새로 흡수된 ID 를 가리키던 것도 rep 으로 재가리킴
+                for old_id, new_id in list(task_id_mapping.items()):
+                    if new_id in {x.task_id for x in cluster if x.task_id != rep_id}:
+                        task_id_mapping[old_id] = rep_id
+                print(
+                    f"   🔀 cross-role 병합: "
+                    f"{[getattr(x, 'name', '') for x in cluster]} → {getattr(rep, 'name', '')}"
+                )
+                result.append(rep)
+            else:
+                result.append(t)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # 임베딩 기반 의미 병합 (휴리스틱 한계 보완)
+    # ------------------------------------------------------------------
+    def _build_task_embed_text(self, task) -> str:
+        """task 임베딩 입력 텍스트. name + instruction 의 첫 라인 일부를 결합해
+        의미 신호를 강화한다. (단순 name 만으로는 짧은 한국어 task 의 cosine 가
+        도메인 어휘에 의해 흔들릴 수 있음)
+        """
+        name = (getattr(task, "name", "") or "").strip()
+        instr = (getattr(task, "instruction", "") or "").strip()
+        # instruction 첫 1~2 라인만 (라벨 노이즈 줄이기 위해 간단 절단)
+        snippet = ""
+        if instr:
+            for ln in instr.splitlines():
+                s = ln.strip()
+                if not s:
+                    continue
+                snippet = (snippet + " " + s).strip() if snippet else s
+                if len(snippet) >= 200:
+                    break
+        if snippet:
+            return f"{name}. {snippet[:240]}"
+        return name
+
+    def _merge_tasks_by_embedding(self, tasks: list, task_id_mapping: dict) -> list:
+        """임베딩 cosine + 휴리스틱 교차검증으로 의미적 동일 task 병합.
+
+        한국어 도메인 어휘 (예: "실무위원회 X" / "실무위원회 Y") 끼리는 cosine 만으로
+        false positive 가 쉽게 나기 때문에, 두 단계 임계 정책을 사용한다:
+
+          A) 강한 휴리스틱 confirm + 약한 cosine 임계 (TASK_SEMANTIC_COSINE_MIN, 기본 0.85)
+             강한 휴리스틱 = (한쪽이 다른쪽 substring 6글자+ 포함)
+                          OR (verb class 양쪽 명확 + 교집합 + noun Jaccard >= TASK_NOUN_JACCARD_MIN)
+          B) 강한 cosine 단독 신호 (TASK_SEMANTIC_HIGH_COSINE, 기본 0.92)
+             휴리스틱이 약해도 cosine 이 매우 높으면 허용 (도메인 동사 사전에 없는 표현 흡수)
+
+        그 외에는 모두 reject. process 단위로만 비교 (cross-process 비교 X).
+        임베딩 호출 실패 시 graceful degrade.
+        """
+        if len(tasks) <= 1:
+            return tasks
+
+        embed_texts = [self._build_task_embed_text(t) for t in tasks]
+        try:
+            embeddings = self.vector_search.embed_texts(embed_texts)
+        except Exception as exc:
+            print(f"   ⚠️ Task 임베딩 호출 실패 → 임베딩 병합 스킵: {exc}")
+            return tasks
+
+        if not embeddings or len(embeddings) != len(tasks):
+            return tasks
+
+        low_thr = float(Config.TASK_SEMANTIC_COSINE_MIN)
+        high_thr = float(Config.TASK_SEMANTIC_HIGH_COSINE)
+        jaccard_min = float(Config.TASK_NOUN_JACCARD_MIN)
+
+        sorted_idx = sorted(range(len(tasks)), key=lambda k: int(getattr(tasks[k], "order", 0) or 0))
+        skip: set[int] = set()
+        result: list = []
+        merged_total = 0
+
+        for pos_i, i in enumerate(sorted_idx):
+            if i in skip:
+                continue
+            cluster: list = [tasks[i]]
+            for pos_j in range(pos_i + 1, len(sorted_idx)):
+                j = sorted_idx[pos_j]
+                if j in skip:
+                    continue
+
+                ti, tj = tasks[i], tasks[j]
+                ni = (getattr(ti, "name", "") or "").strip().lower()
+                nj = (getattr(tj, "name", "") or "").strip().lower()
+                if not ni or not nj:
+                    continue
+                if ni == nj:
+                    cluster.append(tj)
+                    skip.add(j)
+                    continue
+
+                try:
+                    cos = self.vector_search.cosine_similarity(embeddings[i], embeddings[j])
+                except Exception:
+                    continue
+
+                # 임계 미달이면 즉시 reject
+                if cos < low_thr:
+                    continue
+
+                # 강한 휴리스틱 confirm 여부 판정
+                is_substring = (len(ni) >= 6 and ni in nj) or (len(nj) >= 6 and nj in ni)
+                vi = self._task_verb_class(getattr(ti, "name", ""))
+                vj = self._task_verb_class(getattr(tj, "name", ""))
+                ai = self._task_core_nouns(getattr(ti, "name", ""))
+                aj = self._task_core_nouns(getattr(tj, "name", ""))
+
+                # verb class 가 양쪽 다 명확한데 교집합이 없으면 무조건 reject
+                # ("선정" vs "검토" 같은 명백히 다른 동사)
+                if vi and vj and not (vi & vj):
+                    continue
+
+                strong_heuristic = False
+                if is_substring:
+                    strong_heuristic = True
+                elif vi and vj and (vi & vj) and ai and aj:
+                    overlap = ai & aj
+                    union = ai | aj
+                    jaccard = (len(overlap) / len(union)) if union else 0.0
+                    if jaccard >= jaccard_min:
+                        strong_heuristic = True
+
+                if strong_heuristic:
+                    # 약한 임계로 통과
+                    pass
+                elif cos >= high_thr:
+                    # 강한 cosine 단독 신호로 통과
+                    pass
+                else:
+                    # 어느 정책도 충족 못함
+                    continue
+
+                cluster.append(tj)
+                skip.add(j)
+
+            if len(cluster) > 1:
+                # 대표: 가장 긴 이름 (정보량 많음)
+                rep = max(cluster, key=lambda x: len(getattr(x, "name", "") or ""))
+                self._merge_task_metadata(cluster, rep)
+                rep_id = rep.task_id
+                cluster_other_ids = {x.task_id for x in cluster if x.task_id != rep_id}
+                for x in cluster:
+                    if x.task_id != rep_id:
+                        task_id_mapping[x.task_id] = rep_id
+                # transitively 갱신: 기존 매핑 중 흡수된 ID 를 가리키던 것도 rep 으로
+                for old_id, new_id in list(task_id_mapping.items()):
+                    if new_id in cluster_other_ids:
+                        task_id_mapping[old_id] = rep_id
+                merged_total += len(cluster) - 1
+                names_dbg = [getattr(x, "name", "") for x in cluster]
+                # 임계 정보도 함께 로깅 (디버깅 편의)
+                print(
+                    f"   🧠 임베딩 병합 (cos_low={low_thr:.2f}/high={high_thr:.2f}): "
+                    f"{names_dbg} → {rep.name}"
+                )
+                result.append(rep)
+            else:
+                result.append(tasks[i])
+
+        if merged_total:
+            print(f"   🧠 임베딩 병합 합계: {merged_total} 개 task 흡수")
+
+        return result
+
+    def _merge_task_metadata(self, cluster: list, rep) -> None:
+        """task description / instruction 통합 (라인 단위 dedup)."""
+        descs = [getattr(x, "description", "") for x in cluster if getattr(x, "description", "")]
+        if descs:
+            rep.description = " | ".join(dict.fromkeys(descs))
+        instrs = [getattr(x, "instruction", "") for x in cluster if getattr(x, "instruction", "")]
+        if instrs:
+            seen_lines: set[str] = set()
+            merged_lines: list[str] = []
+            for src in instrs:
+                for ln in (src or "").splitlines():
+                    s = ln.strip()
+                    if s and s not in seen_lines:
+                        seen_lines.add(s)
+                        merged_lines.append(s)
+            rep.instruction = "\n".join(merged_lines).strip()
+
+    # ------------------------------------------------------------------
+    # Role 정규화 (직급 보존 + 책임 task signature 기반 클러스터링)
+    # ------------------------------------------------------------------
+    def _role_display_key(self, name: str) -> str:
+        """Role 이름의 보수적 정규화 키 (직급은 보존).
+
+        괄호/구분기호/공백만 제거한 lowercase 형태. 직급 접미사는
+        의도적으로 보존하여 "기획처장" / "기획본부장" 같이 다른 직급은
+        분리된 채로 둔다. ("기획처장" / "기획 처장" / "기획처장(주관)" 정도만
+        같은 키로 흡수)
+        """
+        if not name:
+            return ""
+        s = str(name).strip()
+        for p in _ROLE_NOISE_PATTERNS:
+            s = re.sub(p, " ", s)
+        # "또는/및/and/or" 로 연결된 다중 역할은 첫 부분만 키로 사용
+        parts = re.split(r"\s+(?:또는|혹은|및|or|and)\s+", s, flags=re.IGNORECASE)
+        primary = (parts[0] if parts else s).strip()
+        # 마지막 조사 "의" 만 제거
+        primary = re.sub(r"의$", "", primary).strip()
+        # 공백 제거하여 표기 흔들림 흡수 ("기획처장" == "기획 처장")
+        primary = re.sub(r"\s+", "", primary)
+        return primary.lower()
+
+    def _normalize_roles_by_responsibility(
+        self, roles: list
+    ) -> tuple[list, dict]:
+        """직급은 보존하면서 사실상 동일한 책임을 수행하는 Role 들을 흡수.
+
+        병합 규칙 (Union-Find):
+          1. 보수적 이름 정규화 (괄호/구분기호/공백만 제거, 직급 유지) 후 정확 일치
+          2. 정규화된 task signature (assigned task_id set) Jaccard >= TASK_SIG_JACCARD_MIN
+             AND 양쪽 task 수 >= TASK_SIG_MIN_COUNT 인 경우 흡수
+             - 이름이 달라도 실질 책임 task 가 거의 같으면 같은 역할로 본다는 가정
+             - 이 단계는 task merge 가 끝난 뒤 호출되어야 의미 있음
+
+        직급 접미사 ("처장"/"본부장" 등) 는 인위로 제거하지 않으므로 task 책임이
+        다른 직급들은 자연히 분리 유지된다.
+
+        흡수된 role_id 는 self.task_role_map / self.role_decision_map /
+        self.role_skill_map 에서도 대표 ID 로 재매핑된다.
+
+        Returns:
+            (canonical_roles, {old_role_id: representative_role_id})
+        """
+        if not roles:
+            return roles, {}
+
+        # ----- task signature 빌드 -----
+        # task_role_map: task_id -> role_id (이미 task merge 후 정규화된 task_id)
+        role_to_taskids: dict[str, set[str]] = {}
+        for tid, rid in self.task_role_map.items():
+            if not rid:
+                continue
+            role_to_taskids.setdefault(rid, set()).add(tid)
+
+        items: list[dict] = []
+        for i, r in enumerate(roles):
+            nm = (getattr(r, "name", "") or "").strip()
+            rid = getattr(r, "role_id", None)
+            items.append({
+                "idx": i,
+                "role": r,
+                "name": nm,
+                "nkey": self._role_display_key(nm),
+                "rid": rid,
+                "tasks": role_to_taskids.get(rid, set()) if rid else set(),
+            })
+
+        n = len(items)
+        parent = list(range(n))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(a: int, b: int) -> None:
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        # ----- 1단계: 이름 정규화 키 정확 일치 -----
+        by_key: dict[str, int] = {}
+        for i, it in enumerate(items):
+            k = it["nkey"]
+            if not k:
+                continue
+            if k in by_key:
+                _union(by_key[k], i)
+            else:
+                by_key[k] = i
+
+        # ----- 2단계: task signature Jaccard 기반 -----
+        # 양쪽 다 충분한 task (>=2) 를 가진 role 끼리만 비교 → 노이즈 방지
+        TASK_SIG_MIN_COUNT = 2
+        TASK_SIG_JACCARD_MIN = 0.7
+
+        candidates = [
+            i for i, it in enumerate(items)
+            if len(it["tasks"]) >= TASK_SIG_MIN_COUNT
+        ]
+        for i_idx in range(len(candidates)):
+            for j_idx in range(i_idx + 1, len(candidates)):
+                i, j = candidates[i_idx], candidates[j_idx]
+                if _find(i) == _find(j):
+                    continue
+                ta, tb = items[i]["tasks"], items[j]["tasks"]
+                inter = ta & tb
+                if not inter:
+                    continue
+                union = ta | tb
+                jacc = len(inter) / len(union)
+                if jacc >= TASK_SIG_JACCARD_MIN:
+                    _union(i, j)
+
+        # ----- 3단계: 임베딩 cosine + task signature 교차검증 -----
+        # 직급 보존 정책상 cosine 단독으로는 절대 합치지 않는다.
+        # ("기획본부장" / "기획처장" 의 cosine 은 보통 0.95+ 로 매우 높지만 직급/책임이 다름)
+        # 두 신호가 동시에 강할 때만 흡수:
+        #   · cosine ≥ ROLE_SEMANTIC_COSINE_MIN (이름 의미 매우 유사)
+        #   · AND 양쪽 다 task ≥ ROLE_EMBED_MIN_TASKS
+        #   · AND task signature Jaccard ≥ ROLE_EMBED_JACCARD_MIN (책임도 거의 같음)
+        if Config.ENABLE_SEMANTIC_DEDUP and n >= 2:
+            try:
+                role_texts = [it["name"] for it in items]
+                role_embeddings = self.vector_search.embed_texts(role_texts)
+            except Exception as exc:
+                print(f"   ⚠️ Role 임베딩 호출 실패 → 임베딩 단계 스킵: {exc}")
+                role_embeddings = None
+
+            if role_embeddings and len(role_embeddings) == n:
+                cos_min = float(Config.ROLE_SEMANTIC_COSINE_MIN)
+                ROLE_EMBED_MIN_TASKS = 2
+                ROLE_EMBED_JACCARD_MIN = 0.5
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        if _find(i) == _find(j):
+                            continue
+                        ta, tb = items[i]["tasks"], items[j]["tasks"]
+                        # 한쪽이라도 task 부족하면 임베딩 단독 합병 금지 (직급 다른 후보 흡수 방지)
+                        if len(ta) < ROLE_EMBED_MIN_TASKS or len(tb) < ROLE_EMBED_MIN_TASKS:
+                            continue
+                        try:
+                            cos = self.vector_search.cosine_similarity(
+                                role_embeddings[i], role_embeddings[j]
+                            )
+                        except Exception:
+                            continue
+                        if cos < cos_min:
+                            continue
+                        union = ta | tb
+                        if not union:
+                            continue
+                        jacc = len(ta & tb) / len(union)
+                        if jacc < ROLE_EMBED_JACCARD_MIN:
+                            continue
+                        print(
+                            f"   🧠 Role 임베딩 병합: '{items[i]['name']}' ↔ '{items[j]['name']}' "
+                            f"(cos={cos:.3f}, task_jaccard={jacc:.2f})"
+                        )
+                        _union(i, j)
+
+        # ----- 그룹화 → 대표 선정 -----
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            r = _find(i)
+            groups.setdefault(r, []).append(i)
+
+        canonical_roles: list = []
+        role_id_remap: dict[str, str] = {}
+
+        for _, member_indices in groups.items():
+            members = [items[k] for k in member_indices]
+            # 대표 선정 우선순위:
+            #   1) 책임 task 수가 가장 많은 role (책임이 명확한 표현)
+            #   2) 이름이 가장 짧은 표현 (일반화된 표기)
+            #   3) 등장 순
+            members_sorted = sorted(
+                members,
+                key=lambda m: (-len(m["tasks"]), len(m["name"]), m["idx"]),
+            )
+            rep = members_sorted[0]["role"]
+            rep_id = getattr(rep, "role_id", None)
+            canonical_roles.append(rep)
+            if not rep_id:
+                continue
+            for m in members:
+                mid = m["rid"]
+                if mid and mid != rep_id:
+                    role_id_remap[mid] = rep_id
+
+            if len(members) > 1:
+                names = [m["name"] for m in members]
+                print(
+                    f"   🔀 Role 클러스터: {names} → {getattr(rep, 'name', '')}"
+                )
+
+        if not role_id_remap:
+            return canonical_roles, role_id_remap
+
+        # task_role_map 갱신 (transitively: 흡수된 ID 를 가리키던 항목들 모두 대표로)
+        new_task_role_map: dict[str, str] = {}
+        for tid, rid in self.task_role_map.items():
+            new_task_role_map[tid] = role_id_remap.get(rid, rid)
+        self.task_role_map = new_task_role_map
+
+        # role_decision_map 갱신 (병합 시 중복 제거)
+        new_rdmap: dict[str, list] = {}
+        for rid, dlist in self.role_decision_map.items():
+            new_rid = role_id_remap.get(rid, rid)
+            new_rdmap.setdefault(new_rid, []).extend(dlist or [])
+        self.role_decision_map = {k: list(dict.fromkeys(v)) for k, v in new_rdmap.items()}
+
+        # role_skill_map 갱신
+        new_rsmap: dict[str, list] = {}
+        for rid, slist in self.role_skill_map.items():
+            new_rid = role_id_remap.get(rid, rid)
+            new_rsmap.setdefault(new_rid, []).extend(slist or [])
+        self.role_skill_map = {k: list(dict.fromkeys(v)) for k, v in new_rsmap.items()}
+
+        return canonical_roles, role_id_remap
+
     def _have_same_core_words(self, name1: str, name2: str) -> bool:
         """두 이름이 핵심 단어를 공유하는지 확인합니다."""
         # 한국어 조사/어미 제거를 위한 간단한 처리

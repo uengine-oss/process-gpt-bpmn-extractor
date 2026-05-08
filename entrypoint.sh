@@ -10,7 +10,7 @@ echo "📋 Configuration:"
 echo "   - API Server Port: ${API_PORT:-8001}"
 echo "   - Agent Server Port: ${AGENT_PORT:-8000}"
 echo "   - PDF2BPMN URL: ${PDF2BPMN_URL:-http://localhost:8001}"
-echo "   - Neo4j URI: ${NEO4J_URI:-not set}"
+echo "   - AGE DSN: ${AGE_DSN:-not set}"
 echo "   - Supabase URL: ${SUPABASE_URL:+set}"
 echo "   - Agent Orchestrator: ${AGENT_ORCH:-pdf2bpmn}"
 echo "   - Task Timeout: ${TASK_TIMEOUT:-3600}s"
@@ -27,11 +27,11 @@ if [ -n "$SUPABASE_URL" ]; then
 fi
 
 # Wait for dependencies if needed
-if [ -n "$WAIT_FOR_NEO4J" ]; then
-    echo "⏳ Waiting for Neo4j at ${NEO4J_URI}..."
+if [ -n "$WAIT_FOR_AGE" ]; then
+    echo "⏳ Waiting for Apache AGE..."
     for i in $(seq 1 30); do
         if python -c "from src.pdf2bpmn.graph.neo4j_client import Neo4jClient; c = Neo4jClient(); c.verify_connection(); c.close()" 2>/dev/null; then
-            echo "✅ Neo4j is ready"
+            echo "✅ Apache AGE is ready"
             break
         fi
         echo "   Attempt $i/30..."

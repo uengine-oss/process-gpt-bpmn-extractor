@@ -937,8 +937,6 @@ class EntityExtractor:
                 cond = str(flow.get("condition") or "").strip()
                 if not from_name or not to_name:
                     continue
-                if not cond:
-                    continue
                 grouped.setdefault(from_name, []).append((to_name, cond))
 
             synthesized_pairs = set()
@@ -949,6 +947,9 @@ class EntityExtractor:
                     if to_name not in uniq_targets:
                         uniq_targets.append(to_name)
                 if len(uniq_targets) < 2:
+                    continue
+                # At least one conditional cue should exist to treat this as a branch.
+                if not any(str(cond or "").strip() for _, cond in items):
                     continue
 
                 src_task_id = task_name_to_id.get(from_name)
@@ -996,7 +997,8 @@ class EntityExtractor:
                     tgt_task_id = task_name_to_id.get(to_name)
                     if not tgt_task_id:
                         continue
-                    key = (gw_id, tgt_task_id, cond)
+                    cond_norm = str(cond or "").strip()
+                    key = (gw_id, tgt_task_id, cond_norm)
                     if key in synthesized_pairs:
                         continue
                     synthesized_pairs.add(key)
@@ -1006,7 +1008,7 @@ class EntityExtractor:
                             "from_type": "gateway",
                             "to_id": tgt_task_id,
                             "to_type": "task",
-                            "condition": cond,
+                            "condition": cond_norm,
                         }
                     )
 

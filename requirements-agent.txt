@@ -11,8 +11,8 @@
 # PyPI: https://pypi.org/project/process-gpt-agent-sdk/
 process-gpt-agent-sdk==0.4.13
 
-# Neo4j driver (workflow import/runtime requirement)
-neo4j>=5.0.0
+# Apache AGE backend (PostgreSQL client)
+psycopg[binary]>=3.2.0
 
 # Supabase (데이터베이스 연동)
 supabase>=2.0.0

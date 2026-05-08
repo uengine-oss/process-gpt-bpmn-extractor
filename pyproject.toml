@@ -9,7 +9,7 @@ dependencies = [
     "langchain>=0.3.0",
     "langchain-openai>=0.2.0",
     "langchain-community>=0.3.0",
-    "neo4j>=5.0.0",
+    "psycopg[binary]>=3.2.0",
     "openai>=1.0.0",
     "pypdf>=4.0.0",
     "pdfplumber>=0.11.0",
@@ -28,6 +28,8 @@ dependencies = [
     "pytesseract>=0.3.10",
     "pymupdf>=1.24.0",
     "requests>=2.32.5",
+    "process-gpt-agent-sdk>=0.4.15",
+    "supabase>=2.28.3",
 ]
 
 [build-system]

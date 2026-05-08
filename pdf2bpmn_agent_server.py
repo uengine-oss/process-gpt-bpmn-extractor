@@ -6,12 +6,13 @@ ProcessGPT SDK를 사용한 PDF to BPMN 변환 에이전트 서버
 
 import asyncio
 import os
+import re
 import sys
 import signal
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional, Callable
 
 # Optional: embedded API server (Neo4j graph gateway for frontend)
 try:
@@ -168,15 +169,152 @@ class PDF2BPMNServerManager:
             logger.error(f"ProcessGPT 서버 생성 실패: {e}")
             return False
 
+    @staticmethod
+    def _list_age_graphs() -> List[str]:
+        """List all AGE graphs in the database (best-effort)."""
+        if Neo4jClient is None:
+            return []
+        probe = Neo4jClient()
+        try:
+            conn = probe._connect()  # noqa: SLF001 - embedded API fallback
+            with conn.cursor() as cur:
+                cur.execute("SELECT name FROM ag_catalog.ag_graph ORDER BY name")
+                rows = cur.fetchall() or []
+            return [
+                str(r[0]).strip()
+                for r in rows
+                if isinstance(r, (list, tuple)) and r and str(r[0]).strip()
+            ]
+        except Exception as e:
+            logger.debug(f"[GRAPH] _list_age_graphs failed: {e}")
+            return []
+        finally:
+            try:
+                probe.close()
+            except Exception:
+                pass
+
+    @classmethod
+    def _candidate_graph_names(
+        cls,
+        *,
+        tenant_id: str = "",
+        task_id: str = "",
+        explicit: str = "",
+    ) -> List[str]:
+        """
+        Return candidate AGE graph names ordered by priority.
+
+        한 todo(=task_id) 의 모든 프로세스 데이터는 `g_<tenant>_<task_id>`
+        그래프 하나에 누적된다. 따라서 가장 정확한 식별 방법은 tenant_id +
+        task_id 로 `Neo4jClient.build_graph_name()` 을 호출하는 것.
+
+        우선순위:
+          1. explicit (graph_name 직접 지정)
+          2. tenant_id + task_id 로 build_graph_name 결과
+          3. AGE catalog 에서 task_id 토큰을 포함하는 그래프 (legacy fallback)
+          4. 기본 그래프 (Config.AGE_GRAPH_NAME) (legacy)
+          5. 그 외 발견된 모든 그래프 (최후 수단)
+        """
+        candidates: List[str] = []
+        seen: set[str] = set()
+
+        def _add(name: str) -> None:
+            n = (name or "").strip()
+            if n and n not in seen:
+                candidates.append(n)
+                seen.add(n)
+
+        if explicit:
+            _add(explicit)
+
+        if Neo4jClient is not None and tenant_id and task_id:
+            try:
+                _add(Neo4jClient.build_graph_name(tenant_id=tenant_id, todo_id=task_id))
+            except Exception:
+                pass
+
+        discovered = cls._list_age_graphs()
+
+        if task_id:
+            task_token = re.sub(r"[^0-9A-Za-z_]", "_", str(task_id)).strip("_").lower()
+            if task_token:
+                for g in discovered:
+                    if task_token in g.lower():
+                        _add(g)
+
+        if Neo4jClient is not None:
+            try:
+                _add(Neo4jClient().graph_name)
+            except Exception:
+                pass
+
+        for g in discovered:
+            _add(g)
+
+        return candidates
+
+    @staticmethod
+    def _try_with_graph(
+        name: str,
+        fn: Callable[["Neo4jClient"], Any],
+    ) -> Optional[Any]:
+        """Run callable against the given graph; absorb missing-graph errors."""
+        if not name or Neo4jClient is None:
+            return None
+        client = Neo4jClient(graph_name=name)
+        try:
+            return fn(client)
+        except Exception as e:
+            logger.debug(f"[GRAPH] graph='{name}' query failed: {e}")
+            return None
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    @classmethod
+    def _query_across_graphs(
+        cls,
+        fn: Callable[["Neo4jClient"], Any],
+        *,
+        tenant_id: str = "",
+        task_id: str = "",
+        explicit: str = "",
+    ) -> tuple[Optional[Any], List[str], Optional[str]]:
+        """Iterate candidate graphs; return (data, tried_graphs, hit_graph_name)."""
+        candidates = cls._candidate_graph_names(
+            tenant_id=tenant_id, task_id=task_id, explicit=explicit
+        )
+        for name in candidates:
+            hit = cls._try_with_graph(name, fn)
+            if hit:
+                return hit, candidates, name
+        return None, candidates, None
+
     def _build_graph_api_app(self) -> FastAPI:
         """
-        Minimal embedded API:
-        - /api/health
-        - /api/processes/{proc_id}/graph  (Neo4j subgraph -> cytoscape elements)
-        - /api/graph/requests/{task_id}   (request-level integrated graph snapshot)
-        - /api/graph/full                 (latest integrated graph by default)
+        Embedded Graph API.
+
+        한 todo(=task_id) 의 모든 프로세스 데이터는 `g_<tenant>_<task_id>`
+        그래프 하나에 누적 저장된다. 프론트는 다음 두 가지 호출만 알면 된다:
+
+          - 전체 그래프(해당 todo 의 모든 프로세스 통합):
+              GET /api/graph/full?tenant_id=...&task_id=...
+            또는
+              GET /api/graph/full?graph_name=g_...
+
+          - 프로세스별 그래프(해당 todo 의 특정 프로세스만):
+              GET /api/processes/{proc_id}/graph?tenant_id=...&task_id=...
+            또는
+              GET /api/processes/{proc_id}/graph?graph_name=g_...
+
+        하위호환 엔드포인트도 유지:
+          - GET /api/graph/requests/{task_id}?tenant_id=...
+          - GET /api/graph/full?run_id=...&source=integrated|global
         """
-        app = FastAPI(title="PDF2BPMN Embedded Graph API", version="0.1.0")
+        app = FastAPI(title="PDF2BPMN Embedded Graph API", version="0.2.0")
         app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
@@ -211,68 +349,202 @@ class PDF2BPMNServerManager:
                     "/api/graph/requests/{task_id}",
                     "/api/graph/full",
                 ],
+                "usage": {
+                    "full_per_todo": "/api/graph/full?tenant_id=<tenant>&task_id=<todo>",
+                    "process_per_todo": "/api/processes/{proc_id}/graph?tenant_id=<tenant>&task_id=<todo>",
+                },
             }
 
+        # -------------------------------------------------------------
+        # 프로세스별 그래프 (해당 todo 안의 특정 proc_id)
+        # -------------------------------------------------------------
         @app.get("/api/processes/{proc_id}/graph")
-        async def process_graph(proc_id: str):
-            if Neo4jClient is None:
-                raise HTTPException(500, "Neo4jClient is not available in this runtime")
-            neo4j = Neo4jClient()
-            try:
-                data = neo4j.get_process_graph_elements(proc_id)
-                if not data:
-                    raise HTTPException(404, "Process not found")
-                return data
-            finally:
-                try:
-                    neo4j.close()
-                except Exception:
-                    pass
-
-        @app.get("/api/graph/requests/{task_id}")
-        async def request_integrated_graph(task_id: str):
-            if Neo4jClient is None:
-                raise HTTPException(500, "Neo4jClient is not available in this runtime")
-            neo4j = Neo4jClient()
-            try:
-                data = neo4j.get_latest_request_integrated_graph_by_task(task_id)
-                if not data:
-                    raise HTTPException(404, "Request integrated graph not found")
-                return data
-            finally:
-                try:
-                    neo4j.close()
-                except Exception:
-                    pass
-
-        @app.get("/api/graph/full")
-        async def full_graph(
-            run_id: str = "",
+        async def process_graph(
+            proc_id: str,
+            tenant_id: str = "",
             task_id: str = "",
-            source: str = "integrated",
-            max_nodes: int = 3000,
+            graph_name: str = "",
         ):
             if Neo4jClient is None:
                 raise HTTPException(500, "Neo4jClient is not available in this runtime")
-            neo4j = Neo4jClient()
-            try:
-                src = (source or "integrated").strip().lower()
-                if src == "global":
-                    return neo4j.get_full_graph_elements(max_nodes=max_nodes)
-                if run_id:
-                    data = neo4j.get_request_integrated_graph(run_id)
-                elif task_id:
-                    data = neo4j.get_latest_request_integrated_graph_by_task(task_id)
-                else:
-                    data = neo4j.get_latest_request_integrated_graph()
+
+            def _fetch(client: "Neo4jClient") -> Optional[Dict[str, Any]]:
+                data = client.get_process_graph_elements(proc_id)
                 if not data:
-                    raise HTTPException(404, "Integrated graph not found")
+                    data = client.get_latest_request_process_graph_by_proc_id(proc_id)
+                return data or None
+
+            data, tried, hit_name = self._query_across_graphs(
+                _fetch, tenant_id=tenant_id, task_id=task_id, explicit=graph_name
+            )
+            if not data:
+                raise HTTPException(
+                    404,
+                    f"Process graph not found (proc_id={proc_id}, "
+                    f"tried graphs: {', '.join(tried) or '<none>'})",
+                )
+            if isinstance(data, dict) and hit_name:
+                data.setdefault("graph_name", hit_name)
+                if tenant_id:
+                    data.setdefault("tenant_id", tenant_id)
+                if task_id:
+                    data.setdefault("task_id", task_id)
+            return data
+
+        # -------------------------------------------------------------
+        # 통합 그래프 (해당 todo 의 모든 프로세스 누적)
+        # -------------------------------------------------------------
+        @app.get("/api/graph/requests/{task_id}")
+        async def request_integrated_graph(
+            task_id: str,
+            tenant_id: str = "",
+            graph_name: str = "",
+            max_nodes: int = 3000,
+            allow_global_fallback: bool = True,
+        ):
+            if Neo4jClient is None:
+                raise HTTPException(500, "Neo4jClient is not available in this runtime")
+
+            def _fetch(client: "Neo4jClient") -> Optional[Dict[str, Any]]:
+                return client.get_latest_request_integrated_graph_by_task(task_id)
+
+            data, tried, hit_name = self._query_across_graphs(
+                _fetch, tenant_id=tenant_id, task_id=task_id, explicit=graph_name
+            )
+
+            # FALLBACK: GraphRun/GraphSnapshot 노드가 없는 (이전 버전 워커가
+            # 적재한) 그래프인 경우, 같은 그래프의 process-core 전역 노드/엣지를
+            # "통합 그래프" 로 간주해서 반환한다. 이렇게 하면 스냅샷 적재 전에
+            # 만든 todo 의 그래프도 프론트에서 그대로 시각화 가능.
+            if (
+                not data
+                and allow_global_fallback
+                and Neo4jClient is not None
+            ):
+                def _fetch_global(client: "Neo4jClient") -> Optional[Dict[str, Any]]:
+                    payload = client.get_full_graph_elements(max_nodes=max_nodes)
+                    if not payload:
+                        return None
+                    counts = (payload.get("counts") or {}) if isinstance(payload, dict) else {}
+                    if isinstance(counts, dict) and not (counts.get("nodes") or counts.get("edges")):
+                        return None
+                    if isinstance(payload, dict):
+                        payload.setdefault("source", "global_fallback")
+                    return payload
+
+                data, fallback_tried, hit_name = self._query_across_graphs(
+                    _fetch_global, tenant_id=tenant_id, task_id=task_id, explicit=graph_name
+                )
+                # tried 목록 합치기 (중복 제거)
+                merged: List[str] = list(tried)
+                for g in fallback_tried:
+                    if g not in merged:
+                        merged.append(g)
+                tried = merged
+
+            if not data:
+                raise HTTPException(
+                    404,
+                    f"Request integrated graph not found "
+                    f"(task_id={task_id}, tried graphs: {', '.join(tried) or '<none>'})",
+                )
+            if isinstance(data, dict) and hit_name:
+                data.setdefault("graph_name", hit_name)
+                if tenant_id:
+                    data.setdefault("tenant_id", tenant_id)
+                data.setdefault("task_id", task_id)
+            return data
+
+        # -------------------------------------------------------------
+        # 통합 엔드포인트
+        #   - source=integrated (default): 통합 스냅샷
+        #   - source=global: 그래프의 process-core 전체 노드/엣지
+        # -------------------------------------------------------------
+        @app.get("/api/graph/full")
+        async def full_graph(
+            tenant_id: str = "",
+            task_id: str = "",
+            run_id: str = "",
+            proc_id: str = "",
+            source: str = "integrated",
+            max_nodes: int = 3000,
+            graph_name: str = "",
+        ):
+            if Neo4jClient is None:
+                raise HTTPException(500, "Neo4jClient is not available in this runtime")
+
+            src = (source or "integrated").strip().lower()
+
+            # 1) proc_id 가 함께 들어오면 → 프로세스별 그래프로 위임 (같은 그래프에서 필터)
+            if proc_id:
+                def _fetch_proc(client: "Neo4jClient") -> Optional[Dict[str, Any]]:
+                    data = client.get_process_graph_elements(proc_id)
+                    if not data:
+                        data = client.get_latest_request_process_graph_by_proc_id(proc_id)
+                    return data or None
+
+                data, tried, hit_name = self._query_across_graphs(
+                    _fetch_proc, tenant_id=tenant_id, task_id=task_id, explicit=graph_name
+                )
+                if not data:
+                    raise HTTPException(
+                        404,
+                        f"Process graph not found (proc_id={proc_id}, "
+                        f"tried graphs: {', '.join(tried) or '<none>'})",
+                    )
+                if isinstance(data, dict) and hit_name:
+                    data.setdefault("graph_name", hit_name)
                 return data
-            finally:
-                try:
-                    neo4j.close()
-                except Exception:
-                    pass
+
+            # 2) source=global: 그래프 전역 (process-core 라벨)
+            if src == "global":
+                def _fetch_global(client: "Neo4jClient") -> Optional[Dict[str, Any]]:
+                    data = client.get_full_graph_elements(max_nodes=max_nodes)
+                    if not data:
+                        return None
+                    if isinstance(data, dict):
+                        counts = data.get("counts") or {}
+                        if isinstance(counts, dict) and not (
+                            counts.get("nodes") or counts.get("edges")
+                        ):
+                            return None
+                    return data
+
+                data, tried, hit_name = self._query_across_graphs(
+                    _fetch_global, tenant_id=tenant_id, task_id=task_id, explicit=graph_name
+                )
+                if not data:
+                    raise HTTPException(
+                        404,
+                        f"Global graph not found (tried graphs: {', '.join(tried) or '<none>'})",
+                    )
+                if isinstance(data, dict) and hit_name:
+                    data.setdefault("graph_name", hit_name)
+                return data
+
+            # 3) source=integrated (default): 통합 그래프 스냅샷
+            def _fetch_integrated(client: "Neo4jClient") -> Optional[Dict[str, Any]]:
+                if run_id:
+                    return client.get_request_integrated_graph(run_id)
+                if task_id:
+                    return client.get_latest_request_integrated_graph_by_task(task_id)
+                return client.get_latest_request_integrated_graph()
+
+            data, tried, hit_name = self._query_across_graphs(
+                _fetch_integrated, tenant_id=tenant_id, task_id=task_id, explicit=graph_name
+            )
+            if not data:
+                raise HTTPException(
+                    404,
+                    f"Integrated graph not found (tried graphs: {', '.join(tried) or '<none>'})",
+                )
+            if isinstance(data, dict) and hit_name:
+                data.setdefault("graph_name", hit_name)
+                if tenant_id:
+                    data.setdefault("tenant_id", tenant_id)
+                if task_id:
+                    data.setdefault("task_id", task_id)
+            return data
 
         return app
 

@@ -107,6 +107,17 @@ class Config:
     # role 임베딩 cosine 임계 (이 이상 + (display key 일치 OR task signature 충분) 시 merge)
     ROLE_SEMANTIC_COSINE_MIN: float = float(os.getenv("ROLE_SEMANTIC_COSINE_MIN", "0.92"))
 
+    # 이름이 정확히 같은 task 페어를 합치기 전 instruction/description 으로 추가 검증.
+    # - 같은 role 끼리는 LLM 의 인접 중복 추출 가능성이 높아 비교적 관대.
+    # - role 이 다르면 결재 체인 등 "이름만 같은 다른 단계" 가능성이 커서 더 보수적.
+    # - instruction/description 이 한쪽이라도 비어 있으면 비교 불가 → 안전한 기본값으로 merge.
+    TASK_SAME_NAME_INSTR_COSINE_SAME_ROLE: float = float(
+        os.getenv("TASK_SAME_NAME_INSTR_COSINE_SAME_ROLE", "0.78")
+    )
+    TASK_SAME_NAME_INSTR_COSINE_DIFF_ROLE: float = float(
+        os.getenv("TASK_SAME_NAME_INSTR_COSINE_DIFF_ROLE", "0.86")
+    )
+
     # Performance optimization options
     EVIDENCE_MODE: str = os.getenv("EVIDENCE_MODE", "full")  # "full", "reference_only", "off"
     CHUNKING_STRATEGY: str = os.getenv("CHUNKING_STRATEGY", "fixed")  # "fixed", "semantic"

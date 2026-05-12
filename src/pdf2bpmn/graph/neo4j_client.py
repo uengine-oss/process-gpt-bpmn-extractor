@@ -328,6 +328,48 @@ class Neo4jClient:
         with self.session() as session:
             session.run("MATCH (n) DETACH DELETE n")
 
+    def drop_graph(self, graph_name: Optional[str] = None) -> bool:
+        """AGE 그래프 자체를 통째로 제거한다.
+
+        ScaledJob 워커는 처리 결과를 채팅 메시지에 직접 첨부해 프론트에 넘기므로
+        AGE 인스턴스에 그래프 데이터를 남겨둘 필요가 없다. 이 메서드는 처리 종료
+        직후 호출되어 AGE 가 무한정 부풀지 않도록 정리한다.
+
+        - 존재하지 않는 그래프 → no-op (False 반환, 예외 없음)
+        - drop 실패 → 경고 로그 후 False (호출자가 nominal flow 를 막지 않도록)
+
+        Args:
+            graph_name: 제거할 그래프 이름. 미지정 시 self.graph_name 사용.
+        Returns:
+            성공적으로 drop 된 경우 True, 그 외 False.
+        """
+        target = (graph_name or self.graph_name or "").strip()
+        if not target:
+            return False
+        try:
+            conn = self._connect()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM ag_catalog.ag_graph WHERE name = %s",
+                    (target,),
+                )
+                exists = cur.fetchone()
+                if not exists:
+                    return False
+                # cascade=true 로 노드/엣지/카탈로그 메타까지 일괄 정리
+                cur.execute(
+                    "SELECT ag_catalog.drop_graph(%s, true)",
+                    (target,),
+                )
+            return True
+        except Exception as exc:
+            try:
+                from loguru import logger as _logger
+                _logger.warning(f"[AGE] drop_graph('{target}') 실패: {exc}")
+            except Exception:
+                print(f"[WARN] AGE drop_graph('{target}') 실패: {exc}")
+            return False
+
     def clear_process_core_labels(self, labels: Optional[list[str]] = None) -> dict[str, Any]:
         """Delete only process-core labels and keep unrelated graph data."""
         target_labels = labels or self.PROCESS_CORE_LABELS

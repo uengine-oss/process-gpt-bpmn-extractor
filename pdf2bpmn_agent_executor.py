@@ -1831,6 +1831,11 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             "description": "",
             "room_id": "",
             "tenant_id": "",
+            # 사용자 [도구 설정] 다이얼로그에서 선택한 처리 강도.
+            # 메인 에이전트가 [InputData].tool_settings 로 넣어 주면 여기에 그대로 보존되어
+            # workflow.set_dedup_level() 호출에 사용된다.
+            # 예: {"pdf2bpmnLevel": "concise" | "standard" | "detailed"}
+            "tool_settings": {},
             "raw_query": query
         }
 
@@ -1966,6 +1971,16 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         def _apply_parsed_data(data: Dict[str, Any]):
             result["room_id"] = str(data.get("room_id") or result.get("room_id") or "").strip()
             result["tenant_id"] = str(data.get("tenant_id") or result.get("tenant_id") or "").strip()
+            # tool_settings 화이트리스트 검증 후 보존.
+            ts = data.get("tool_settings")
+            if isinstance(ts, dict) and ts:
+                allowed_levels = {"concise", "standard", "detailed"}
+                lv = str(ts.get("pdf2bpmnLevel") or "").strip().lower()
+                cleaned: Dict[str, Any] = {}
+                if lv in allowed_levels:
+                    cleaned["pdf2bpmnLevel"] = lv
+                if cleaned:
+                    result["tool_settings"] = cleaned
             normalized_files = _normalize_files_from_input(data)
             if normalized_files:
                 result["input_files"] = normalized_files
@@ -2198,6 +2213,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         display_name: str,
         source: str,
         memento_chunks: List[Dict[str, Any]],
+        pdf2bpmn_level: str = "standard",
     ) -> Tuple[List[PdfDocument], List[Section], List[ReferenceChunk]]:
         """
         메멘토 청크를 그대로 활용해 (Document, [Section], [ReferenceChunk]) 를 구성한다.
@@ -2258,6 +2274,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
         # 3) Section: 기존 heading/SOP 분리 로직 재사용
         extractor = PDFExtractor()
+        # 사용자 [도구 설정] 의 pdf2bpmnLevel 을 SOP 분할 단계에도 적용한다.
+        # SOP 개수 자체는 LLM 이 문서 내용을 보고 판단하며 (하드코딩 N 개 강제 X),
+        # level 은 "분할에 얼마나 적극적인가" 의 임계만 조절한다.
+        try:
+            extractor.set_segmentation_level(pdf2bpmn_level)
+        except Exception:
+            pass
         all_text = [(p, page_texts[p]) for p in sorted_pages]
         sop_sections: List[Section] = []
         heading_sections: List[Section] = extractor._extract_sections(doc.doc_id, all_text)
@@ -3336,12 +3359,432 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         if ex_events_n >= 4 and llm_events <= 2 and llm_activities <= 1:
             return True, "event_count_collapsed_to_start_end_only"
 
+        # NEW: gateway/sequence 의 "심각한 수축" 도 fallback.
+        # - LLM 이 게이트웨이를 만들긴 했지만 절반 이하로 줄어들면, 분기/병합 의미가 사라져
+        #   본 문서의 흐름을 보존하지 못한다. validator 의 single-branch gateway collapse 가
+        #   이어서 동작하면서 게이트웨이가 0 까지 떨어지는 회귀가 관측되었기 때문에,
+        #   이 시점에서 미리 컷한다.
+        if ex_gateways_n >= 2 and llm_gateways * 2 < ex_gateways_n:
+            return True, f"gateway_count_severely_reduced({llm_gateways}<{ex_gateways_n}/2)"
+        # - 마찬가지로 sequence 도 절반 이하이면 분기/병합/역방향 흐름이 다수 누락된 것으로
+        #   판단해 fallback. (LLM 이 모든 노드를 직선 chain 으로 만들어버린 회귀 사례 대응)
+        if ex_flows_n >= 6 and llm_sequences * 2 < ex_flows_n:
+            return True, f"sequence_count_severely_reduced({llm_sequences}<{ex_flows_n}/2)"
+
+        # NEW: task 시작점 무결성 — extracted.sequence_flows 에서 유일한 in-degree 0 task 가
+        #      식별되는데, LLM elements 의 시작 task (sequence 에서 source 로만 등장하고 target 으로는
+        #      등장하지 않는 activity) 의 이름이 그와 명백히 다르면, LLM 이 task 순서를 잘못 잡은
+        #      hallucination 으로 본다. (예: "최종 결과 통보" 가 첫 task 가 되는 회귀)
+        try:
+            mismatch_reason = self._llm_start_task_mismatches_extracted(
+                elements_model=elements_model,
+                extracted=extracted,
+                ex_tasks=ex_tasks if isinstance(ex_tasks, list) else [],
+                ex_flows=ex_flows if isinstance(ex_flows, list) else [],
+            )
+            if mismatch_reason:
+                return True, mismatch_reason
+        except Exception:
+            # 검증 실패는 정책상 보수적으로 무시 (LLM 결과 유지)
+            pass
+
         logger.info(
             f"[PROCDEF][FALLBACK-CHECK] keep_llm process={process_name!r} "
             f"llm(events={llm_events},activities={llm_activities},gateways={llm_gateways},sequences={llm_sequences}) "
             f"extracted(tasks={ex_tasks_n},roles={ex_roles_n},gateways={ex_gateways_n},events={ex_events_n},flows={ex_flows_n})"
         )
         return False, "ok"
+
+    def _llm_start_task_mismatches_extracted(
+        self,
+        *,
+        elements_model: Dict[str, Any],
+        extracted: Dict[str, Any],
+        ex_tasks: List[Any],
+        ex_flows: List[Any],
+    ) -> Optional[str]:
+        """LLM 결과의 "시작 activity" 가 extracted 의 시작 task 와 일치하는지 검사.
+
+        검증 트리거 조건:
+          - extracted.sequence_flows 가 충분히 있고 (>= 3)
+          - sequence_flows 에서 한 번도 to_id 로 등장하지 않는 task id 가 정확히 1개일 때
+
+        그 1개 시작 task 의 이름과, LLM elements 의 시작 activity (Sequence 에서 source 로만
+        등장하고 target 으로 등장하지 않는 Activity) 의 이름을 비교한다.
+        둘 다 식별되는데 이름이 명백히 다르면 (substring 매칭도 실패) hallucination 으로 본다.
+
+        Returns:
+          None: 검증 트리거 조건 불충족 또는 일치 → fallback 사유 없음
+          str:  fallback 사유 (예: "start_task_mismatch(...)")
+        """
+        if not isinstance(ex_flows, list) or len(ex_flows) < 3:
+            return None
+
+        # extracted: task id -> name map (task type 만)
+        ex_task_name_by_id: Dict[str, str] = {}
+        for t in ex_tasks or []:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("task_id") or t.get("id") or "").strip()
+            tname = str(t.get("name") or "").strip()
+            if tid and tname:
+                ex_task_name_by_id[tid] = tname
+        if not ex_task_name_by_id:
+            return None
+
+        # extracted: task id 중 in-degree 0 (어디서도 to_id 로 안 가리키는 것)
+        in_targets: set[str] = set()
+        all_task_sources: set[str] = set()
+        for f in ex_flows or []:
+            if not isinstance(f, dict):
+                continue
+            ft = str(f.get("from_type") or "task").strip().lower()
+            tt = str(f.get("to_type") or "task").strip().lower()
+            fid = str(f.get("from_id") or f.get("from_task_id") or "").strip()
+            tid = str(f.get("to_id") or f.get("to_task_id") or "").strip()
+            if ft == "task" and fid:
+                all_task_sources.add(fid)
+            if tt == "task" and tid:
+                in_targets.add(tid)
+
+        starts = [
+            tid for tid in ex_task_name_by_id
+            if tid in all_task_sources and tid not in in_targets
+        ]
+        if len(starts) != 1:
+            return None
+        ex_start_name = ex_task_name_by_id[starts[0]]
+
+        # LLM: Sequence 에서 source 로만 등장하고 target 으로 안 나오는 Activity
+        llm_elems = elements_model.get("elements") or []
+        if not isinstance(llm_elems, list):
+            return None
+        activity_name_by_id: Dict[str, str] = {}
+        seq_sources: set[str] = set()
+        seq_targets: set[str] = set()
+        for e in llm_elems:
+            if not isinstance(e, dict):
+                continue
+            et = str(e.get("elementType") or "").strip().lower()
+            eid = str(e.get("id") or "").strip()
+            if et == "activity" and eid:
+                activity_name_by_id[eid] = str(e.get("name") or "").strip()
+            elif et == "sequence":
+                s = str(e.get("source") or "").strip()
+                t = str(e.get("target") or "").strip()
+                if s:
+                    seq_sources.add(s)
+                if t:
+                    seq_targets.add(t)
+        if not activity_name_by_id:
+            return None
+        llm_starts = [
+            aid for aid in activity_name_by_id
+            if aid in seq_sources and aid not in seq_targets
+        ]
+        # LLM 의 시작 activity 가 0 이거나 2 이상이면 다른 검증(sequence 손실)에 맡긴다
+        if len(llm_starts) != 1:
+            return None
+        llm_start_name = activity_name_by_id[llm_starts[0]]
+        if not ex_start_name or not llm_start_name:
+            return None
+
+        a = ex_start_name.lower().strip()
+        b = llm_start_name.lower().strip()
+        if a == b:
+            return None
+        # 부분 일치는 허용 (예: LLM 이 이름을 약간 다듬은 경우)
+        if (len(a) >= 4 and a in b) or (len(b) >= 4 and b in a):
+            return None
+        return f"start_task_mismatch(extracted='{ex_start_name}', llm='{llm_start_name}')"
+
+    def _augment_sequence_flows_for_isolated_tasks(
+        self,
+        sorted_tasks: List[Any],
+        raw_flows: List[Any],
+    ) -> List[Any]:
+        """task_order 가 부여된 sorted_tasks 중 sequence_flows 에 한 번도 안 나타나는
+        isolated task 들을 task_order 인접 task 와 연결하는 backbone sequence 들을 추가.
+
+        - (I) GLOBAL-ORDER 가 task_order 를 정확히 부여한 후에도 추출 LLM 이 분기 sequence
+          를 누락하면 일부 task (예: "휴가 신청서 접수") 가 isolated 로 남는다. 이 경우 LLM
+          이 BPMN 시작점을 다른 task 로 선택하는 회귀가 발생한다.
+        - source text 위치 기반 task_order 만 신뢰 가능한 truth source 이므로, isolated 한
+          task 들을 task_order 인접 task 와 연결하여 흐름의 backbone 을 회복한다.
+        - 기존 sequence_flows 는 그대로 보존. 보강은 isolated task 가 양쪽 (prev/next) 와
+          연결되지 않은 경우에만 적용 (중복 방지).
+        """
+        if not isinstance(sorted_tasks, list) or len(sorted_tasks) < 2:
+            return raw_flows if isinstance(raw_flows, list) else []
+        flows = list(raw_flows) if isinstance(raw_flows, list) else []
+
+        task_ids_in_order: List[str] = []
+        for t in sorted_tasks:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("task_id") or t.get("id") or "").strip()
+            if tid:
+                task_ids_in_order.append(tid)
+        if len(task_ids_in_order) < 2:
+            return flows
+
+        in_count: Dict[str, int] = {tid: 0 for tid in task_ids_in_order}
+        out_count: Dict[str, int] = {tid: 0 for tid in task_ids_in_order}
+        existing_pairs: Set[Tuple[str, str]] = set()
+        for f in flows:
+            if not isinstance(f, dict):
+                continue
+            src = str(
+                f.get("source") or f.get("from_id") or f.get("from_task_id") or ""
+            ).strip()
+            tgt = str(
+                f.get("target") or f.get("to_id") or f.get("to_task_id") or ""
+            ).strip()
+            if src in out_count:
+                out_count[src] += 1
+            if tgt in in_count:
+                in_count[tgt] += 1
+            if src and tgt:
+                existing_pairs.add((src, tgt))
+
+        last_index = len(task_ids_in_order) - 1
+
+        # (M) 완전 isolated (in==0 AND out==0) 인 task — 양쪽 모두 끊김.
+        isolated_ids = {
+            tid for tid in task_ids_in_order
+            if in_count.get(tid, 0) == 0 and out_count.get(tid, 0) == 0
+        }
+        # (N) section 경계 gap task — in 또는 out 한 쪽만 끊긴 task.
+        #     - in==0 이지만 task_order 가 첫번째가 아닌 task: 이전 section 의 어떤 task 에서도
+        #       이 task 로 흐름이 오지 않음 → 이전 task_order task 에서 들어오게 보강.
+        #     - out==0 이지만 task_order 가 마지막이 아닌 task: 이 task 에서 다음 section 으로
+        #       나가는 흐름이 없음 → 다음 task_order task 로 나가게 보강.
+        gap_in_ids: Set[str] = {
+            tid for i, tid in enumerate(task_ids_in_order)
+            if i > 0 and tid not in isolated_ids and in_count.get(tid, 0) == 0
+        }
+        gap_out_ids: Set[str] = {
+            tid for i, tid in enumerate(task_ids_in_order)
+            if i < last_index and tid not in isolated_ids and out_count.get(tid, 0) == 0
+        }
+
+        if not isolated_ids and not gap_in_ids and not gap_out_ids:
+            return flows
+
+        added: List[Dict[str, Any]] = []
+
+        def _emit(prev_id: str, this_id: str, tag: str) -> None:
+            if (prev_id, this_id) in existing_pairs or prev_id == this_id:
+                return
+            added.append({
+                "source": prev_id,
+                "target": this_id,
+                "from_id": prev_id,
+                "to_id": this_id,
+                "from_type": "task",
+                "to_type": "task",
+                "condition": "",
+                "name": "",
+                "_synthesized": tag,
+            })
+            existing_pairs.add((prev_id, this_id))
+            in_count[this_id] = in_count.get(this_id, 0) + 1
+            out_count[prev_id] = out_count.get(prev_id, 0) + 1
+
+        for i, tid in enumerate(task_ids_in_order):
+            # case 1: (M) 완전 isolated — 우선 prev 와 연결, 없으면 next.
+            if tid in isolated_ids:
+                connected = False
+                if i > 0:
+                    _emit(task_ids_in_order[i - 1], tid, "isolated_backbone")
+                    connected = (task_ids_in_order[i - 1], tid) in existing_pairs
+                if not connected and i + 1 < len(task_ids_in_order):
+                    _emit(tid, task_ids_in_order[i + 1], "isolated_backbone")
+                continue
+            # case 2: (N) gap-in — 이전 task_order task 에서 들어오게.
+            if tid in gap_in_ids and i > 0:
+                _emit(task_ids_in_order[i - 1], tid, "section_gap_in")
+            # case 3: (N) gap-out — 다음 task_order task 로 나가게.
+            if tid in gap_out_ids and i + 1 < len(task_ids_in_order):
+                _emit(tid, task_ids_in_order[i + 1], "section_gap_out")
+
+        if added:
+            try:
+                logger.info(
+                    f"[PROCDEF][BACKBONE-AUGMENT] added {len(added)} task_order-backbone "
+                    f"sequence_flows "
+                    f"(isolated={len(isolated_ids)}, gap_in={len(gap_in_ids)}, "
+                    f"gap_out={len(gap_out_ids)})"
+                )
+            except Exception:
+                pass
+        return flows + added
+
+    def _topological_sort_tasks(
+        self,
+        raw_tasks: List[Any],
+        raw_flows: List[Any],
+    ) -> List[Any]:
+        """detail.tasks 를 detail.sequence_flows 의 topological order 로 재정렬.
+
+        - 추출 LLM 이 task.order 를 잘못 부여하는 경우 (예: 종결 task 인 "최종 결과 통보" 가
+          가장 작은 order) `task_order` 기반 단순 정렬은 시작 task 를 오선택한다.
+        - sequence_flows 의 (source/from_id → target/to_id) 관계로 DAG 를 구성하여
+          Kahn 알고리즘으로 topological 정렬 (in-degree 0 후보가 여럿이면 reach_count 큰 것 우선,
+          동률이면 task_order 작은 것 우선).
+        - cycle 이 있거나 sequence_flows 에 포함되지 않은 task 는 task_order 순으로 fallback.
+        - sequence_flows 가 빈약하면 (총 task 수의 25% 미만) topology 대신 task_order 기반 정렬로 fallback.
+        """
+        if not isinstance(raw_tasks, list) or not raw_tasks:
+            return raw_tasks or []
+
+        # task index 및 task_order 보조 키
+        task_by_id: Dict[str, Dict[str, Any]] = {}
+        task_order_by_id: Dict[str, int] = {}
+        original_index: Dict[str, int] = {}
+        for i, t in enumerate(raw_tasks):
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("task_id") or t.get("id") or "").strip()
+            if not tid:
+                continue
+            task_by_id[tid] = t
+            original_index[tid] = i
+            ov = t.get("task_order")
+            if ov is None:
+                ov = t.get("order")
+            try:
+                task_order_by_id[tid] = int(ov) if ov is not None else 10**9
+            except Exception:
+                task_order_by_id[tid] = 10**9
+
+        if not task_by_id:
+            return raw_tasks
+
+        # task_order 기반 단순 정렬 (fallback 으로도 사용)
+        def _task_order_sorted() -> List[Any]:
+            with_id = [t for t in raw_tasks if isinstance(t, dict) and (t.get("task_id") or t.get("id"))]
+            without_id = [t for t in raw_tasks if not (isinstance(t, dict) and (t.get("task_id") or t.get("id")))]
+            with_id.sort(key=lambda t: (
+                task_order_by_id.get(str(t.get("task_id") or t.get("id") or ""), 10**9),
+                str(t.get("name") or ""),
+            ))
+            return with_id + without_id
+
+        flows = raw_flows if isinstance(raw_flows, list) else []
+        # sequence_flows 가 빈약하면 topology 신뢰 불가 — task_order fallback
+        if len(flows) < max(2, len(task_by_id) // 4):
+            return _task_order_sorted()
+
+        # DAG 빌드 (task / gateway / event 모든 노드 포함)
+        adjacency: Dict[str, List[str]] = {}
+        in_degree: Dict[str, int] = {tid: 0 for tid in task_by_id}
+        all_nodes: Set[str] = set(task_by_id.keys())
+
+        def _f_src(f: Dict[str, Any]) -> str:
+            return str(
+                f.get("source")
+                or f.get("from_id")
+                or f.get("from_task_id")
+                or ""
+            ).strip()
+
+        def _f_tgt(f: Dict[str, Any]) -> str:
+            return str(
+                f.get("target")
+                or f.get("to_id")
+                or f.get("to_task_id")
+                or ""
+            ).strip()
+
+        for f in flows:
+            if not isinstance(f, dict):
+                continue
+            s = _f_src(f); t = _f_tgt(f)
+            if not s or not t or s == t:
+                continue
+            all_nodes.add(s); all_nodes.add(t)
+            adjacency.setdefault(s, []).append(t)
+            in_degree[t] = in_degree.get(t, 0) + 1
+            in_degree.setdefault(s, in_degree.get(s, 0))
+
+        # reach_count: 노드 n 에서 도달 가능한 task 노드 수 (자기 자신 포함 시)
+        reach_cache: Dict[str, int] = {}
+
+        def _reach_tasks(start: str) -> int:
+            if start in reach_cache:
+                return reach_cache[start]
+            from collections import deque as _dq
+            visited: Set[str] = {start}
+            dq = _dq([start])
+            while dq:
+                cur = dq.popleft()
+                for nxt in adjacency.get(cur, []):
+                    if nxt in visited:
+                        continue
+                    visited.add(nxt)
+                    dq.append(nxt)
+            cnt = sum(1 for v in visited if v in task_by_id)
+            reach_cache[start] = cnt
+            return cnt
+
+        # Kahn (greedy with priority)
+        remaining_indeg = dict(in_degree)
+        ordered_tasks: List[Dict[str, Any]] = []
+        seen_tasks: Set[str] = set()
+        # node 종류 판별을 위해 task_by_id 외의 노드는 non-task (gateway/event)
+        # priority: task 우선 → **task_order asc** → reach desc → original index asc → id
+        # CRITICAL: extract 단계에서 (I) GLOBAL-ORDER 가 source text 위치 기반으로 task.order 를
+        # 부여했으므로 그 값을 reach_count 보다 우선시한다. reach_count 우선은 LLM 추출 누락으로
+        # 시작점 task ("휴가 신청서 접수") 의 outgoing 이 없을 때, 다른 긴 chain (예: "증빙 보완
+        # 요청" 부터 시작하는 7개 chain) 이 head 로 선정되는 회귀를 만든다.
+        guard_steps = len(remaining_indeg) + 8
+        while remaining_indeg and guard_steps > 0:
+            guard_steps -= 1
+            cands = [n for n, d in remaining_indeg.items() if d == 0]
+            if not cands:
+                # cycle → task_order 가장 작은 task 부터 강제 선택
+                cands = list(remaining_indeg.keys())
+                cands.sort(key=lambda n: (
+                    0 if n in task_by_id else 1,
+                    task_order_by_id.get(n, 10**9),
+                    -_reach_tasks(n),
+                    original_index.get(n, 10**9),
+                    n,
+                ))
+                if not cands:
+                    break
+                chosen = cands[0]
+            else:
+                cands.sort(key=lambda n: (
+                    0 if n in task_by_id else 1,
+                    task_order_by_id.get(n, 10**9),
+                    -_reach_tasks(n),
+                    original_index.get(n, 10**9),
+                    n,
+                ))
+                chosen = cands[0]
+            for nxt in adjacency.get(chosen, []):
+                if nxt in remaining_indeg:
+                    remaining_indeg[nxt] = max(0, remaining_indeg[nxt] - 1)
+            remaining_indeg.pop(chosen, None)
+            if chosen in task_by_id and chosen not in seen_tasks:
+                ordered_tasks.append(task_by_id[chosen])
+                seen_tasks.add(chosen)
+
+        # sequence_flows 에 등장하지 않은 잔여 task 는 task_order 순으로 뒤에 붙임
+        leftover_ids = [tid for tid in task_by_id if tid not in seen_tasks]
+        leftover_ids.sort(key=lambda tid: (
+            task_order_by_id.get(tid, 10**9),
+            original_index.get(tid, 10**9),
+        ))
+        for tid in leftover_ids:
+            ordered_tasks.append(task_by_id[tid])
+
+        # task_id 가 없는 항목들은 끝에 원래 순서로
+        no_id_items = [t for t in raw_tasks if not (isinstance(t, dict) and (t.get("task_id") or t.get("id")))]
+        ordered_tasks.extend(no_id_items)
+        return ordered_tasks
 
     def _build_elements_model_from_extracted(
         self,
@@ -3403,9 +3846,21 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         for t in tasks:
             if isinstance(t, dict):
                 sorted_tasks.append(t)
+
+        def _task_order_value(x: Dict[str, Any]) -> int:
+            v = x.get("task_order")
+            if v is None:
+                v = x.get("order")
+            if v is None:
+                return 10**9
+            try:
+                return int(v)
+            except Exception:
+                return 10**9
+
         sorted_tasks.sort(
             key=lambda x: (
-                10**9 if x.get("order") is None else int(x.get("order") or 0),
+                _task_order_value(x),
                 str(x.get("name") or ""),
             )
         )
@@ -4273,28 +4728,249 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         # Recompute node order after potential insertions (exclude sequences)
         node_order = [str(e.get("id")) for e in elems if e.get("elementType") != "Sequence" and e.get("id")]
 
-        # Connectivity repair: ensure every consecutive node is connected (fallback chain)
-        for i in range(len(node_order) - 1):
-            s = node_order[i]
-            t = node_order[i + 1]
-            if not s or not t or s == t:
+        # Identify start/end ids and structural helpers
+        start_event_ids: Set[str] = {
+            str(e.get("id"))
+            for e in elems
+            if isinstance(e, dict)
+            and e.get("elementType") == "Event"
+            and str(e.get("type") or "").lower().startswith("start")
+            and e.get("id")
+        }
+        end_event_ids: Set[str] = {
+            str(e.get("id"))
+            for e in elems
+            if isinstance(e, dict)
+            and e.get("elementType") == "Event"
+            and str(e.get("type") or "").lower().startswith("end")
+            and e.get("id")
+        }
+        non_event_ids = [nid for nid in node_order if nid not in start_event_ids and nid not in end_event_ids]
+
+        outgoing_count: Dict[str, int] = {}
+        incoming_count: Dict[str, int] = {}
+        for sf in seqs:
+            outgoing_count[str(sf.get("source"))] = outgoing_count.get(str(sf.get("source")), 0) + 1
+            incoming_count[str(sf.get("target"))] = incoming_count.get(str(sf.get("target")), 0) + 1
+
+        # Connectivity repair (conservative):
+        # - Only insert chain edges when the graph is essentially empty (no real sequences),
+        #   so we don't pollute extracted/LLM flows with fabricated ones.
+        # - Otherwise: only ensure start has an outgoing edge, and that "leaf" nodes
+        #   (no outgoing, non-start, non-end) flow into end_event.
+        real_seq_count = sum(
+            1
+            for sf in seqs
+            if str(sf.get("source")) and str(sf.get("target"))
+            and str(sf.get("source")) not in start_event_ids
+            and str(sf.get("target")) not in end_event_ids
+        )
+
+        if real_seq_count == 0:
+            # graph is empty — fall back to a deterministic linear chain
+            chain_order: List[str] = []
+            chain_order.extend(sorted(start_event_ids))
+            chain_order.extend(non_event_ids)
+            chain_order.extend(sorted(end_event_ids))
+            for i in range(len(chain_order) - 1):
+                s = chain_order[i]
+                t = chain_order[i + 1]
+                if not s or not t or s == t:
+                    continue
+                if (s, t) in seq_pairs:
+                    continue
+                seqs.append(
+                    {
+                        "elementType": "Sequence",
+                        "id": f"seq_{s}_{t}",
+                        "name": "",
+                        "source": s,
+                        "target": t,
+                        "condition": "",
+                    }
+                )
+                seq_pairs.add((s, t))
+        else:
+            # ensure start has at least one outgoing edge
+            #
+            # 후보 선택 정책 (회귀 방지):
+            # - non_event_ids 의 1차 순서는 elements 등록 순서(=task_order 순)인데,
+            #   neo4j 의 task_order 또는 extractor LLM 이 잘못된 순서를 부여한 경우
+            #   "최종 결과 통보" 같은 종결 task 가 list 앞에 와 잘못 선택된다.
+            # - 따라서 incoming==0 인 후보가 여러 개일 때는 "그 노드로부터 도달 가능한
+            #   non-event 노드 수가 가장 많은" 노드를 진짜 시작점으로 본다.
+            #   (BPMN 진짜 시작점은 거의 모든 노드에 도달 가능, isolated 잘못된 노드는
+            #    도달 가능 set 이 작다)
+            adjacency: Dict[str, List[str]] = {}
+            for s in seqs:
+                src = str(s.get("source") or "")
+                tgt = str(s.get("target") or "")
+                if src and tgt:
+                    adjacency.setdefault(src, []).append(tgt)
+
+            def _reach_count(start_id: str) -> int:
+                visited: Set[str] = {start_id}
+                stack: List[str] = [start_id]
+                while stack:
+                    cur = stack.pop()
+                    for nxt in adjacency.get(cur, []):
+                        if nxt in visited:
+                            continue
+                        if nxt in start_event_ids or nxt in end_event_ids:
+                            continue
+                        visited.add(nxt)
+                        stack.append(nxt)
+                return len(visited)
+
+            for sid in start_event_ids:
+                if outgoing_count.get(sid, 0) > 0:
+                    continue
+                # 1순위: incoming==0 인 후보 중 "도달 가능한 노드 수" 가 가장 큰 것
+                #        동률이면 outgoing 이 많은 쪽, 또 동률이면 non_event_ids 순서 유지
+                zero_in_candidates = [
+                    nid for nid in non_event_ids
+                    if incoming_count.get(nid, 0) == 0
+                ]
+                preferred = ""
+                if zero_in_candidates:
+                    if len(zero_in_candidates) == 1:
+                        preferred = zero_in_candidates[0]
+                    else:
+                        scored = [
+                            (
+                                _reach_count(nid),
+                                outgoing_count.get(nid, 0),
+                                -non_event_ids.index(nid),  # 안정 정렬 (앞쪽 우선)
+                                nid,
+                            )
+                            for nid in zero_in_candidates
+                        ]
+                        scored.sort(reverse=True)
+                        preferred = scored[0][3]
+                        try:
+                            logger.info(
+                                f"[PROCDEF][START-PICK] candidates={zero_in_candidates} "
+                                f"picked={preferred!r} scores={[(s[0], s[1], s[3]) for s in scored]}"
+                            )
+                        except Exception:
+                            pass
+                if not preferred and non_event_ids:
+                    preferred = non_event_ids[0]
+                if preferred and (sid, preferred) not in seq_pairs:
+                    seqs.append(
+                        {
+                            "elementType": "Sequence",
+                            "id": f"seq_{sid}_{preferred}",
+                            "name": "",
+                            "source": sid,
+                            "target": preferred,
+                            "condition": "",
+                        }
+                    )
+                    seq_pairs.add((sid, preferred))
+                    outgoing_count[sid] = outgoing_count.get(sid, 0) + 1
+                    incoming_count[preferred] = incoming_count.get(preferred, 0) + 1
+
+            # connect real "leaf" non-event nodes to end_event (no outgoing of their own)
+            for eid in end_event_ids:
+                for nid in non_event_ids:
+                    if outgoing_count.get(nid, 0) > 0:
+                        continue
+                    if nid in start_event_ids or nid in end_event_ids:
+                        continue
+                    if (nid, eid) in seq_pairs:
+                        continue
+                    seqs.append(
+                        {
+                            "elementType": "Sequence",
+                            "id": f"seq_{nid}_{eid}",
+                            "name": "",
+                            "source": nid,
+                            "target": eid,
+                            "condition": "",
+                        }
+                    )
+                    seq_pairs.add((nid, eid))
+                    outgoing_count[nid] = outgoing_count.get(nid, 0) + 1
+                    incoming_count[eid] = incoming_count.get(eid, 0) + 1
+
+        # ----------------------------------------------------------------
+        # Orphan terminal task 보정 (회귀 방지)
+        # ----------------------------------------------------------------
+        # 추출 LLM 이 종결 task (예: "최종 결과 통보") 의 incoming sequence 를 누락하면
+        # 해당 task 는 incoming==0 인 채로 outgoing 만 end_event 에 가는 고아 노드가 된다.
+        # 이런 형태는 BPMN 상 무의미하므로 (start 와 연결도 없음) 다른 종결 path 들을
+        # orphan_terminal 로 우회시켜 의미상 마지막 합류점으로 통합한다.
+        #
+        # 조건:
+        #   - incoming_count == 0 (start-pick 이후 기준)
+        #   - 모든 outgoing 이 end_event 로만 향함
+        #   - 그런 task 가 정확히 1개일 때만 적용 (모호한 경우 미적용)
+        # ----------------------------------------------------------------
+        orphan_terminal_id = ""
+        orphan_terminal_multiple = False
+        for nid in non_event_ids:
+            if incoming_count.get(nid, 0) > 0:
                 continue
-            if (s, t) in seq_pairs:
+            if nid in start_event_ids or nid in end_event_ids:
                 continue
-            seqs.append(
-                {
-                    "elementType": "Sequence",
-                    "id": f"seq_{s}_{t}",
-                    "name": "",
-                    "source": s,
-                    "target": t,
-                    "condition": "",
-                }
-            )
-            seq_pairs.add((s, t))
+            # start_event 에서 직접 outgoing 받은 node 는 (sid, nid) in seq_pairs 로 식별
+            if any((sid, nid) in seq_pairs for sid in start_event_ids):
+                continue
+            my_outs = [s for s in seqs if str(s.get("source")) == nid]
+            if not my_outs:
+                continue
+            if not all(str(s.get("target")) in end_event_ids for s in my_outs):
+                continue
+            if orphan_terminal_id and orphan_terminal_id != nid:
+                orphan_terminal_multiple = True
+                break
+            orphan_terminal_id = nid
+
+        if orphan_terminal_id and not orphan_terminal_multiple:
+            other_end_inbounds = [
+                s for s in seqs
+                if str(s.get("target")) in end_event_ids
+                and str(s.get("source")) != orphan_terminal_id
+                and str(s.get("source")) not in start_event_ids
+            ]
+            if other_end_inbounds:
+                try:
+                    logger.info(
+                        f"[PROCDEF][ORPHAN-TERMINAL] divert other end-inbound paths to orphan "
+                        f"terminal={orphan_terminal_id!r} "
+                        f"diverted_sources={[str(s.get('source')) for s in other_end_inbounds]}"
+                    )
+                except Exception:
+                    pass
+                for s in other_end_inbounds:
+                    old_src = str(s.get("source") or "")
+                    old_tgt = str(s.get("target") or "")
+                    if not old_src or not old_tgt or old_src == orphan_terminal_id:
+                        continue
+                    # source → orphan_terminal 가 이미 있으면 기존 sequence 제거
+                    if (old_src, orphan_terminal_id) in seq_pairs:
+                        seq_pairs.discard((old_src, old_tgt))
+                        incoming_count[old_tgt] = max(0, incoming_count.get(old_tgt, 0) - 1)
+                        s["__drop__"] = True
+                        continue
+                    seq_pairs.discard((old_src, old_tgt))
+                    s["target"] = orphan_terminal_id
+                    s["id"] = f"seq_{old_src}_{orphan_terminal_id}"
+                    seq_pairs.add((old_src, orphan_terminal_id))
+                    incoming_count[old_tgt] = max(0, incoming_count.get(old_tgt, 0) - 1)
+                    incoming_count[orphan_terminal_id] = incoming_count.get(orphan_terminal_id, 0) + 1
+                seqs = [s for s in seqs if not (isinstance(s, dict) and s.get("__drop__"))]
 
         # Gateway branching: enforce explicit Gateway nodes for any branching point.
         # If a non-gateway node has multiple outgoing flows, insert an ExclusiveGateway and reroute.
+        #
+        # 이전에는 "condition 이 명시된 outgoing 이 하나라도 있어야" gateway 를 만들도록
+        # 보수적으로 두었으나, 추출 LLM 이 분기 task 의 outgoing 들에 condition 을 빠뜨리면
+        # multi-outgoing 이 그대로 task→task 다중 흐름으로 남아 BPMN 표준에 맞지 않는
+        # "task 가 분기점" 패턴이 생겨버린다 (예: "휴가 신청서 접수" 가 outgoing 2개).
+        # → multi-outgoing 인 non-gateway 노드는 모두 ExclusiveGateway 로 래핑한다.
+        # 단, 이미 다운스트림에 gateway 가 있다면 (분기가 다른 곳에서 모델링됐다면) 건너뛴다.
         outgoing_by_source: Dict[str, List[Dict[str, Any]]] = {}
         for s in seqs:
             outgoing_by_source.setdefault(str(s.get("source")), []).append(s)
@@ -4302,12 +4978,38 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             str(e.get("id")): e for e in elems if isinstance(e, dict) and e.get("id")
         }
 
+        # Does this source already feed directly into an existing Gateway? If so, real branching
+        # is already represented downstream and we should not insert a second wrapper gateway.
+        def _has_downstream_gateway(src_id: str, outs_list: List[Dict[str, Any]]) -> bool:
+            for s in outs_list:
+                tgt = str(s.get("target") or "").strip()
+                tgt_el = element_by_id_for_branching.get(tgt) or {}
+                if str(tgt_el.get("elementType") or "") == "Gateway":
+                    return True
+            return False
+
         for src_id, outs in list(outgoing_by_source.items()):
             if len(outs) <= 1:
                 continue
             src_el = element_by_id_for_branching.get(src_id) or {}
             if str(src_el.get("elementType") or "") == "Gateway":
                 continue
+
+            # Skip if any outgoing already targets a Gateway (branching already modelled)
+            if _has_downstream_gateway(src_id, outs):
+                continue
+
+            # NOTE: 과거에는 condition 이 하나라도 있어야만 wrap 했지만
+            # 추출 LLM 의 condition 누락이 일상적이라 그 가드를 제거한다.
+            # multi-outgoing 자체가 BPMN 표준상 분기 의미이고, 게이트웨이로 표현해야 옳다.
+            try:
+                logger.info(
+                    f"[PROCDEF][GW-WRAP] wrapping multi-outgoing source={src_id!r} "
+                    f"branch_count={len(outs)} "
+                    f"branch_targets={[str(s.get('target') or '') for s in outs]}"
+                )
+            except Exception:
+                pass
 
             src_name = str(src_el.get("name") or "").strip()
             src_desc = str(src_el.get("description") or "").strip()
@@ -6308,6 +7010,10 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         logger.info(f"[START] PDF2BPMN task: {user_input[:100] if user_input else 'N/A'}... (job_id: {job_id})")
         
         temp_paths_to_cleanup: Set[str] = set()
+        # finally 에서 AGE 그래프를 정리하기 위한 핸들. try 진입 전에 초기화하여
+        # 부분 실패 상황에서도 NameError 없이 안전하게 drop 시도할 수 있도록 한다.
+        workflow: Optional[Any] = None  # type: ignore[name-defined]
+        age_graph_name_for_cleanup: str = ""
         
         try:
             # 2. 작업 시작 이벤트
@@ -6332,6 +7038,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 f"[GRAPH] AGE graph scope selected: tenant='{effective_tenant_id}', "
                 f"todo='{task_id}', graph='{age_graph_name}'"
             )
+            age_graph_name_for_cleanup = str(age_graph_name or "")
             if not input_files:
                 pdf_url_fallback = (parsed.get("pdf_url") or "").strip()
                 if pdf_url_fallback:
@@ -6424,6 +7131,17 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             preloaded_chunks: List[ReferenceChunk] = []
             total_reused_embeddings = 0
 
+            # 사용자 [도구 설정] pdf2bpmnLevel 을 SOP 분할 단계에서 사용하기 위해 미리 추출.
+            # 이후 workflow.set_dedup_level 호출은 dedup 임계 적용용으로 동일 값을 다시 사용한다.
+            try:
+                _ts_for_section = parsed.get("tool_settings") or {}
+                _seg_level = (_ts_for_section.get("pdf2bpmnLevel") or "standard").strip().lower()
+                if _seg_level not in {"concise", "standard", "detailed"}:
+                    _seg_level = "standard"
+            except Exception:
+                _seg_level = "standard"
+            logger.info(f"[SECTION-LEVEL] pdf2bpmnLevel='{_seg_level}' applied to SOP segmentation")
+
             for idx, file_info in enumerate(input_files, start=1):
                 file_url = (file_info.get("url") or "").strip()
                 display_name = (file_info.get("name") or f"document_{idx}").strip() or f"document_{idx}"
@@ -6458,6 +7176,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         display_name=display_name,
                         source=f"memento://{file_path or display_name}",
                         memento_chunks=memento_chunks,
+                        pdf2bpmn_level=_seg_level,
                     )
                     if not docs or not chs:
                         raise Exception(
@@ -6590,6 +7309,25 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     event_queue.enqueue_event(evt)
 
             workflow = PDF2BPMNWorkflow(graph_name=age_graph_name)
+
+            # 사용자 [도구 설정] 다이얼로그에서 선택한 dedup 강도 적용.
+            # 메인 에이전트가 [InputData].tool_settings 로 넣어 준 값을 _parse_query 가 보존했고,
+            # 여기서 workflow 의 임계값을 일괄 오버라이드한다.
+            #   - "concise"  : 임계 ↓ → 간결한 결과
+            #   - "standard" : Config 기본값 (안 넣어도 동일)
+            #   - "detailed" : 임계 ↑ → 원문에 가까운 자세한 결과
+            try:
+                tool_settings_in = parsed.get("tool_settings") or {}
+                pdf2bpmn_level = (tool_settings_in.get("pdf2bpmnLevel") or "standard").strip().lower()
+                workflow.set_dedup_level(pdf2bpmn_level)
+                logger.info(
+                    f"[DEDUP] User pdf2bpmnLevel='{pdf2bpmn_level}' applied "
+                    f"(tool_settings={tool_settings_in})"
+                )
+            except Exception as exc:
+                logger.warning(f"[DEDUP] tool_settings 적용 실패 → standard 유지: {exc}")
+                workflow.set_dedup_level("standard")
+
             state: Dict[str, Any] = {
                 # pdf_paths 는 메멘토 재사용 흐름에서는 사용하지 않지만, 워크플로우 state 스키마 호환을 위해 빈 리스트로 둔다.
                 "pdf_paths": [],
@@ -7031,13 +7769,50 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 logger.info(f"[DEBUG] Processing extracted process {idx+1}/{total_bpmn}: {process_name}")
 
                 # extracted info -> ProcessGPT definition + BPMN XML
+                # NOTE: Neo4j collect(DISTINCT t {.*}) does NOT preserve order; tasks come back arbitrary.
+                # 게다가 추출 LLM 이 task.order 를 잘못 부여할 수 있어 (예: 종결 task 가 order=1)
+                # task_order 단순 정렬은 시작 task 를 오선택한다.
+                # → detail.sequence_flows 의 topological order 로 정렬 (cycle/누락은 task_order fallback).
+                #   LLM/deterministic generator 모두 "extracted.tasks 의 순서" 를 신뢰하므로
+                #   이 단계의 정렬이 BPMN 시작 task 와 흐름을 결정한다.
+                raw_tasks = detail.get("tasks") or []
+                raw_flows = detail.get("sequence_flows") or detail.get("flows") or []
+                if isinstance(raw_tasks, list):
+                    sorted_tasks_payload = self._topological_sort_tasks(
+                        raw_tasks,
+                        raw_flows if isinstance(raw_flows, list) else [],
+                    )
+                    # task_order backbone 으로 isolated task 보강.
+                    # 이때 sorted_tasks_payload 가 task_order asc 순으로 (I) GLOBAL-ORDER 결과를
+                    # 반영하므로, source text 위치 순서대로 backbone 이 만들어진다.
+                    augmented_flows = self._augment_sequence_flows_for_isolated_tasks(
+                        sorted_tasks_payload,
+                        raw_flows if isinstance(raw_flows, list) else [],
+                    )
+                    try:
+                        sample_names = [
+                            str(t.get("name") or "")
+                            for t in sorted_tasks_payload[:5]
+                            if isinstance(t, dict)
+                        ]
+                        logger.info(
+                            f"[PROCDEF][TOPO-SORT] proc={process_name!r} tasks={len(sorted_tasks_payload)} "
+                            f"flows_in={len(raw_flows) if isinstance(raw_flows, list) else 0} "
+                            f"flows_out={len(augmented_flows)} "
+                            f"head={sample_names}"
+                        )
+                    except Exception:
+                        pass
+                else:
+                    sorted_tasks_payload = []
+                    augmented_flows = raw_flows if isinstance(raw_flows, list) else []
                 extracted_payload = {
                     "process": detail.get("process") or {},
-                    "tasks": detail.get("tasks") or [],
+                    "tasks": sorted_tasks_payload,
                     "roles": detail.get("roles") or [],
                     "gateways": detail.get("gateways") or [],
                     "events": detail.get("events") or [],
-                    "sequence_flows": detail.get("sequence_flows") or detail.get("flows") or [],
+                    "sequence_flows": augmented_flows,
                 }
 
                 # legacy flow is intentionally removed
@@ -7225,9 +8000,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     all_bpmn_xmls[proc_def_id] = None
                 
                 # saved_processes에 bpmn_xml 포함
+                #   - neo4j_proc_id 를 함께 저장하여 프론트가 process_graphs 캐시를
+                #     `neo4j_proc_id` 키로 매칭할 수 있도록 한다.
                 saved_processes.append({
                     "id": proc_def_id,
                     "name": process_name,
+                    "neo4j_proc_id": str(proc_id),
                     "bpmn_xml": all_bpmn_xmls.get(proc_def_id)  # XML 생성 비활성화: None
                 })
 
@@ -7480,6 +8258,38 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     }
                 )
 
+            # ----------------------------------------------------------------
+            # AGE 그래프 elements 추출
+            #   - ScaledJob 워커는 처리 후 Pod 가 종료되므로 외부에서 AGE 를 쿼리할
+            #     수단(API 서버)이 없다. 따라서 그래프 미리보기에 필요한 데이터를
+            #     워커가 처리 종료 직전에 모두 추출해 결과 메시지에 함께 첨부한다.
+            #   - 프론트는 이 첨부 데이터를 그대로 렌더링하므로 별도 API 호출 불필요.
+            #   - 추출 후 finally 블록에서 AGE 의 그래프 자체는 drop 한다 (정리).
+            # ----------------------------------------------------------------
+            integrated_graph_full: Dict[str, Any] = {"elements": [], "counts": {"nodes": 0, "edges": 0}}
+            process_graphs: Dict[str, Any] = {}
+            try:
+                integrated_graph_full = workflow.neo4j.get_full_graph_elements(max_nodes=3000) or {
+                    "elements": [], "counts": {"nodes": 0, "edges": 0}
+                }
+                for p in saved_processes:
+                    pid = str(p.get("neo4j_proc_id") or p.get("id") or "").strip()
+                    if not pid:
+                        continue
+                    try:
+                        process_graphs[pid] = workflow.neo4j.get_process_graph_elements(pid) or {
+                            "elements": [], "counts": {"nodes": 0, "edges": 0}
+                        }
+                    except Exception as exc_proc:
+                        logger.warning(f"[GRAPH] process({pid}) elements 추출 실패: {exc_proc}")
+                logger.info(
+                    f"[GRAPH] elements 추출 완료 — full: nodes={integrated_graph_full.get('counts', {}).get('nodes', 0)}, "
+                    f"edges={integrated_graph_full.get('counts', {}).get('edges', 0)}, "
+                    f"per_process: {len(process_graphs)} 개"
+                )
+            except Exception as exc_full:
+                logger.warning(f"[GRAPH] AGE elements 추출 실패 (그래프 미리보기 누락 가능): {exc_full}")
+
             final_result = {
                 "message": completed_message,
                 "status": "completed",
@@ -7493,6 +8303,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 "saved_processes": saved_processes,  # bpmn_xml 포함
                 "saved_skills": saved_skills_summary,
                 "saved_agents": saved_agents_summary,
+                # 프론트 그래프 미리보기 전용 payload (final_artifact 와 동일 내용)
+                #   - 이 데이터로 프론트는 외부 API 호출 없이 그래프를 즉시 렌더링한다.
+                #   - integrated_graph: 통합(전체) 그래프 elements (showIntegratedGraphByTask 용)
+                #   - process_graphs: { neo4j_proc_id: { elements, counts } }
+                "integrated_graph": integrated_graph_full,
+                "process_graphs": process_graphs,
+                "graph_name": str(getattr(workflow, "neo4j", None) and workflow.neo4j.graph_name or ""),
                 "generated_at": datetime.now(timezone.utc).isoformat()
             }
             
@@ -7500,7 +8317,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # 이 이벤트가 프론트엔드에서 최종 결과로 사용됨
             # saved_processes에서 요약 정보만 추출 (draft 크기 제한 고려)
             saved_processes_summary = [
-                {"id": p["id"], "name": p["name"]} for p in saved_processes
+                {
+                    "id": p["id"],
+                    "name": p["name"],
+                    "neo4j_proc_id": p.get("neo4j_proc_id") or "",
+                }
+                for p in saved_processes
             ]
             
             final_artifact_data = {
@@ -7515,6 +8337,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 "saved_skills": saved_skills_summary,
                 "saved_agents": saved_agents_summary,
                 "bpmn_xmls": all_bpmn_xmls,  # 모든 XML 내용
+                # 프론트 그래프 미리보기 전용 payload.
+                #  - integrated_graph: 통합(전체) 그래프 elements (showIntegratedGraphByTask 용)
+                #  - process_graphs: { neo4j_proc_id: { elements, counts } } (프로세스별 그래프 미리보기용)
+                # 프론트는 우선 이 데이터를 사용하며, 없을 때만 외부 API 로 fallback 한다.
+                "integrated_graph": integrated_graph_full,
+                "process_graphs": process_graphs,
+                "graph_name": str(getattr(workflow, "neo4j", None) and workflow.neo4j.graph_name or ""),
                 "success": True,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "task_type": "pdf2bpmn"
@@ -7580,6 +8409,23 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         logger.info(f"[CLEANUP] Removed temp file: {p}")
                 except Exception as e:
                     logger.warning(f"[WARN] Failed to remove temp file: {e}")
+
+            # AGE 그래프 정리
+            #   - 처리 결과(노드/엣지 elements)는 위에서 final_artifact 에 첨부했고,
+            #     프론트는 그 첨부 데이터로 그래프를 렌더링한다.
+            #   - 따라서 이 ScaledJob 워커가 종료되기 전 AGE 인스턴스에 남은 그래프를
+            #     drop 하여 데이터가 무한정 부풀지 않도록 정리한다.
+            try:
+                if age_graph_name_for_cleanup and workflow is not None and getattr(workflow, "neo4j", None):
+                    dropped = workflow.neo4j.drop_graph(age_graph_name_for_cleanup)
+                    if dropped:
+                        logger.info(f"[CLEANUP] AGE graph dropped: {age_graph_name_for_cleanup}")
+                    else:
+                        logger.info(
+                            f"[CLEANUP] AGE graph not dropped (missing or skipped): {age_graph_name_for_cleanup}"
+                        )
+            except Exception as e:
+                logger.warning(f"[WARN] AGE graph drop 실패: {e}")
             
             # HTTP 클라이언트 정리
             if self.http_client:

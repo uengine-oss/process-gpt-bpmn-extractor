@@ -70,6 +70,33 @@ _TASK_NOUN_STOP_TOKENS: set[str] = {
 }
 
 
+# Dedup 강도 프리셋. 사용자가 [도구 설정] 다이얼로그에서 선택한 값에 따라
+# normalize_entities 안의 임계값들이 일괄 오버라이드된다.
+#   - concise  : 임계 ↓ → 더 잘 합쳐짐 (프로세스 간소화)
+#   - standard : 기본값 그대로 사용 (Config.* 값)
+#   - detailed : 임계 ↑ → 거의 안 합쳐짐 (원문 절차 유지)
+# 각 프리셋은 partial dict — 명시되지 않은 키는 Config 기본값을 그대로 사용한다.
+_DEDUP_LEVEL_PROFILES: dict[str, dict[str, float]] = {
+    "concise": {
+        "TASK_SEMANTIC_COSINE_MIN": 0.78,
+        "TASK_SEMANTIC_HIGH_COSINE": 0.86,
+        "TASK_NOUN_JACCARD_MIN": 0.40,
+        "ROLE_SEMANTIC_COSINE_MIN": 0.86,
+        "TASK_SAME_NAME_INSTR_COSINE_SAME_ROLE": 0.65,
+        "TASK_SAME_NAME_INSTR_COSINE_DIFF_ROLE": 0.72,
+    },
+    "standard": {},  # Config 기본값 사용
+    "detailed": {
+        "TASK_SEMANTIC_COSINE_MIN": 0.93,
+        "TASK_SEMANTIC_HIGH_COSINE": 0.97,
+        "TASK_NOUN_JACCARD_MIN": 0.80,
+        "ROLE_SEMANTIC_COSINE_MIN": 0.97,
+        "TASK_SAME_NAME_INSTR_COSINE_SAME_ROLE": 0.92,
+        "TASK_SAME_NAME_INSTR_COSINE_DIFF_ROLE": 0.97,
+    },
+}
+
+
 class PDF2BPMNWorkflow:
     """Orchestrates the PDF to BPMN conversion workflow."""
     
@@ -95,6 +122,28 @@ class PDF2BPMNWorkflow:
         self.process_name_to_id = {}
         self.role_name_to_id = {}
         self.task_name_to_id = {}
+
+        # 이름이 같은 task 페어의 instruction/description 임베딩 cosine 캐시.
+        # key = sorted (task_id_a, task_id_b). value = float | None (None = 비교 불가).
+        # 같은 워크플로우 인스턴스 안에서만 유효 (normalize 시작 시 reset).
+        self._instr_sim_cache: dict[tuple[str, str], float | None] = {}
+
+        # Dedup 강도 (사용자 선택값). agent_executor 가 set_dedup_level() 로 설정한다.
+        # _dedup_overrides 는 _cfg() 가 Config 보다 우선해서 사용한다.
+        self._dedup_level: str = "standard"
+        self._dedup_overrides: dict[str, float] = {}
+
+        # ----------------------------------------------------------------
+        # Global task order tracking (회귀 방지: SOP segmentation 으로 인한 order 충돌)
+        # ----------------------------------------------------------------
+        # SOP segmentation 이 강화된 이후 (commit 5662a2e) 문서가 여러 section 으로
+        # 분할되어 entity_extractor 가 section 단위로 호출된다. 각 section 안에서
+        # task.order 가 독립적으로 1..N 으로 부여되므로, 다른 section 의 첫 task 와
+        # order 가 충돌하여 시작 task 가 비결정적으로 뽑힌다.
+        # → 각 task 마다 (section_index, section.content 내 첫 등장 offset) 를 기록하고,
+        #   모든 section 처리 후 그 키로 글로벌 정렬하여 task.order 를 재할당한다.
+        # key: task_id -> (section_index, byte_offset_in_section)
+        self._task_global_order_key: dict[str, tuple[int, int]] = {}
     
     def ingest_pdf(self, state: GraphState) -> GraphState:
         """Node: Ingest PDF and extract document structure."""
@@ -145,6 +194,76 @@ class PDF2BPMNWorkflow:
             "current_step": "extract_candidates"
         }
     
+    def _record_task_global_order_keys(
+        self,
+        *,
+        section_index: int,
+        section_content: str,
+        new_tasks: list,
+    ) -> None:
+        """각 task 의 (section_index, section.content 내 첫 등장 offset) 을 기록.
+
+        - section.content 안에서 task.name 이 처음 등장하는 위치를 정렬 키로 사용한다.
+        - LLM 이 section 내부에서 잘못된 order 를 부여해도, source text 위치가 truth source.
+        - 같은 task 이름이 여러 section 에 나타나면 normalize 단계에서 merge 되므로
+          여기서는 별도 처리 없이 첫 등장 위치만 저장한다.
+        """
+        if not new_tasks:
+            return
+        content_low = str(section_content or "").lower()
+        for t in new_tasks:
+            tid = getattr(t, "task_id", None)
+            if not tid:
+                continue
+            if tid in self._task_global_order_key:
+                continue
+            name = str(getattr(t, "name", "") or "").strip().lower()
+            pos = -1
+            if name and content_low:
+                pos = content_low.find(name)
+                if pos < 0:
+                    # 첫 단어만 잡아도 의미상 충분 (소수의 token 차이 보정)
+                    first_tok = name.split()[0] if name.split() else ""
+                    if first_tok and len(first_tok) >= 2:
+                        pos = content_low.find(first_tok)
+            if pos < 0:
+                pos = 10**9
+            self._task_global_order_key[tid] = (section_index, pos)
+
+    def _reassign_global_task_order(self, all_tasks: list) -> None:
+        """모든 section 처리 후 task.order 를 글로벌 위치 기반으로 재할당."""
+        if not all_tasks:
+            return
+        indexed: list[tuple[tuple[int, int], int, object]] = []
+        for i, t in enumerate(all_tasks):
+            tid = getattr(t, "task_id", None) or ""
+            key = self._task_global_order_key.get(tid, (10**9, 10**9))
+            indexed.append((key, i, t))
+        indexed.sort(key=lambda x: (x[0], x[1]))
+
+        name_to_assigned_order: dict[str, int] = {}
+        next_order = 1
+        for _, _, t in indexed:
+            nm = str(getattr(t, "name", "") or "").strip().lower()
+            if nm and nm in name_to_assigned_order:
+                t.order = name_to_assigned_order[nm]
+                continue
+            t.order = next_order
+            if nm:
+                name_to_assigned_order[nm] = next_order
+            next_order += 1
+        try:
+            head_names = [
+                f"{getattr(t, 'order', '?')}.{getattr(t, 'name', '?')!r}"
+                for _, _, t in indexed[:6]
+            ]
+            print(
+                f"   📊 [GLOBAL-ORDER] reassigned task.order for {len(all_tasks)} tasks. "
+                f"head6={head_names}"
+            )
+        except Exception:
+            pass
+
     def extract_candidates(self, state: GraphState) -> GraphState:
         """Node: Extract process/task/role candidates from sections."""
         print("🔍 Extracting candidate entities...")
@@ -173,8 +292,19 @@ class PDF2BPMNWorkflow:
         # 문서별 엔티티 컨텍스트 (다중 파일일 때 서로 다른 문서 간 과도한 병합 방지)
         doc_process_name_to_id = {}
         doc_role_name_to_id = {}
-        
-        for section in sections:
+
+        # SOP segmentation 으로 section 순서가 비결정적으로 반환될 수 있어
+        # page_from(보조: page_to) 기준으로 안정 정렬한 뒤 순회한다.
+        sections_sorted = sorted(
+            sections,
+            key=lambda s: (
+                int(getattr(s, "page_from", 0) or 0),
+                int(getattr(s, "page_to", 0) or 0),
+                str(getattr(s, "section_id", "") or ""),
+            ),
+        )
+
+        for section_index, section in enumerate(sections_sorted):
             if not section.content or len(section.content.strip()) < 50:
                 continue
             
@@ -231,7 +361,14 @@ class PDF2BPMNWorkflow:
             
             # Collect entities
             all_processes.extend(entities["processes"])
-            all_tasks.extend(entities["tasks"])
+            new_tasks_for_section = entities.get("tasks") or []
+            all_tasks.extend(new_tasks_for_section)
+            # 각 task 의 글로벌 정렬 키 (section_index, offset_in_section_content) 기록
+            self._record_task_global_order_keys(
+                section_index=section_index,
+                section_content=section.content,
+                new_tasks=new_tasks_for_section,
+            )
             all_roles.extend(entities["roles"])
             all_gateways.extend(entities["gateways"])
             all_events.extend(entities["events"])
@@ -270,7 +407,11 @@ class PDF2BPMNWorkflow:
                 doc_role_name_to_id[section_doc_id][role.name.lower()] = role.role_id
             for task in entities["tasks"]:
                 self.task_name_to_id[task.name.lower()] = task.task_id
-        
+
+        # SOP segmentation 으로 section 단위 호출이 끝난 후, 글로벌 task.order 재할당.
+        # 각 task 의 section 내 첫 등장 offset 으로 정렬 → BPMN 흐름이 source text 와 일치.
+        self._reassign_global_task_order(all_tasks)
+
         return {
             "processes": all_processes,
             "tasks": all_tasks,
@@ -300,8 +441,15 @@ class PDF2BPMNWorkflow:
         chunks = state.get("reference_chunks", [])
         is_multi_doc = len({s.doc_id for s in sections if getattr(s, "doc_id", None)}) > 1
         
-        # Filter valid sections
+        # Filter valid sections + SOP segmentation 출력 순서 안정화 (page_from 기준)
         valid_sections = [s for s in sections if s.content and len(s.content.strip()) >= 50]
+        valid_sections.sort(
+            key=lambda s: (
+                int(getattr(s, "page_from", 0) or 0),
+                int(getattr(s, "page_to", 0) or 0),
+                str(getattr(s, "section_id", "") or ""),
+            )
+        )
         total_sections = len(valid_sections)
         
         # Create chunk index for linking
@@ -391,7 +539,14 @@ class PDF2BPMNWorkflow:
                 
                 # Collect entities
                 all_processes.extend(entities["processes"])
-                all_tasks.extend(entities["tasks"])
+                new_tasks_for_section = entities.get("tasks") or []
+                all_tasks.extend(new_tasks_for_section)
+                # 각 task 의 글로벌 정렬 키 (section_index, offset_in_section_content) 기록
+                self._record_task_global_order_keys(
+                    section_index=i,
+                    section_content=section.content,
+                    new_tasks=new_tasks_for_section,
+                )
                 all_roles.extend(entities["roles"])
                 all_gateways.extend(entities["gateways"])
                 all_events.extend(entities["events"])
@@ -432,7 +587,10 @@ class PDF2BPMNWorkflow:
             except Exception as e:
                 print(f"   ⚠️ 청크 {i+1} 처리 중 오류: {e}")
                 continue
-        
+
+        # SOP segmentation 으로 section 단위 호출이 끝난 후 글로벌 task.order 재할당
+        self._reassign_global_task_order(all_tasks)
+
         return {
             "processes": all_processes,
             "tasks": all_tasks,
@@ -448,7 +606,11 @@ class PDF2BPMNWorkflow:
     def normalize_entities(self, state: GraphState) -> GraphState:
         """Node: Normalize and deduplicate entities using vector search."""
         print("🔄 Normalizing and deduplicating entities...")
-        
+
+        # 정규화 시작마다 instruction-similarity 캐시 초기화.
+        # (재호출/재실행 시 stale 비교가 누적되지 않도록)
+        self._instr_sim_cache = {}
+
         processes = state.get("processes", [])
         tasks = state.get("tasks", [])
         roles = state.get("roles", [])
@@ -626,22 +788,45 @@ class PDF2BPMNWorkflow:
                 tasks_by_process[proc_id] = []
             tasks_by_process[proc_id].append(task)
         
-        # Create sequence flows for each process based on task order
-        for proc_id, proc_tasks in tasks_by_process.items():
-            sorted_tasks = sorted(proc_tasks, key=lambda t: t.order)
-            
-            for i in range(len(sorted_tasks) - 1):
-                from_task = sorted_tasks[i]
-                to_task = sorted_tasks[i + 1]
-                
-                if (from_task.task_id, to_task.task_id) not in created_flows:
-                    self.neo4j.link_task_sequence(from_task.task_id, to_task.task_id)
-                    created_flows.add((from_task.task_id, to_task.task_id))
-        
-        # Also use Neo4j to create sequences for each process
-        for proc in processes:
-            self.neo4j.create_task_sequence_for_process(proc.proc_id)
-        
+        # Create sequence flows for each process based on task order.
+        # ----------------------------------------------------------------
+        # CRITICAL (regression guard):
+        # 추출 LLM 이 task 에 부여한 `order` 가 잘못되면 (예: 종결 task 인 "최종 결과 통보"가
+        # order=1 로 부여) task_order 순 자동 chain 이 거꾸로 된 NEXT 관계를 Neo4j 에
+        # 영구 저장하여, 이후 generator/validator 가 그 가짜 관계를 sequence 로 사용 →
+        # BPMN 의 시작 task 가 뒤바뀌는 회귀가 발생한다.
+        # 이를 막기 위해 LLM 이 명시적으로 추출한 sequence_flows 가 task 수 절반 이상이면
+        # task_order 기반 자동 chain 생성 자체를 건너뛴다. (LLM 이 이미 흐름을 충분히
+        # 명시했다고 신뢰)
+        # ----------------------------------------------------------------
+        total_tasks = sum(len(v) for v in tasks_by_process.values())
+        explicit_count = len(created_flows)
+        auto_chain_threshold = max(1, total_tasks // 2)
+        skip_auto_chain = explicit_count >= auto_chain_threshold
+
+        if skip_auto_chain:
+            print(
+                f"   ⏭️ Skip task_order auto-chain: explicit_flows={explicit_count}, "
+                f"tasks={total_tasks} (threshold={auto_chain_threshold}). "
+                "LLM 이 흐름을 명시했으므로 task_order 기반 가짜 NEXT 를 만들지 않음."
+            )
+        else:
+            for proc_id, proc_tasks in tasks_by_process.items():
+                sorted_tasks = sorted(proc_tasks, key=lambda t: t.order)
+                for i in range(len(sorted_tasks) - 1):
+                    from_task = sorted_tasks[i]
+                    to_task = sorted_tasks[i + 1]
+                    if (from_task.task_id, to_task.task_id) not in created_flows:
+                        self.neo4j.link_task_sequence(from_task.task_id, to_task.task_id)
+                        created_flows.add((from_task.task_id, to_task.task_id))
+
+        # Also use Neo4j to create sequences for each process — same defensive gate.
+        # create_task_sequence_for_process 도 task_order 순으로 NEXT 를 일괄 생성하므로
+        # 동일하게 가짜 chain 의 원인이 될 수 있다.
+        if not skip_auto_chain:
+            for proc in processes:
+                self.neo4j.create_task_sequence_for_process(proc.proc_id)
+
         print(f"   Created {len(created_flows)} sequence flows (NEXT relationships)")
     
     def _infer_task_role_relationships(self, tasks: list, roles: list):
@@ -1167,8 +1352,70 @@ class PDF2BPMNWorkflow:
             if old_id in self.task_role_map and old_id != new_id:
                 self.task_role_map[new_id] = self.task_role_map[old_id]
 
+        # NEW: merge 로 사라진 task id 를 가리키는 sequence_flows / task_process_map 도 함께 remap.
+        # - 이 단계가 빠지면 self.sequence_flows 가 stale id 를 가진 채 _create_sequence_flows 로 흘러가
+        #   silent 하게 flow 가 drop 되고, 결과적으로 LLM 에 전달되는 extracted.sequence_flows 가
+        #   부실해진다. (LLM 이 task 순서를 추론하지 못해 임의 정렬하는 회귀의 직접 원인.)
+        self._apply_task_id_remap(task_id_mapping)
+
         return merged_tasks, task_id_mapping
-    
+
+    def _apply_task_id_remap(self, task_id_mapping: dict) -> None:
+        """task merge 결과(old_id → new_id)를 sequence_flows / task_process_map 에 일괄 반영.
+
+        - self.sequence_flows 의 from_id/to_id/from_task_id/to_task_id 를 모두 remap
+        - self-loop (양 끝이 같아진 flow) 제거
+        - (from, to) 중복 제거
+        - self.task_process_map 의 키도 새 id 로 이동
+        """
+        if not task_id_mapping:
+            return
+
+        try:
+            remapped_count = 0
+            seen_pairs: set[tuple[str, str]] = set()
+            deduped_flows: list = []
+            for flow in self.sequence_flows or []:
+                if not isinstance(flow, dict):
+                    continue
+                new_flow = dict(flow)
+                for key in ("from_id", "from_task_id", "to_id", "to_task_id"):
+                    v = new_flow.get(key)
+                    if isinstance(v, str) and v in task_id_mapping:
+                        new_flow[key] = task_id_mapping[v]
+                        remapped_count += 1
+                fid = new_flow.get("from_id") or new_flow.get("from_task_id") or ""
+                tid = new_flow.get("to_id") or new_flow.get("to_task_id") or ""
+                if fid and tid and fid == tid:
+                    continue
+                pair = (str(fid), str(tid))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                deduped_flows.append(new_flow)
+
+            before = len(self.sequence_flows or [])
+            after = len(deduped_flows)
+            if remapped_count or before != after:
+                print(
+                    f"   🔧 sequence_flows id remap: {before} → {after} "
+                    f"(remapped fields={remapped_count})"
+                )
+            self.sequence_flows = deduped_flows
+        except Exception as exc:
+            print(f"   ⚠️ sequence_flows remap 실패 (무시하고 진행): {exc}")
+
+        try:
+            for old_id, new_id in task_id_mapping.items():
+                if old_id == new_id:
+                    continue
+                if old_id in self.task_process_map:
+                    if new_id not in self.task_process_map:
+                        self.task_process_map[new_id] = self.task_process_map[old_id]
+                    self.task_process_map.pop(old_id, None)
+        except Exception as exc:
+            print(f"   ⚠️ task_process_map remap 실패 (무시하고 진행): {exc}")
+
     def _merge_tasks_by_similarity(self, tasks: list, task_id_mapping: dict) -> list:
         """이름 유사도를 기반으로 태스크를 병합합니다."""
         if len(tasks) <= 1:
@@ -1188,11 +1435,21 @@ class PDF2BPMNWorkflow:
             if left_classes and right_classes and not shared_classes:
                 return False, "different_verb_class"
 
+            # 이름이 정확히 같다고 해서 자동 merge 하지 않는다.
+            # ("승인" / "승인" 같이 도메인상 반복되는 단계가 단순 동명으로 합쳐지는 사고 방지)
+            # → instruction/description 임베딩 cosine 으로 의미 검증.
             if left_name == right_name:
-                return True, "same_name"
+                ok, reason, _sim = self._decide_same_name_merge(left, right)
+                return ok, reason
 
+            # substring 포함도 동일 정책. 짧은 이름이 다른 단계의 이름을 우연히
+            # 포함하는 경우 (예: "승인" ⊂ "최종 승인") 가 false positive 의 주범이므로
+            # instruction 신호로 한 번 더 검증한다.
             if left_name in right_name or right_name in left_name:
-                return True, "name_contains_other"
+                ok, reason, _sim = self._decide_same_name_merge(left, right)
+                if ok:
+                    return True, f"name_contains_other_with_instr_sim({reason})"
+                return False, f"name_contains_other_but_instr_diff({reason})"
 
             if self._have_same_core_words(left_name, right_name) and order_gap <= 3:
                 return True, "same_core_words_nearby"
@@ -1243,7 +1500,18 @@ class PDF2BPMNWorkflow:
                 # 가장 긴 이름을 가진 태스크를 대표로 선택
                 all_related = [task] + [t for _, t in merged_with]
                 representative = max(all_related, key=lambda t: len(t.name))
-                
+
+                # 대표 task 의 order 는 클러스터 내 최소 order 로 갱신.
+                # (대표가 "가장 긴 이름" 기준이라 원본 순서가 뒤로 밀린 task 가 선택되면
+                #  merged_tasks 가 정렬됐을 때 task 가 본래 위치보다 훨씬 뒤로 이동해
+                #  LLM/extract 단계에서 순서가 망가진다.)
+                try:
+                    min_order = min(int(getattr(x, "order", 0) or 0) for x in all_related)
+                    if int(getattr(representative, "order", 0) or 0) > min_order:
+                        representative.order = min_order
+                except Exception:
+                    pass
+
                 # 설명 통합
                 descriptions = [t.description for t in all_related if t.description]
                 if descriptions:
@@ -1326,13 +1594,12 @@ class PDF2BPMNWorkflow:
         al, bl = an.lower().strip(), bn.lower().strip()
         if not al or not bl:
             return False
-        if al == bl:
-            return True
-        # substring 매칭: 충분히 긴 경우만
-        if len(al) >= 6 and al in bl:
-            return True
-        if len(bl) >= 6 and bl in al:
-            return True
+        # 이름이 같거나 한쪽이 다른쪽을 충분히 포함하면, instruction 신호로 한 번 더 검증.
+        # 결재 체인 ("팀장 승인" / "본부장 승인") 처럼 role 만 다르고 이름은 같은
+        # 별개 단계가 자동으로 묶이는 사고를 방지한다.
+        if al == bl or (len(al) >= 6 and al in bl) or (len(bl) >= 6 and bl in al):
+            ok, _reason, _sim = self._decide_same_name_merge(a, b)
+            return ok
 
         a_verbs = self._task_verb_class(an)
         b_verbs = self._task_verb_class(bn)
@@ -1390,6 +1657,13 @@ class PDF2BPMNWorkflow:
             if len(cluster) > 1:
                 # 대표: 가장 긴 이름 (정보량 많음). 동률이면 가장 처음.
                 rep = max(cluster, key=lambda x: (len(getattr(x, "name", "") or ""),))
+                # 대표 task 의 order 는 클러스터 내 최소 order 로 보정 (원본 순서 보존)
+                try:
+                    min_order = min(int(getattr(x, "order", 0) or 0) for x in cluster)
+                    if int(getattr(rep, "order", 0) or 0) > min_order:
+                        rep.order = min_order
+                except Exception:
+                    pass
                 # description 통합
                 descs = [getattr(x, "description", "") for x in cluster if getattr(x, "description", "")]
                 if descs:
@@ -1477,9 +1751,9 @@ class PDF2BPMNWorkflow:
         if not embeddings or len(embeddings) != len(tasks):
             return tasks
 
-        low_thr = float(Config.TASK_SEMANTIC_COSINE_MIN)
-        high_thr = float(Config.TASK_SEMANTIC_HIGH_COSINE)
-        jaccard_min = float(Config.TASK_NOUN_JACCARD_MIN)
+        low_thr = float(self._cfg("TASK_SEMANTIC_COSINE_MIN"))
+        high_thr = float(self._cfg("TASK_SEMANTIC_HIGH_COSINE"))
+        jaccard_min = float(self._cfg("TASK_NOUN_JACCARD_MIN"))
 
         sorted_idx = sorted(range(len(tasks)), key=lambda k: int(getattr(tasks[k], "order", 0) or 0))
         skip: set[int] = set()
@@ -1501,8 +1775,22 @@ class PDF2BPMNWorkflow:
                 if not ni or not nj:
                     continue
                 if ni == nj:
-                    cluster.append(tj)
-                    skip.add(j)
+                    # 이름이 같다고 해서 임베딩 비교를 건너뛰지 않는다.
+                    # instruction/description 신호로 의미 동일성을 한 번 더 검증.
+                    ok, reason, sim = self._decide_same_name_merge(ti, tj)
+                    if ok:
+                        if sim is not None:
+                            print(
+                                f"   🧠 same-name merge ({reason}): "
+                                f"'{getattr(ti, 'name', '')}' ↔ '{getattr(tj, 'name', '')}'"
+                            )
+                        cluster.append(tj)
+                        skip.add(j)
+                    else:
+                        print(
+                            f"   🚫 same-name 분리 유지 ({reason}): "
+                            f"'{getattr(ti, 'name', '')}' ↔ '{getattr(tj, 'name', '')}'"
+                        )
                     continue
 
                 try:
@@ -1552,6 +1840,13 @@ class PDF2BPMNWorkflow:
             if len(cluster) > 1:
                 # 대표: 가장 긴 이름 (정보량 많음)
                 rep = max(cluster, key=lambda x: len(getattr(x, "name", "") or ""))
+                # 대표 task 의 order 는 클러스터 내 최소 order 로 보정 (원본 순서 보존)
+                try:
+                    min_order = min(int(getattr(x, "order", 0) or 0) for x in cluster)
+                    if int(getattr(rep, "order", 0) or 0) > min_order:
+                        rep.order = min_order
+                except Exception:
+                    pass
                 self._merge_task_metadata(cluster, rep)
                 rep_id = rep.task_id
                 cluster_other_ids = {x.task_id for x in cluster if x.task_id != rep_id}
@@ -1594,6 +1889,142 @@ class PDF2BPMNWorkflow:
                         seen_lines.add(s)
                         merged_lines.append(s)
             rep.instruction = "\n".join(merged_lines).strip()
+
+    # ------------------------------------------------------------------
+    # Dedup 강도 (사용자 [도구 설정] 다이얼로그 값)
+    # ------------------------------------------------------------------
+    def set_dedup_level(self, level: str | None) -> None:
+        """사용자가 선택한 dedup 강도를 적용한다.
+
+        Args:
+            level: "concise" | "standard" | "detailed". 그 외/None 은 standard 로 폴백.
+        """
+        normalized = (level or "standard").strip().lower()
+        if normalized not in _DEDUP_LEVEL_PROFILES:
+            print(f"   ⚠️ 알 수 없는 dedup level '{level}' → 'standard' 로 폴백")
+            normalized = "standard"
+        self._dedup_level = normalized
+        self._dedup_overrides = dict(_DEDUP_LEVEL_PROFILES[normalized])
+        if self._dedup_overrides:
+            print(
+                f"   ⚙️ dedup level='{normalized}' 적용 — 임계값 오버라이드 "
+                f"{self._dedup_overrides}"
+            )
+        else:
+            print(f"   ⚙️ dedup level='{normalized}' 적용 — Config 기본값 사용")
+
+        # SOP 분할 단계 (PDFExtractor) 에도 같은 level 을 동기 적용한다.
+        # (executor 의 _build_state_from_memento_chunks 경로 외에 graph.py 의
+        #  self.pdf_extractor 를 직접 사용하는 경로에서도 일관된 동작 보장.)
+        try:
+            if hasattr(self, "pdf_extractor") and hasattr(self.pdf_extractor, "set_segmentation_level"):
+                self.pdf_extractor.set_segmentation_level(normalized)
+        except Exception:
+            pass
+
+    def _cfg(self, name: str):
+        """임계값 조회 헬퍼.
+
+        - 사용자 dedup level 의 오버라이드가 있으면 그 값을 우선 사용
+        - 없으면 Config 의 기본 attribute 를 그대로 반환
+        """
+        if name in self._dedup_overrides:
+            return self._dedup_overrides[name]
+        return getattr(Config, name)
+
+    # ------------------------------------------------------------------
+    # 이름이 같은 task 페어의 instruction/description 의미 유사도 검증
+    # (1차/2차/3차 dedup 단계에서 공통으로 사용 — 자동 통과 방지용)
+    # ------------------------------------------------------------------
+    def _task_extra_text(self, task) -> str:
+        """task 의 의미 비교용 보조 텍스트.
+
+        instruction 우선, 없으면 description 으로 폴백. 너무 긴 경우 임베딩 입력
+        토큰을 아끼기 위해 절단한다 (도메인 task 지침은 대개 600자 안에 핵심이 있음).
+        """
+        txt = (getattr(task, "instruction", "") or "").strip()
+        if not txt:
+            txt = (getattr(task, "description", "") or "").strip()
+        return txt[:600]
+
+    def _instructions_similarity(self, a, b) -> float | None:
+        """두 task 의 instruction/description 임베딩 cosine 유사도.
+
+        Returns:
+            float (0.0 ~ 1.0) — 비교 가능한 경우
+            None — 한쪽이라도 보조 텍스트가 비었거나 임베딩 호출이 실패한 경우
+
+        같은 페어가 여러 단계에서 평가될 수 있으므로 self._instr_sim_cache 로
+        결과를 재사용한다.
+        """
+        aid = getattr(a, "task_id", "") or ""
+        bid = getattr(b, "task_id", "") or ""
+        cache_key: tuple[str, str] | None = None
+        if aid and bid:
+            cache_key = (aid, bid) if aid <= bid else (bid, aid)
+            if cache_key in self._instr_sim_cache:
+                return self._instr_sim_cache[cache_key]
+
+        txt_a = self._task_extra_text(a)
+        txt_b = self._task_extra_text(b)
+        if not txt_a or not txt_b:
+            if cache_key is not None:
+                self._instr_sim_cache[cache_key] = None
+            return None
+
+        try:
+            embs = self.vector_search.embed_texts([txt_a, txt_b])
+        except Exception as exc:
+            print(f"   ⚠️ instruction 임베딩 호출 실패 → 비교 스킵: {exc}")
+            if cache_key is not None:
+                self._instr_sim_cache[cache_key] = None
+            return None
+
+        if not embs or len(embs) != 2:
+            if cache_key is not None:
+                self._instr_sim_cache[cache_key] = None
+            return None
+
+        try:
+            sim = float(self.vector_search.cosine_similarity(embs[0], embs[1]))
+        except Exception:
+            if cache_key is not None:
+                self._instr_sim_cache[cache_key] = None
+            return None
+
+        if cache_key is not None:
+            self._instr_sim_cache[cache_key] = sim
+        return sim
+
+    def _decide_same_name_merge(self, a, b) -> tuple[bool, str, float | None]:
+        """이름이 정확히 같은 task 페어를 합칠지 의미 신호로 판정.
+
+        정책:
+          - instruction/description 비교 가능: cosine 임계 충족 시에만 merge.
+            · 같은 role 끼리: TASK_SAME_NAME_INSTR_COSINE_SAME_ROLE (기본 0.78)
+            · 다른 role 끼리: TASK_SAME_NAME_INSTR_COSINE_DIFF_ROLE (기본 0.86)
+          - 비교 불가 (한쪽이라도 텍스트 부재 / 임베딩 실패):
+            안전한 기본값으로 merge 허용 (기존 동작 유지, BPMN 손실 방지).
+
+        Returns:
+            (merge 여부, 사유, cosine 값 또는 None)
+        """
+        sim = self._instructions_similarity(a, b)
+        if sim is None:
+            return True, "same_name_no_instruction_signal", None
+
+        role_a = self.task_role_map.get(getattr(a, "task_id", ""))
+        role_b = self.task_role_map.get(getattr(b, "task_id", ""))
+        same_role = bool(role_a) and bool(role_b) and role_a == role_b
+        threshold = (
+            float(self._cfg("TASK_SAME_NAME_INSTR_COSINE_SAME_ROLE"))
+            if same_role
+            else float(self._cfg("TASK_SAME_NAME_INSTR_COSINE_DIFF_ROLE"))
+        )
+
+        if sim >= threshold:
+            return True, f"same_name_instr_sim_pass({sim:.2f}>={threshold:.2f})", sim
+        return False, f"same_name_instr_sim_fail({sim:.2f}<{threshold:.2f})", sim
 
     # ------------------------------------------------------------------
     # Role 정규화 (직급 보존 + 책임 task signature 기반 클러스터링)
@@ -1652,17 +2083,39 @@ class PDF2BPMNWorkflow:
                 continue
             role_to_taskids.setdefault(rid, set()).add(tid)
 
+        # role 별 process scope 결정 (process 격리 정책).
+        # - role 의 task 들이 모두 단일 process 에 속하면 그 proc_id 가 scope.
+        # - 여러 process 에 걸쳐 있으면 "_multi" (보수적으로 같은 _multi 끼리만 비교).
+        # - task 가 하나도 없으면 "_orphan" (다른 그룹으로 절대 흡수되지 않음).
+        # task_process_map 은 task merge 단계에서 갱신되어 있으며,
+        # task_id_mapping 으로 흡수된 ID 도 표준 ID 로 일관 조회 가능해야 한다.
+        def _role_proc_scope(task_ids: set[str]) -> str:
+            if not task_ids:
+                return "_orphan"
+            procs = set()
+            for tid in task_ids:
+                pid = self.task_process_map.get(tid)
+                if pid:
+                    procs.add(pid)
+            if not procs:
+                return "_orphan"
+            if len(procs) == 1:
+                return next(iter(procs))
+            return "_multi"
+
         items: list[dict] = []
         for i, r in enumerate(roles):
             nm = (getattr(r, "name", "") or "").strip()
             rid = getattr(r, "role_id", None)
+            tasks = role_to_taskids.get(rid, set()) if rid else set()
             items.append({
                 "idx": i,
                 "role": r,
                 "name": nm,
                 "nkey": self._role_display_key(nm),
                 "rid": rid,
-                "tasks": role_to_taskids.get(rid, set()) if rid else set(),
+                "tasks": tasks,
+                "proc_scope": _role_proc_scope(tasks),
             })
 
         n = len(items)
@@ -1679,19 +2132,35 @@ class PDF2BPMNWorkflow:
             if ra != rb:
                 parent[rb] = ra
 
-        # ----- 1단계: 이름 정규화 키 정확 일치 -----
-        by_key: dict[str, int] = {}
+        def _same_scope(i: int, j: int) -> bool:
+            """두 role 이 같은 process scope 일 때만 병합 허용.
+
+            process 격리 정책:
+              - 같은 proc_id        → 비교 가능
+              - 둘 다 "_multi"      → 비교 가능 (이미 cross-process role)
+              - 둘 다 "_orphan"     → 비교 가능 (둘 다 task 없음, 이름만으로)
+              - 그 외 (proc_id ↔ _multi / _orphan, 다른 proc_id 끼리) → 차단
+            """
+            return items[i]["proc_scope"] == items[j]["proc_scope"]
+
+        # ----- 1단계: 이름 정규화 키 정확 일치 (process scope 별 그룹) -----
+        # 같은 직책 이름이 여러 process 에 등장해도 process 가 다르면 합치지 않음.
+        by_key_per_scope: dict[tuple[str, str], int] = {}
         for i, it in enumerate(items):
             k = it["nkey"]
             if not k:
                 continue
-            if k in by_key:
-                _union(by_key[k], i)
+            scope = it["proc_scope"]
+            bucket_key = (scope, k)
+            if bucket_key in by_key_per_scope:
+                _union(by_key_per_scope[bucket_key], i)
             else:
-                by_key[k] = i
+                by_key_per_scope[bucket_key] = i
 
-        # ----- 2단계: task signature Jaccard 기반 -----
-        # 양쪽 다 충분한 task (>=2) 를 가진 role 끼리만 비교 → 노이즈 방지
+        # ----- 2단계: task signature Jaccard 기반 (process scope 별) -----
+        # 양쪽 다 충분한 task (>=2) 를 가진 role 끼리만 비교 → 노이즈 방지.
+        # task_id 가 process 별로 분리되어 있으므로 cross-process 합병은 자연 차단되지만,
+        # 정책 일관성을 위해 명시적으로 same_scope 검사도 둔다.
         TASK_SIG_MIN_COUNT = 2
         TASK_SIG_JACCARD_MIN = 0.7
 
@@ -1704,6 +2173,8 @@ class PDF2BPMNWorkflow:
                 i, j = candidates[i_idx], candidates[j_idx]
                 if _find(i) == _find(j):
                     continue
+                if not _same_scope(i, j):
+                    continue
                 ta, tb = items[i]["tasks"], items[j]["tasks"]
                 inter = ta & tb
                 if not inter:
@@ -1713,10 +2184,11 @@ class PDF2BPMNWorkflow:
                 if jacc >= TASK_SIG_JACCARD_MIN:
                     _union(i, j)
 
-        # ----- 3단계: 임베딩 cosine + task signature 교차검증 -----
+        # ----- 3단계: 임베딩 cosine + task signature 교차검증 (process scope 별) -----
         # 직급 보존 정책상 cosine 단독으로는 절대 합치지 않는다.
         # ("기획본부장" / "기획처장" 의 cosine 은 보통 0.95+ 로 매우 높지만 직급/책임이 다름)
         # 두 신호가 동시에 강할 때만 흡수:
+        #   · 같은 process scope (cross-process 차단)
         #   · cosine ≥ ROLE_SEMANTIC_COSINE_MIN (이름 의미 매우 유사)
         #   · AND 양쪽 다 task ≥ ROLE_EMBED_MIN_TASKS
         #   · AND task signature Jaccard ≥ ROLE_EMBED_JACCARD_MIN (책임도 거의 같음)
@@ -1729,12 +2201,14 @@ class PDF2BPMNWorkflow:
                 role_embeddings = None
 
             if role_embeddings and len(role_embeddings) == n:
-                cos_min = float(Config.ROLE_SEMANTIC_COSINE_MIN)
+                cos_min = float(self._cfg("ROLE_SEMANTIC_COSINE_MIN"))
                 ROLE_EMBED_MIN_TASKS = 2
                 ROLE_EMBED_JACCARD_MIN = 0.5
                 for i in range(n):
                     for j in range(i + 1, n):
                         if _find(i) == _find(j):
+                            continue
+                        if not _same_scope(i, j):
                             continue
                         ta, tb = items[i]["tasks"], items[j]["tasks"]
                         # 한쪽이라도 task 부족하면 임베딩 단독 합병 금지 (직급 다른 후보 흡수 방지)

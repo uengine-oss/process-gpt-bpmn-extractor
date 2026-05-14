@@ -46,28 +46,25 @@ ENV LANG=ko_KR.UTF-8 \
 # Install uv for faster dependency resolution
 RUN pip install uv
 
-# Copy requirements files
-COPY pyproject.toml ./
-COPY uv.lock ./
-COPY requirements-agent.txt ./
-# Needed for `-e .` (pyproject readme points to README.md)
-COPY README.md ./
+# Copy project metadata + lock for reproducible install
+COPY pyproject.toml uv.lock README.md ./
 
-# Copy application source (needed for `-e .` in requirements-agent.txt)
+# Source package required because `-e .` is resolved by `uv sync`
 COPY src/ ./src/
+
+# Install dependencies strictly from uv.lock for a fully reproducible build.
+# numpy<2 / langchain-core 1.2 / langgraph 1.0.5 pinning lives in pyproject + lock,
+# so no extra ad-hoc `pip install` lines here.
+RUN uv sync --frozen --no-dev
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Application entry-point scripts (not part of the installed package)
 COPY run.py ./
 COPY pdf2bpmn_agent_executor.py ./
 COPY pdf2bpmn_agent_server.py ./
 COPY pdf2bpmn_scaledjob_worker.py ./
 COPY a2a_server.py ./
 COPY a2a_client.py ./
-
-# Install Python dependencies using uv (much faster with lock file)
-# Use --system to install to system Python instead of creating a venv
-# Note: numpy<2.0 for older CPU compatibility (no X86_V2 requirement)
-RUN uv pip install --system "numpy<2.0" && \
-    uv pip install --system -e . && \
-    uv pip install --system process-gpt-agent-sdk==0.4.13 supabase>=2.0.0 httpx>=0.25.0 sse-starlette>=2.0.0
 
 # Create necessary directories
 RUN mkdir -p /app/output /app/uploads

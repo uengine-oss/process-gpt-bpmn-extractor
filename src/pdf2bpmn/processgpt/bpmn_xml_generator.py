@@ -1115,8 +1115,18 @@ class ProcessGPTBPMNXmlGenerator:
             out = ET.SubElement(gw, _q(NS_BPMN, "outgoing"))
             out.text = str(out_id)
 
+        gw_props: Dict[str, Any] = {}
         if element.get("description"):
-            gw.append(self.buildExtension({"description": element.get("description")}))
+            gw_props["description"] = element.get("description")
+        # 게이트웨이 참조정보(분기 판단용 폼/필드 키 리스트). 프론트가 uengine:properties.json 의
+        # conditionData 키를 그대로 읽어 게이트웨이 분기 판단에 사용함.
+        if isinstance(element.get("conditionData"), list) and element.get("conditionData"):
+            gw_props["conditionData"] = element.get("conditionData")
+        if isinstance(element.get("properties"), dict):
+            gw_props.update(element.get("properties"))
+
+        if gw_props:
+            gw.append(self.buildExtension(gw_props))
 
     def attachEventDefinition(self, evt: ET.Element, element: Dict[str, Any]) -> None:
         et = element.get("eventType")
@@ -1569,6 +1579,17 @@ class ProcessGPTBPMNXmlGenerator:
                 continue
             gw_type_raw = str(gw.get("type") or gw.get("gateWayType") or "").lower()
             gw_type = "bpmn:parallelGateway" if "parallel" in gw_type_raw else "bpmn:exclusiveGateway"
+
+            gw_properties = gw.get("properties")
+            if isinstance(gw_properties, str):
+                try:
+                    parsed_gw_props = json.loads(gw_properties) if gw_properties.strip() else {}
+                    gw_properties = parsed_gw_props if isinstance(parsed_gw_props, dict) else {}
+                except Exception:
+                    gw_properties = {}
+            elif not isinstance(gw_properties, dict):
+                gw_properties = {}
+
             elements.append(
                 {
                     "id": gw.get("id"),
@@ -1576,6 +1597,9 @@ class ProcessGPTBPMNXmlGenerator:
                     "role": gw.get("role") or "",
                     "description": gw.get("description") or "",
                     "gateWayType": gw_type,
+                    # 게이트웨이 분기 판단용 참조 필드 (프론트의 buildGateway 가 properties.conditionData 로 읽음)
+                    "conditionData": gw.get("conditionData") or [],
+                    "properties": gw_properties,
                     "elementType": "Gateway",
                 }
             )

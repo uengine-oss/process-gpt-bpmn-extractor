@@ -124,7 +124,30 @@ For gateways (IMPORTANT: Gateway is just a BRANCHING POINT, NOT the condition it
     Example: "예비타당성조사 대상 사업인지 여부..." -> "예비타당성조사 대상 사업 여부 판단"
   DO NOT put condition text here - just the name of the decision point
 - parent_process: Name of the process this gateway belongs to
-- incoming_task: Name of the task before this gateway
+- incoming_task: Name of the task before this gateway (REQUIRED — what flows INTO this gateway)
+- outgoing_branches: **REQUIRED** — List of branches OUT of this gateway. This is the most
+  important field — without it the gateway has no purpose and will be discarded.
+  Format: [ {{ "to_task": "<existing task name>", "condition": "<branch condition>" }}, ... ]
+  Rules (MUST follow):
+    1. MUST contain at least 2 entries (a gateway with <2 branches is not a gateway).
+    2. Each "to_task" MUST refer to a task that exists in the tasks list (or in the
+       provided existing_tasks context). Do NOT invent task names that are not in the
+       document; do NOT use gateway names; do NOT use roles or events.
+    3. Each "condition" MUST be a real, semantically distinct condition from the source
+       text (e.g., "승인인 경우" / "거부인 경우"). Do NOT use placeholders like
+       "조건1", "분기1", or "case1".
+    4. For exclusive/inclusive gateways: conditions must be mutually meaningful (e.g.,
+       a true/false pair or a clear set of exclusive cases).
+    5. For parallel gateways: condition can be "" but at least 2 outgoing tasks are still
+       required.
+  Example for "승인권자가 승인하면 발주 처리를 진행하고, 거부하면 반려 통보한다":
+    outgoing_branches = [
+      {{ "to_task": "발주 처리", "condition": "승인인 경우" }},
+      {{ "to_task": "반려 통보", "condition": "거부인 경우" }}
+    ]
+  NOTE: You MUST also list these same branches as entries in `sequence_flows` (with
+  from_task = this gateway's name). The two MUST be consistent. Duplicate listing is
+  intentional and required.
 - description: Brief description of what decision is being made
 
 For decisions:
@@ -183,8 +206,15 @@ SELF-CHECK BEFORE OUTPUT:
 Example of correct extraction:
 If text says: "승인권자가 승인하면 발주 처리를 진행하고, 거부하면 구매요청자에게 반려 통보한다"
 Extract:
-- Gateway: name="승인 여부 분기", gateway_type="exclusive"
-- sequence_flows:
+- Gateway:
+    name="승인 여부 분기",
+    gateway_type="exclusive",
+    incoming_task="승인 요청",
+    outgoing_branches=[
+      {{ "to_task": "발주 처리", "condition": "승인인 경우" }},
+      {{ "to_task": "반려 통보", "condition": "거부인 경우" }}
+    ]
+- sequence_flows (consistent duplicate listing):
   1. from_task="승인 여부 분기", to_task="발주 처리", condition="승인인 경우"
   2. from_task="승인 여부 분기", to_task="반려 통보", condition="거부인 경우"
 
@@ -628,6 +658,8 @@ class EntityExtractor:
                         break
         
         # Convert gateways
+        # gateway_id → raw extracted dict (for outgoing_branches / incoming_task post-processing below)
+        gateway_raw_meta: Dict[str, Dict[str, Any]] = {}
         for g in extracted.gateways:
             gw_type_str = (g.get("gateway_type") or "exclusive").lower()
             gw_type = GatewayType.EXCLUSIVE
@@ -660,6 +692,10 @@ class EntityExtractor:
                 description=gw_desc
             )
             entities["gateways"].append(gateway)
+            gateway_raw_meta[gateway_id] = {
+                "incoming_task": str(g.get("incoming_task") or "").strip(),
+                "outgoing_branches": g.get("outgoing_branches") or [],
+            }
             
             if chunk_id:
                 entities["entity_chunk_map"][gateway_id] = chunk_id
@@ -922,7 +958,104 @@ class EntityExtractor:
                 # Log for debugging
                 if condition:
                     print(f"   📍 Sequence flow with condition: {from_name} → {to_name} [{condition}]")
-        
+
+        # ─────────────────────────────────────────────────────────────────────
+        # (Option A) Gateway.outgoing_branches → sequence_flows 자동 보강
+        #   LLM 이 sequence_flows 에 게이트웨이 분기를 빠뜨려도, gateway 객체에
+        #   명시한 outgoing_branches 만 채워뒀다면 그 정보로 sequence_flow 를
+        #   복원한다. 추출 단계의 안전망.
+        # ─────────────────────────────────────────────────────────────────────
+        if gateway_raw_meta:
+            # 기존 sequence_flows 에서 이미 등록된 (from_id, to_id) 쌍을 skip 대상으로 모음
+            existing_pairs: set = set()
+            for sf in entities["sequence_flows"]:
+                _f = sf.get("from_id") or sf.get("from_task_id")
+                _t = sf.get("to_id") or sf.get("to_task_id")
+                if _f and _t:
+                    existing_pairs.add((str(_f), str(_t)))
+
+            task_name_to_id_lc = {
+                (t.name or "").lower().strip(): t.task_id
+                for t in entities["tasks"]
+                if t.name
+            }
+
+            augmented = 0
+            for gw_id, meta in gateway_raw_meta.items():
+                branches = meta.get("outgoing_branches") or []
+                if not isinstance(branches, list):
+                    continue
+                # incoming_task → gateway 흐름도 누락됐다면 같이 보강
+                in_name = (meta.get("incoming_task") or "").lower().strip()
+                if in_name:
+                    in_task_id = None
+                    if in_name in task_name_to_id_lc:
+                        in_task_id = task_name_to_id_lc[in_name]
+                    else:
+                        for tname_lc, tid in task_name_to_id_lc.items():
+                            if tname_lc and (tname_lc in in_name or in_name in tname_lc):
+                                in_task_id = tid
+                                break
+                    if in_task_id and (in_task_id, gw_id) not in existing_pairs:
+                        entities["sequence_flows"].append({
+                            "from_id": in_task_id,
+                            "from_type": "task",
+                            "to_id": gw_id,
+                            "to_type": "gateway",
+                            "condition": "",
+                        })
+                        existing_pairs.add((in_task_id, gw_id))
+                        augmented += 1
+
+                for br in branches:
+                    if not isinstance(br, dict):
+                        continue
+                    to_name = (br.get("to_task") or "").lower().strip()
+                    cond = str(br.get("condition") or "").strip()
+                    if not to_name:
+                        continue
+                    cond_norm = "".join(cond.lower().split())
+                    if cond_norm in _BAD_CONDITION_KEYS:
+                        cond = ""
+
+                    to_id = None
+                    to_type = None
+                    if to_name in task_name_to_id_lc:
+                        to_id = task_name_to_id_lc[to_name]
+                        to_type = "task"
+                    else:
+                        # substring match (LLM 이름 표기 흔들림 흡수)
+                        for tname_lc, tid in task_name_to_id_lc.items():
+                            if tname_lc and (tname_lc in to_name or to_name in tname_lc):
+                                to_id = tid
+                                to_type = "task"
+                                break
+                    # task 매칭 실패 시 gateway 도 후보로 (게이트웨이 체이닝 케이스)
+                    if not to_id:
+                        for gw_name_lc, other_gw_id in gateway_name_to_id.items():
+                            if other_gw_id == gw_id:
+                                continue
+                            if gw_name_lc and (gw_name_lc in to_name or to_name in gw_name_lc):
+                                to_id = other_gw_id
+                                to_type = "gateway"
+                                break
+                    if not to_id:
+                        continue
+                    if (gw_id, to_id) in existing_pairs:
+                        continue
+                    entities["sequence_flows"].append({
+                        "from_id": gw_id,
+                        "from_type": "gateway",
+                        "to_id": to_id,
+                        "to_type": to_type,
+                        "condition": cond,
+                    })
+                    existing_pairs.add((gw_id, to_id))
+                    augmented += 1
+
+            if augmented:
+                print(f"   🛟 gateway outgoing_branches 로부터 sequence_flow {augmented} 개 자동 보강")
+
         # Heuristic gateway synthesis:
         # If no gateways were extracted but a source task has multiple conditional outgoing flows,
         # synthesize an ExclusiveGateway to preserve branching semantics deterministically.

@@ -18,30 +18,30 @@ services:
 
   # Agent-only (polling based)
   # - requires Supabase env (SUPABASE_URL, SUPABASE_ANON_KEY, ...)
-  pdf2bpmn-agent:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: pdf2bpmn-agent
-    depends_on:
-      age:
-        condition: service_healthy
-    environment:
-      - AGENT_PORT=8000
-      - WAIT_FOR_AGE=1
-      - AGE_DSN=postgresql://postgres:postgres@age:5432/postgres
-      - AGE_GRAPH_NAME=pdf2bpmn
-      - PYTHONIOENCODING=utf-8
-    env_file:
-      - ./.env
-    extra_hosts:
-      # Ensure host.docker.internal resolves (esp. on Linux)
-      - "host.docker.internal:host-gateway"
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./uploads:/app/uploads
-      - ./output:/app/output
+  # pdf2bpmn-agent:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: pdf2bpmn-agent
+  #   depends_on:
+  #     age:
+  #       condition: service_healthy
+  #   environment:
+  #     - AGENT_PORT=8000
+  #     - WAIT_FOR_AGE=1
+  #     - AGE_DSN=postgresql://postgres:postgres@age:5432/postgres
+  #     - AGE_GRAPH_NAME=pdf2bpmn
+  #     - PYTHONIOENCODING=utf-8
+  #   env_file:
+  #     - ./.env
+  #   extra_hosts:
+  #     # Ensure host.docker.internal resolves (esp. on Linux)
+  #     - "host.docker.internal:host-gateway"
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - ./uploads:/app/uploads
+  #     - ./output:/app/output
 
 volumes:
   age_data:

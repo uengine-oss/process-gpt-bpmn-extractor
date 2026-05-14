@@ -1102,6 +1102,63 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             )
         return out
 
+    def _build_predecessor_activity_map_for_gateways(self, proc_json: Dict[str, Any]) -> Dict[str, List[str]]:
+        """
+        gateway_id -> 그 게이트웨이로 도달 가능한 모든 선행 activity_id 리스트.
+        - sequences 의 source->target 그래프를 역방향으로 탐색하여 activity 노드만 수집.
+        - sequences 가 없거나 비어있으면 fallback 으로 activities 의 list order 를 그대로 사용 (모든 활동을 선행으로 간주).
+        """
+        gateways = proc_json.get("gateways") or []
+        if not isinstance(gateways, list) or not gateways:
+            return {}
+        gateway_ids = [str(g.get("id")) for g in gateways if isinstance(g, dict) and g.get("id")]
+        if not gateway_ids:
+            return {}
+
+        activities = proc_json.get("activities") or []
+        activity_ids = [str(a.get("id")) for a in activities if isinstance(a, dict) and a.get("id")]
+        activity_id_set = set(activity_ids)
+
+        sequences = proc_json.get("sequences") or []
+        if not isinstance(sequences, list) or not sequences:
+            return {gid: list(activity_ids) for gid in gateway_ids}
+
+        rev: Dict[str, List[str]] = {}
+        edge_count = 0
+        for s in sequences:
+            if not isinstance(s, dict):
+                continue
+            src = str(s.get("source") or "").strip()
+            tgt = str(s.get("target") or "").strip()
+            if not src or not tgt or src == tgt:
+                continue
+            rev.setdefault(tgt, []).append(src)
+            edge_count += 1
+
+        if edge_count == 0:
+            return {gid: list(activity_ids) for gid in gateway_ids}
+
+        out: Dict[str, List[str]] = {}
+        for gid in gateway_ids:
+            seen_nodes: Set[str] = set()
+            preds: List[str] = []
+            q: List[str] = list(rev.get(gid) or [])
+            while q:
+                cur = q.pop(0)
+                if cur in seen_nodes:
+                    continue
+                seen_nodes.add(cur)
+                if cur in activity_id_set:
+                    preds.append(cur)
+                for p in rev.get(cur) or []:
+                    if p not in seen_nodes:
+                        q.append(p)
+                if len(seen_nodes) > 5000:
+                    break
+            preds_sorted = [x for x in activity_ids if x in set(preds)]
+            out[gid] = preds_sorted
+        return out
+
     def _build_predecessor_activity_map(self, proc_json: Dict[str, Any]) -> Dict[str, List[str]]:
         """
         Build a mapping: activity_id -> list of predecessor activity_ids (reachable via sequences).
@@ -1267,6 +1324,134 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 seen.add(ref)
                 cleaned.append(ref)
             out[tid] = cleaned
+        return out
+
+    async def _llm_choose_conditiondata_for_gateways(
+        self,
+        *,
+        process_name: str,
+        proc_def_id: str,
+        proc_json: Dict[str, Any],
+        candidates_by_gateway_id: Dict[str, List[Dict[str, str]]],
+    ) -> Optional[Dict[str, List[str]]]:
+        """
+        각 ExclusiveGateway 의 conditionData(분기 판단용 참조 필드)를 LLM 으로 선택.
+        - inputData 와 동일한 형식: ["form_id.field_key", ...]
+        - 반드시 candidates.ref 안에서만 선택
+        - 분기 시퀀스(outgoing)의 name/condition 을 함께 제공하여 어떤 필드가 분기 판단에 필요한지 추론하게 함
+        """
+        if not self.openai_client:
+            return None
+        if os.getenv("ENABLE_LLM_CONDITIONDATA_MAPPING", "true").lower() != "true":
+            return None
+
+        gateways = proc_json.get("gateways") or []
+        if not isinstance(gateways, list) or not gateways:
+            return None
+
+        sequences = proc_json.get("sequences") or []
+        out_seqs_by_gateway: Dict[str, List[Dict[str, str]]] = {}
+        if isinstance(sequences, list):
+            for s in sequences:
+                if not isinstance(s, dict):
+                    continue
+                src = str(s.get("source") or "").strip()
+                if not src:
+                    continue
+                out_seqs_by_gateway.setdefault(src, []).append(
+                    {
+                        "id": str(s.get("id") or ""),
+                        "name": str(s.get("name") or ""),
+                        "condition": str(s.get("condition") or ""),
+                        "target": str(s.get("target") or ""),
+                    }
+                )
+
+        gateways_payload: List[Dict[str, Any]] = []
+        for g in gateways:
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get("id") or "").strip()
+            if not gid:
+                continue
+            gtype = str(g.get("type") or "").lower()
+            # 분기 판단이 의미있는 게이트웨이만 (exclusive/inclusive). parallel 은 조건 없이 모두 진행.
+            if "parallel" in gtype:
+                continue
+            cands = candidates_by_gateway_id.get(gid) or []
+            gateways_payload.append(
+                {
+                    "gateway_id": gid,
+                    "name": str(g.get("name") or ""),
+                    "type": g.get("type") or "ExclusiveGateway",
+                    "description": str(g.get("description") or ""),
+                    "branches": out_seqs_by_gateway.get(gid) or [],
+                    "candidates": cands[:120],
+                }
+            )
+
+        if not gateways_payload:
+            return None
+
+        system_prompt = (
+            "당신은 BPM 프로세스의 분기 게이트웨이(ExclusiveGateway/InclusiveGateway)에 대해 "
+            "conditionData(분기 판단에 필요한 참조 데이터)를 설계하는 전문가입니다.\n"
+            "규칙:\n"
+            "- conditionData 에는 반드시 제공된 candidates.ref 값만 넣을 수 있습니다.\n"
+            "- conditionData 는 '이 게이트웨이의 분기 조건을 평가할 때 참조해야 하는 이전 태스크 폼의 필드' 여야 합니다.\n"
+            "- branches[].name 과 branches[].condition 을 읽고, 분기 판단을 가능하게 하는 핵심 필드만 선택하세요.\n"
+            "- 보통 게이트웨이 직전 태스크의 결과 필드(분기 결과/판정값/체크박스 등)가 핵심이며, 너무 많이 넣지 마세요.\n"
+            "- 출력은 JSON ONLY 입니다.\n"
+        )
+
+        user_prompt = (
+            f"프로세스명: {process_name}\n"
+            f"proc_def_id: {proc_def_id}\n\n"
+            "각 게이트웨이별 후보(candidates) 중에서 conditionData 로 적절한 것들을 골라주세요.\n"
+            "반환 형식:\n"
+            "{\n"
+            '  "mappings": [\n'
+            '    {"gateway_id": "...", "conditionData": ["form_id.field_key", "..."]}\n'
+            "  ]\n"
+            "}\n\n"
+            f"gateways:\n{json.dumps(gateways_payload, ensure_ascii=False)}\n"
+        )
+
+        obj = await self._call_openai_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=int(os.getenv("LLM_CONDITIONDATA_MAX_TOKENS", "1200")),
+            model=os.getenv("CONDITIONDATA_MAPPING_MODEL", self.process_definition_model),
+            temperature=float(os.getenv("LLM_CONDITIONDATA_TEMPERATURE", "0.0")),
+        )
+        if not isinstance(obj, dict):
+            return None
+        mappings = obj.get("mappings")
+        if not isinstance(mappings, list):
+            return None
+
+        out: Dict[str, List[str]] = {}
+        for m in mappings:
+            if not isinstance(m, dict):
+                continue
+            gid = str(m.get("gateway_id") or "").strip()
+            if not gid:
+                continue
+            arr = m.get("conditionData") or []
+            if not isinstance(arr, list):
+                continue
+            cleaned: List[str] = []
+            seen: Set[str] = set()
+            allowed = {c.get("ref") for c in (candidates_by_gateway_id.get(gid) or []) if isinstance(c, dict) and c.get("ref")}
+            for x in arr:
+                ref = str(x or "").strip()
+                if not ref or ref in seen:
+                    continue
+                if allowed and ref not in allowed:
+                    continue
+                seen.add(ref)
+                cleaned.append(ref)
+            out[gid] = cleaned
         return out
 
     async def _postprocess_skills_and_tasks(
@@ -1674,6 +1859,104 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
                 a["inputData"] = sanitized
 
+        # 4) Gateways: conditionData(분기 판단용 참조 필드) 자동 설정
+        #    - 게이트웨이의 선행 액티비티들의 폼 필드를 후보로 모아서, LLM 으로 분기 조건에 필요한 필드 선택.
+        #    - LLM 미사용/실패 시 fallback: 가장 가까운 선행 액티비티의 모든 폼 필드를 conditionData 로 설정.
+        gateway_pred_map = self._build_predecessor_activity_map_for_gateways(proc_json)
+        gateways = proc_json.get("gateways") or []
+
+        candidates_by_gateway_id: Dict[str, List[Dict[str, str]]] = {}
+        nearest_pred_by_gateway_id: Dict[str, Optional[str]] = {}
+        if isinstance(gateways, list) and gateways:
+            for gid, preds in (gateway_pred_map or {}).items():
+                cand: List[Dict[str, str]] = []
+                seen3: Set[str] = set()
+                for pid in preds:
+                    info = forms_by_activity_id.get(pid) if isinstance(forms_by_activity_id, dict) else None
+                    if not isinstance(info, dict):
+                        continue
+                    form_id = str(info.get("form_id") or "").strip()
+                    fields_json = info.get("fields_json")
+                    for c in self._extract_form_field_refs(form_id, fields_json):
+                        ref = c.get("ref") or ""
+                        if ref and ref not in seen3:
+                            seen3.add(ref)
+                            cand.append(c)
+                candidates_by_gateway_id[gid] = cand
+                nearest_pred_by_gateway_id[gid] = preds[-1] if preds else None
+
+        chosen_gateways: Optional[Dict[str, List[str]]] = None
+        if isinstance(gateways, list) and gateways:
+            chosen_gateways = await self._llm_choose_conditiondata_for_gateways(
+                process_name=process_name,
+                proc_def_id=proc_def_id,
+                proc_json=proc_json,
+                candidates_by_gateway_id=candidates_by_gateway_id,
+            )
+
+        if isinstance(gateways, list):
+            max_cond = int(os.getenv("CONDITIONDATA_MAX_PER_GATEWAY", "30"))
+            for g in gateways:
+                if not isinstance(g, dict):
+                    continue
+                gid = str(g.get("id") or "").strip()
+                if not gid:
+                    continue
+                gtype = str(g.get("type") or "").lower()
+                # parallel 게이트웨이는 조건 평가 자체가 없으므로 conditionData 미세팅
+                if "parallel" in gtype:
+                    if not isinstance(g.get("conditionData"), list):
+                        g["conditionData"] = []
+                    continue
+
+                allowed = {
+                    str(c.get("ref"))
+                    for c in (candidates_by_gateway_id.get(gid) or [])
+                    if isinstance(c, dict) and c.get("ref")
+                }
+
+                # 1) LLM 선택값 적용 (이미 allowed 필터링됨)
+                if isinstance(chosen_gateways, dict) and gid in chosen_gateways:
+                    new_inputs = chosen_gateways.get(gid) or []
+                    if isinstance(new_inputs, list) and new_inputs:
+                        g["conditionData"] = [str(x).strip() for x in new_inputs if str(x or "").strip()][:max_cond]
+                        continue
+
+                # 2) 기존값 정리 (allowed 만 통과)
+                existing = g.get("conditionData") or []
+                sanitized: List[str] = []
+                seen4: Set[str] = set()
+                if isinstance(existing, list) and allowed:
+                    for x in existing:
+                        ref = str(x or "").strip()
+                        if not ref or ref in seen4:
+                            continue
+                        if ref not in allowed:
+                            continue
+                        seen4.add(ref)
+                        sanitized.append(ref)
+                        if len(sanitized) >= max_cond:
+                            break
+
+                # 3) Fallback: 가장 가까운 선행 액티비티의 모든 폼 필드를 그대로 conditionData 로
+                if not sanitized:
+                    nearest_pid = nearest_pred_by_gateway_id.get(gid)
+                    if nearest_pid:
+                        info = forms_by_activity_id.get(nearest_pid) if isinstance(forms_by_activity_id, dict) else None
+                        if isinstance(info, dict):
+                            form_id = str(info.get("form_id") or "").strip()
+                            fields_json = info.get("fields_json")
+                            for c in self._extract_form_field_refs(form_id, fields_json):
+                                ref = str(c.get("ref") or "").strip()
+                                if not ref or ref in seen4:
+                                    continue
+                                seen4.add(ref)
+                                sanitized.append(ref)
+                                if len(sanitized) >= max_cond:
+                                    break
+
+                g["conditionData"] = sanitized
+
         await self._send_progress_event(
             event_queue,
             context_id,
@@ -1687,7 +1970,9 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
         return {
             "candidates_count": {k: len(v) for k, v in candidates_by_activity_id.items()},
+            "gateway_candidates_count": {k: len(v) for k, v in candidates_by_gateway_id.items()},
             "llm_used": bool(isinstance(chosen, dict)),
+            "llm_used_gateways": bool(isinstance(chosen_gateways, dict)),
         }
 
     async def _update_proc_def_definition_only(self, *, proc_def_id: str, tenant_id: str, definition: Dict[str, Any]) -> bool:
@@ -1758,6 +2043,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             if isinstance(a, dict) and a.get("id"):
                 acts_by_id[str(a.get("id"))] = a
 
+        # build gateway lookup by id (conditionData sync 용)
+        gws_by_id: Dict[str, Dict[str, Any]] = {}
+        for g in (rd.get("gateways") or []):
+            if isinstance(g, dict) and g.get("id"):
+                gws_by_id[str(g.get("id"))] = g
+
         elems = em.get("elements")
         if not isinstance(elems, list):
             # The generator can accept dict-shaped elements too, but this backend path uses list.
@@ -1766,48 +2057,65 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         for e in elems:
             if not isinstance(e, dict):
                 continue
-            if e.get("elementType") != "Activity":
-                continue
-            aid = str(e.get("id") or "").strip()
-            if not aid or aid not in acts_by_id:
-                continue
+            etype = e.get("elementType")
 
-            a = acts_by_id[aid]
+            if etype == "Activity":
+                aid = str(e.get("id") or "").strip()
+                if not aid or aid not in acts_by_id:
+                    continue
 
-            # keep canonical fields in sync
-            if a.get("name"):
-                e["name"] = a.get("name")
-            if a.get("description") is not None:
-                e["description"] = a.get("description") or ""
-            if a.get("role") is not None:
-                e["role"] = a.get("role") or ""
-            if isinstance(a.get("inputData"), list):
-                e["inputData"] = a.get("inputData") or []
-            if isinstance(a.get("outputData"), list):
-                e["outputData"] = a.get("outputData") or []
-            if isinstance(a.get("checkpoints"), list):
-                e["checkpoints"] = a.get("checkpoints") or []
-            if isinstance(a.get("skills"), list):
-                e["skills"] = a.get("skills") or []
+                a = acts_by_id[aid]
 
-            # properties are serialized into uengine:json for tasks
-            props = e.get("properties") if isinstance(e.get("properties"), dict) else {}
-            props = dict(props)
-            props.update(
-                {
-                    "role": a.get("role"),
-                    "duration": a.get("duration", 5),
-                    "instruction": a.get("instruction") or "",
-                    "tool": a.get("tool") or "",
-                    "agent": a.get("agent", None),
-                    "agentMode": a.get("agentMode") or "none",
-                    "orchestration": a.get("orchestration", None),
-                    "attachments": a.get("attachments") or [],
-                    "skills": a.get("skills") or [],
-                    "customProperties": a.get("customProperties") or [],
-                }
-            )
-            e["properties"] = props
+                # keep canonical fields in sync
+                if a.get("name"):
+                    e["name"] = a.get("name")
+                if a.get("description") is not None:
+                    e["description"] = a.get("description") or ""
+                if a.get("role") is not None:
+                    e["role"] = a.get("role") or ""
+                if isinstance(a.get("inputData"), list):
+                    e["inputData"] = a.get("inputData") or []
+                if isinstance(a.get("outputData"), list):
+                    e["outputData"] = a.get("outputData") or []
+                if isinstance(a.get("checkpoints"), list):
+                    e["checkpoints"] = a.get("checkpoints") or []
+                if isinstance(a.get("skills"), list):
+                    e["skills"] = a.get("skills") or []
+
+                # properties are serialized into uengine:json for tasks
+                props = e.get("properties") if isinstance(e.get("properties"), dict) else {}
+                props = dict(props)
+                props.update(
+                    {
+                        "role": a.get("role"),
+                        "duration": a.get("duration", 5),
+                        "instruction": a.get("instruction") or "",
+                        "tool": a.get("tool") or "",
+                        "agent": a.get("agent", None),
+                        "agentMode": a.get("agentMode") or "none",
+                        "orchestration": a.get("orchestration", None),
+                        "attachments": a.get("attachments") or [],
+                        "skills": a.get("skills") or [],
+                        "customProperties": a.get("customProperties") or [],
+                    }
+                )
+                e["properties"] = props
+
+            elif etype == "Gateway":
+                # 게이트웨이의 conditionData(분기 판단용 참조 필드)도 elements_model 에 sync.
+                # → BPMN XML 생성기가 properties(uengine:json)로 직렬화하여 프론트에서 읽을 수 있게 함.
+                gid = str(e.get("id") or "").strip()
+                if not gid or gid not in gws_by_id:
+                    continue
+                g = gws_by_id[gid]
+                if g.get("name"):
+                    e["name"] = g.get("name")
+                if g.get("description") is not None:
+                    e["description"] = g.get("description") or ""
+                if g.get("role") is not None:
+                    e["role"] = g.get("role") or ""
+                if isinstance(g.get("conditionData"), list):
+                    e["conditionData"] = g.get("conditionData") or []
 
         em["elements"] = elems
         return em
@@ -5075,7 +5383,11 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 )
 
         # Gateway branching: ensure conditions exist when a gateway has multiple outgoing.
-        # Also: remove degenerate gateways (<=1 outgoing) by collapsing them into straight sequences.
+        # Also: handle degenerate gateways (<=1 outgoing).
+        #   기존: 무조건 collapse(삭제) 했음 → 추출 단계에서 연결선이 빠진 게이트웨이가
+        #         곧장 사라짐.
+        #   변경: 가능한 한 누락된 outgoing 을 자동 보강한 뒤 게이트웨이를 유지하고,
+        #         보강 후보가 정말 없을 때만 collapse 한다.
         outgoing_by_source = {}
         incoming_by_target: Dict[str, List[Dict[str, Any]]] = {}
         for s in seqs:
@@ -5086,13 +5398,134 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
         removed_gateway_ids: Set[str] = set()
         if gateway_ids:
-            # collapse single-branch gateways: connect incoming.source -> outgoing.target and remove gateway node/sequences
+            element_by_id_for_gw: Dict[str, Dict[str, Any]] = {
+                str(e.get("id")): e for e in elems if isinstance(e, dict) and e.get("id")
+            }
+
+            def _gw_collect_candidates(
+                gid: str,
+                outs_list: List[Dict[str, Any]],
+                ins_list: List[Dict[str, Any]],
+            ) -> List[Tuple[str, str]]:
+                """게이트웨이의 누락된 outgoing 을 보강할 후보 (target_id, condition) 목록.
+
+                보강 휴리스틱:
+                  (1) incoming source task 의 _다른_ outgoing(gateway 외) 의 target 들
+                      LLM 이 분기 task 의 multi-outgoing 을 그대로 놔두고 그중 일부만
+                      게이트웨이로 우회시킨 케이스 → sibling 들을 게이트웨이로 모은다.
+                  (2) gateway 의 name/description 에 task name 이 substring 으로 등장하는
+                      같은 process 내 Activity (보수적 매칭, len(ename) >= 3 강제).
+                """
+                existing_out_target_ids: Set[str] = {
+                    str(s.get("target") or "") for s in outs_list
+                }
+                candidates: List[Tuple[str, str]] = []
+                seen_targets: Set[str] = set(existing_out_target_ids)
+
+                # (1) sibling outgoing
+                for inc_ in ins_list:
+                    src_id = str(inc_.get("source") or "")
+                    if not src_id:
+                        continue
+                    src_el = element_by_id_for_gw.get(src_id) or {}
+                    if str(src_el.get("elementType") or "") == "Gateway":
+                        continue
+                    for sib in outgoing_by_source.get(src_id) or []:
+                        sib_tgt = str(sib.get("target") or "")
+                        if not sib_tgt or sib_tgt == gid or sib_tgt in seen_targets:
+                            continue
+                        sib_el = element_by_id_for_gw.get(sib_tgt) or {}
+                        if str(sib_el.get("elementType") or "") in ("Event", "Gateway"):
+                            continue
+                        cond_ = str(sib.get("condition") or "").strip()
+                        candidates.append((sib_tgt, cond_))
+                        seen_targets.add(sib_tgt)
+
+                # (2) keyword / substring 매칭 — 보수적
+                gw_el_kw = element_by_id_for_gw.get(gid) or {}
+                gw_text_parts = [
+                    str(gw_el_kw.get("name") or ""),
+                    str(gw_el_kw.get("description") or ""),
+                ]
+                gw_text = " ".join([p for p in gw_text_parts if p]).strip()
+                same_proc_id = str(
+                    gw_el_kw.get("processId") or gw_el_kw.get("process_id") or ""
+                )
+                if gw_text:
+                    for el in elems:
+                        if not isinstance(el, dict):
+                            continue
+                        if str(el.get("elementType") or "") != "Activity":
+                            continue
+                        eid = str(el.get("id") or "")
+                        if not eid or eid in seen_targets or eid == gid:
+                            continue
+                        ename = str(el.get("name") or "").strip()
+                        if not ename or len(ename) < 3:
+                            continue
+                        if same_proc_id:
+                            el_proc = str(
+                                el.get("processId") or el.get("process_id") or ""
+                            )
+                            if el_proc and el_proc != same_proc_id:
+                                continue
+                        # substring (양방향) 매칭 — 둘 다 길이 3 이상일 때만
+                        if ename in gw_text or (len(gw_text) >= 3 and gw_text in ename):
+                            candidates.append((eid, ""))
+                            seen_targets.add(eid)
+
+                return candidates
+
             for gid in list(gateway_ids):
                 outs = outgoing_by_source.get(gid) or []
                 if len(outs) >= 2:
                     continue
                 ins = incoming_by_target.get(gid) or []
-                out_target = str(outs[0].get("target")) if outs else ""
+
+                # ── 보강 시도
+                candidates = _gw_collect_candidates(gid, outs, ins)
+                added_count = 0
+                if candidates:
+                    needed = max(0, 2 - len(outs))
+                    for tgt_id, cond in candidates:
+                        if added_count >= needed:
+                            break
+                        if not tgt_id or tgt_id == gid:
+                            continue
+                        if (gid, tgt_id) in seq_pairs:
+                            continue
+                        new_seq = {
+                            "elementType": "Sequence",
+                            "id": f"seq_{gid}_{tgt_id}",
+                            "name": cond or "",
+                            "source": gid,
+                            "target": tgt_id,
+                            "condition": cond or "",
+                            "_synthesized": "gateway_outgoing_augment",
+                        }
+                        seqs.append(new_seq)
+                        seq_pairs.add((gid, tgt_id))
+                        outgoing_by_source.setdefault(gid, []).append(new_seq)
+                        incoming_by_target.setdefault(tgt_id, []).append(new_seq)
+                        added_count += 1
+
+                outs_after = outgoing_by_source.get(gid) or []
+                if added_count > 0:
+                    try:
+                        logger.info(
+                            f"[PROCDEF][GW-AUGMENT] gateway={gid!r} "
+                            f"outs_before={len(outs)} added={added_count} "
+                            f"outs_after={len(outs_after)} keep_gateway={len(outs_after) >= 2}"
+                        )
+                    except Exception:
+                        pass
+
+                if len(outs_after) >= 2:
+                    # 게이트웨이 유지
+                    continue
+
+                # ── 보강 실패 → 기존 collapse 로직: incoming.source → outgoing.target 직선화
+                out_target = str(outs_after[0].get("target")) if outs_after else ""
                 for inc in ins:
                     src = str(inc.get("source") or "")
                     if src and out_target and src != out_target and (src, out_target) not in seq_pairs:
@@ -5108,6 +5541,14 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         )
                         seq_pairs.add((src, out_target))
                 removed_gateway_ids.add(gid)
+                try:
+                    logger.info(
+                        f"[PROCDEF][GW-COLLAPSE] gateway={gid!r} "
+                        f"outs={len(outs_after)} ins={len(ins)} "
+                        f"reason=no_augment_candidate"
+                    )
+                except Exception:
+                    pass
 
             if removed_gateway_ids:
                 seqs = [

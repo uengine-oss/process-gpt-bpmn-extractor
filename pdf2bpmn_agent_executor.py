@@ -35,6 +35,21 @@ from src.pdf2bpmn.skill_enricher import (
     build_activity_index,
     render_skill_markdown,
 )
+from src.pdf2bpmn.hitl import (
+    HitlPauseException,
+    build_question_payload,
+    clear_hitl_checkpoint,
+    mark_hitl_process_resolved,
+    stable_hitl_question_id,
+    custom_text as hitl_custom_text,
+    emit_human_feedback_received,
+    emit_waiting_for_user,
+    is_skipped as hitl_is_skipped,
+    make_question_id,
+    pause_for_hitl,
+    read_batch_responses,
+    selected_ids as hitl_selected_ids,
+)
 
 # OpenAI
 try:
@@ -1974,6 +1989,62 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             "llm_used": bool(isinstance(chosen, dict)),
             "llm_used_gateways": bool(isinstance(chosen_gateways, dict)),
         }
+
+    async def _strip_dmn_from_saved_proc_defs(
+        self,
+        *,
+        proc_def_ids: List[str],
+        tenant_id: str,
+    ) -> int:
+        """사용자가 통합 elicit 에서 'DMN 적용 안 함' 을 선택한 경우 저장된 proc_def 들에서
+        dmn 관련 키(decisions/rules/dmnXml/businessRuleTask 참조 등) 를 제거하고 update.
+
+        반환: 처리된 row 수.
+        """
+        if not self.supabase_client or not proc_def_ids:
+            return 0
+        DMN_KEYS = ("dmn", "dmnXml", "dmn_xml", "decisions", "decision_rules", "dmn_decisions", "dmn_rules")
+        count = 0
+        for pid in proc_def_ids:
+            pid_str = str(pid or "").strip()
+            if not pid_str:
+                continue
+            try:
+                res = self.supabase_client.table("proc_def").select("definition").eq("id", pid_str).limit(1).execute()
+                rows = getattr(res, "data", None) or []
+                if not rows:
+                    continue
+                definition = rows[0].get("definition") or {}
+                if isinstance(definition, str):
+                    try:
+                        definition = json.loads(definition)
+                    except Exception:
+                        definition = {}
+                if not isinstance(definition, dict):
+                    continue
+                changed = False
+                for k in DMN_KEYS:
+                    if k in definition:
+                        definition.pop(k, None)
+                        changed = True
+                # activity 단의 businessRule 참조도 정리 (있을 경우)
+                acts = definition.get("activities")
+                if isinstance(acts, list):
+                    for a in acts:
+                        if not isinstance(a, dict):
+                            continue
+                        if a.get("type") == "businessRuleTask" or a.get("decisionRef"):
+                            a.pop("decisionRef", None)
+                            changed = True
+                if changed:
+                    self.supabase_client.table("proc_def").update(
+                        {"definition": definition, "tenant_id": tenant_id, "isdeleted": False}
+                    ).eq("id", pid_str).execute()
+                    count += 1
+            except Exception as e:
+                logger.warning(f"[DMN-STRIP] proc_def {pid_str} 처리 실패: {e}")
+        logger.info(f"[DMN-STRIP] DMN 제거 완료: {count}/{len(proc_def_ids)} proc_def")
+        return count
 
     async def _update_proc_def_definition_only(self, *, proc_def_id: str, tenant_id: str, definition: Dict[str, Any]) -> bool:
         """proc_def.definition만 업데이트(폼 id 연결을 위해)."""
@@ -4564,6 +4635,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         *,
         runtime_def: Dict[str, Any],
         extracted: Dict[str, Any],
+        approved_gateway_ids: Optional[Set[str]] = None,
     ) -> Dict[str, Any]:
         """
         Gateway 분기 조건을 검증 가능한 형태로 남기기 위해 DMN 메타를 보강합니다.
@@ -4650,6 +4722,9 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             gid = str(gw.get("id") or "").strip()
             gtype = str(gw.get("type") or "").lower().strip()
             if not gid or "exclusive" not in gtype:
+                continue
+            # HITL: 사용자가 선택한 게이트웨이만 DMN 으로 변환 (None 이면 전체 자동)
+            if approved_gateway_ids is not None and gid not in approved_gateway_ids:
                 continue
             outs = outgoing_by_source.get(gid) or []
             if len(outs) < 2:
@@ -6737,6 +6812,370 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         except Exception as e:
             logger.warning(f"[WARN] lane-skill assignment failed: {e}")
 
+    # =========================================================================
+    # HITL 사전 후보 추출 — 실제 생성/INSERT 없이 사용자에게 보여줄 후보만 만든다.
+    # =========================================================================
+
+    async def _collect_agent_candidates(
+        self,
+        *,
+        proc_json: Dict[str, Any],
+        tenant_id: str,
+        process_name: str,
+    ) -> List[Dict[str, Any]]:
+        """신규로 만들 가능성이 있는 에이전트 후보 목록을 반환 (INSERT 없음).
+
+        각 후보:
+          {
+            "candidate_id":  "agent_<role>_<skill>",   # 식별자
+            "role_name":     "심사역",
+            "skill_name":    "검토 처리",
+            "activity_ids":  [...],
+            "existing_id":   "<user.id>" | None,       # 매칭된 기존 에이전트 (있으면 신규 생성 불필요)
+            "profile":       {...} | None,             # 신규일 때 LLM 으로 미리 생성한 프로필
+            "label":         "심사역 — 검토 처리",
+            "description":   "name/role/goal/persona 요약",
+          }
+        """
+        try:
+            await self._load_org_and_agents(tenant_id)
+        except Exception as e:
+            logger.warning(f"[CAND][AGENT] org/agents 로드 실패: {e}")
+
+        proc_skills = proc_json.get("skills") or []
+        skill_name_by_id = {
+            str(s.get("id") or "").strip(): str(s.get("name") or "").strip()
+            for s in proc_skills
+            if isinstance(s, dict)
+        }
+        activities = proc_json.get("activities") or []
+        activity_by_id = {
+            str(a.get("id") or "").strip(): a
+            for a in activities
+            if isinstance(a, dict) and str(a.get("id") or "").strip()
+        }
+
+        processor = ProcessPostProcessor(
+            min_ratio=self._skill_extraction_min_ratio,
+            min_count=self._skill_extraction_min_count,
+            lane_skill_min_tasks=self._agent_creation_min_tasks_per_skill_per_lane,
+            require_automation=self._agent_creation_require_automation,
+        )
+        raw_candidates = processor.collect_lane_skill_candidates(proc_json)
+        out: List[Dict[str, Any]] = []
+        for cand in raw_candidates:
+            role_name = str(cand.get("role") or "").strip()
+            skill_id = str(cand.get("skill_id") or "").strip()
+            activity_ids = [str(x).strip() for x in (cand.get("activity_ids") or []) if str(x).strip()]
+            if not role_name or not skill_id or not activity_ids:
+                continue
+            skill_name = skill_name_by_id.get(skill_id) or skill_id
+            cand_id = f"agent_{self._normalize_text_key(role_name)}_{self._normalize_text_key(skill_name)}"
+            existing = self._pick_existing_agent_for_lane_skill(
+                role_name=role_name,
+                skill_names=[skill_name],
+            )
+            existing_id = str(existing.get("id")) if existing and existing.get("id") else None
+
+            profile: Optional[Dict[str, Any]] = None
+            description = ""
+            if not existing_id:
+                # 신규 에이전트 후보 — LLM 으로 미리 프로필 생성해 미리보기 제공.
+                team_id = self._org_teams_by_name.get(self._normalize_text_key(role_name)) or ""
+                team_name = self._org_team_name_by_id.get(team_id) or role_name or "미분류"
+                snippets: List[str] = []
+                for aid in activity_ids[:6]:
+                    a = activity_by_id.get(aid, {})
+                    snippets.append(
+                        " ".join(
+                            str(x or "")
+                            for x in (
+                                a.get("name"),
+                                a.get("instruction"),
+                                a.get("description"),
+                            )
+                        )
+                    )
+                user_input = (
+                    f"프로세스 '{process_name}'의 역할 '{role_name}'에 대해 다음 공통 스킬을 수행할 에이전트를 설계하세요.\n"
+                    f"- 공통 스킬: {skill_name}\n"
+                    f"- 대표 태스크 맥락: {' | '.join(snippets)}\n"
+                    "불필요한 일반 업무는 제외하고 자동화 가능한 작업 중심으로 설계하세요."
+                )
+                mcp_tools = self._safe_json_loads(os.getenv("MCP_TOOLS_JSON", "")) or {}
+                try:
+                    profile = await self._llm_generate_agent_profile(
+                        team_name=team_name,
+                        user_input=user_input,
+                        mcp_tools=mcp_tools,
+                    )
+                except Exception as e:
+                    logger.warning(f"[CAND][AGENT] profile 생성 실패: role={role_name} err={e}")
+                    profile = None
+                if profile:
+                    description = " · ".join(
+                        str(x).strip() for x in (
+                            profile.get("role"),
+                            profile.get("goal"),
+                            profile.get("persona"),
+                        ) if str(x or "").strip()
+                    )[:160]
+
+            out.append({
+                "candidate_id": cand_id,
+                "role_name": role_name,
+                "skill_id": skill_id,
+                "skill_name": skill_name,
+                "activity_ids": activity_ids,
+                "existing_id": existing_id,
+                "profile": profile,
+                "label": (
+                    f"{role_name} — {skill_name}"
+                    + (" (기존 에이전트 재사용)" if existing_id else " (신규)")
+                ),
+                "description": (
+                    f"담당 활동 {len(activity_ids)}개"
+                    + (f" · {description}" if description else "")
+                    + (f" · 기존 에이전트 ID: {existing_id}" if existing_id else "")
+                ),
+            })
+        return out
+
+    async def _apply_approved_agents(
+        self,
+        *,
+        proc_json: Dict[str, Any],
+        tenant_id: str,
+        candidates: List[Dict[str, Any]],
+        approved_ids: Set[str],
+    ) -> Dict[str, Set[str]]:
+        """승인된 후보만 실제 처리:
+          - existing_id 있는 후보 → 그 에이전트 그대로 할당
+          - 신규 후보 (existing_id 없음) → profile 기반으로 _insert_agent_user 호출
+          - 거부된 후보 → activity.agent=None 처리
+        반환: {agent_id: {skill_name...}}
+        """
+        agent_skill_names: Dict[str, Set[str]] = {}
+        if not isinstance(proc_json, dict):
+            return agent_skill_names
+        activities = proc_json.get("activities") or []
+        roles = proc_json.get("roles") or []
+        activity_by_id = {
+            str(a.get("id") or "").strip(): a
+            for a in activities
+            if isinstance(a, dict) and str(a.get("id") or "").strip()
+        }
+        role_agent_by_name: Dict[str, str] = {}
+
+        for cand in candidates:
+            cand_id = str(cand.get("candidate_id") or "")
+            if cand_id not in approved_ids:
+                continue
+            role_name = str(cand.get("role_name") or "").strip()
+            skill_name = str(cand.get("skill_name") or "").strip()
+            activity_ids = [str(x).strip() for x in (cand.get("activity_ids") or []) if str(x).strip()]
+            existing_id = cand.get("existing_id")
+
+            agent_id = existing_id
+            if not agent_id:
+                profile = cand.get("profile") or {}
+                if profile:
+                    try:
+                        created = await self._insert_agent_user(
+                            tenant_id=tenant_id,
+                            agent_profile=profile,
+                            agent_type="agent",
+                        )
+                        if created and created.get("id"):
+                            agent_id = str(created.get("id"))
+                            team_id = self._org_teams_by_name.get(self._normalize_text_key(role_name)) or ""
+                            if team_id:
+                                await self._update_org_chart_add_member(
+                                    tenant_id=tenant_id,
+                                    team_id=team_id,
+                                    member_user=created,
+                                )
+                    except Exception as e:
+                        logger.warning(f"[APPLY][AGENT] INSERT 실패: {cand_id} err={e}")
+                        continue
+            if not agent_id:
+                continue
+
+            role_agent_by_name[role_name] = agent_id
+            agent_skill_names.setdefault(agent_id, set()).add(skill_name)
+
+            for aid in activity_ids:
+                a = activity_by_id.get(aid)
+                if not isinstance(a, dict):
+                    continue
+                a["agent"] = agent_id
+                a["agentMode"] = "complete"
+                a["orchestration"] = "deepagents"
+
+        # 후보에 없거나 거부된 activity 는 명시적으로 none 처리 (스킬 부착된 건 제외)
+        for a in activities:
+            if not isinstance(a, dict):
+                continue
+            if isinstance(a.get("skills"), list) and a.get("skills"):
+                a["agentMode"] = "complete"
+                a["orchestration"] = "deepagents"
+                continue
+            if str(a.get("agent") or "").strip():
+                continue
+            a["agent"] = None
+            a["agentMode"] = "none"
+            a["orchestration"] = None
+
+        # roles.endpoint 갱신
+        for r in roles:
+            if not isinstance(r, dict):
+                continue
+            rname = str(r.get("name") or "").strip()
+            if not rname:
+                continue
+            agent_id = role_agent_by_name.get(rname)
+            if agent_id:
+                r["endpoint"] = agent_id
+                r["origin"] = "used"
+
+        proc_json["activities"] = activities
+        proc_json["roles"] = roles
+        return agent_skill_names
+
+    def _collect_dmn_candidates_from_proc_json(
+        self,
+        *,
+        proc_json: Dict[str, Any],
+        proc_def_id: str,
+        process_name: str,
+    ) -> List[Dict[str, Any]]:
+        """실제 생성될 proc_json 의 게이트웨이 중 DMN 의사결정 테이블로 변환 가능한 것만 후보로 반환.
+
+        후보 소스가 추출 단계 원시 엔티티(state.gateways)가 아니라, 검증/병합/축약을
+        모두 거친 최종 proc_json.gateways 이므로:
+          - "실제로 생성될 게이트웨이"만 노출된다 (유령/중복 게이트웨이 제거).
+          - 분기 수/조건을 proc_json.sequences 에서 실측하므로 "분기 0개" 오류가 없다.
+
+        자격 조건 (_augment_runtime_with_gateway_dmn 의 게이트와 동일):
+          - ExclusiveGateway (parallel/inclusive 는 조건 평가 의미가 달라 제외)
+          - outgoing sequence 2개 이상
+
+        각 후보:
+          {
+            "candidate_id": "dmn::<proc_def_id>::<gateway_id>",
+            "proc_def_id":  "...",
+            "gateway_id":   "...",
+            "gateway_name": "...",
+            "label":        "[프로세스명] 게이트웨이명",
+            "description":  "분기 N개: 조건1 → 대상1 / 조건2 → 대상2",
+          }
+        """
+        out: List[Dict[str, Any]] = []
+        if not isinstance(proc_json, dict):
+            return out
+        gateways = proc_json.get("gateways") or []
+        sequences = proc_json.get("sequences") or []
+        if not isinstance(gateways, list) or not isinstance(sequences, list):
+            return out
+
+        # 분기 대상 노드 이름 lookup (description 표시용)
+        node_name_by_id: Dict[str, str] = {}
+        for coll in (
+            proc_json.get("activities") or [],
+            proc_json.get("events") or [],
+            gateways,
+        ):
+            if isinstance(coll, list):
+                for n in coll:
+                    if isinstance(n, dict) and str(n.get("id") or "").strip():
+                        node_name_by_id[str(n.get("id")).strip()] = str(n.get("name") or "").strip()
+
+        outgoing_by_source: Dict[str, List[Dict[str, Any]]] = {}
+        for s in sequences:
+            if isinstance(s, dict):
+                src = str(s.get("source") or "").strip()
+                if src:
+                    outgoing_by_source.setdefault(src, []).append(s)
+
+        for gw in gateways:
+            if not isinstance(gw, dict):
+                continue
+            gid = str(gw.get("id") or "").strip()
+            gtype = str(gw.get("type") or "").lower().strip()
+            if not gid:
+                continue
+            # parallel/inclusive 게이트웨이는 DMN 의사결정 테이블 대상이 아니다.
+            if "exclusive" not in gtype:
+                continue
+            outs = outgoing_by_source.get(gid) or []
+            if len(outs) < 2:
+                # 분기 2개 미만 → 의사결정 테이블로 만들 의미가 없다.
+                continue
+
+            gname = str(gw.get("name") or "").strip() or gid
+            branch_descs: List[str] = []
+            for s in outs:
+                cond = str(s.get("condition") or s.get("expression") or "").strip()
+                tgt = str(s.get("target") or "").strip()
+                tgt_name = node_name_by_id.get(tgt) or tgt
+                if cond and tgt_name:
+                    branch_descs.append(f"{cond} → {tgt_name}"[:80])
+                elif cond:
+                    branch_descs.append(cond[:80])
+                elif tgt_name:
+                    branch_descs.append(f"→ {tgt_name}"[:80])
+            desc = f"분기 {len(outs)}개" + (
+                ": " + " / ".join(branch_descs) if branch_descs else ""
+            )
+            out.append({
+                "candidate_id": f"dmn::{proc_def_id}::{gid}",
+                "proc_def_id": str(proc_def_id),
+                "gateway_id": gid,
+                "gateway_name": gname,
+                "label": f"[{process_name}] {gname}" if process_name else gname,
+                "description": desc[:200],
+            })
+        return out
+
+    def _remove_rejected_skills_from_proc_json(
+        self,
+        *,
+        proc_json: Dict[str, Any],
+        approved_skill_keys: Set[str],
+    ) -> int:
+        """사용자가 거부한 스킬을 proc_json 에서 제거.
+        - proc_json['skills'] 에서 빠짐
+        - activities[*].skills 에서 해당 id 제거
+        반환: 제거된 카드 수.
+        """
+        if not isinstance(proc_json, dict):
+            return 0
+        removed = 0
+        skills = proc_json.get("skills") or []
+        if isinstance(skills, list):
+            new_skills = []
+            removed_ids: Set[str] = set()
+            for s in skills:
+                if not isinstance(s, dict):
+                    continue
+                key = self._normalize_skill_key(str(s.get("safe_name") or s.get("name") or s.get("id") or ""))
+                if key in approved_skill_keys:
+                    new_skills.append(s)
+                else:
+                    sid = str(s.get("id") or s.get("safe_name") or "").strip()
+                    if sid:
+                        removed_ids.add(sid)
+                    removed += 1
+            proc_json["skills"] = new_skills
+            # activities 에서 거부된 id 제거
+            for a in proc_json.get("activities") or []:
+                if not isinstance(a, dict):
+                    continue
+                a_skills = a.get("skills")
+                if isinstance(a_skills, list) and removed_ids:
+                    a["skills"] = [x for x in a_skills if str(x or "").strip() not in removed_ids]
+        return removed
+
     async def _send_progress_event(
         self, 
         event_queue: EventQueue, 
@@ -7405,6 +7844,121 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             logger.error(f"[ERROR] Failed to update proc_map: {e}")
             return False
 
+    def _parse_todolist_output_field(self, raw: Any) -> Dict[str, Any]:
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    async def _load_fresh_todolist_output(self, task_id: str) -> Dict[str, Any]:
+        if not self.supabase_client or not task_id:
+            return {}
+        from src.pdf2bpmn.hitl import _read_todolist_output  # type: ignore
+
+        return await asyncio.to_thread(
+            _read_todolist_output, self.supabase_client, str(task_id)
+        )
+
+    def _get_hitl_resume_checkpoint_if_fb_requested(
+        self, row: Dict[str, Any], output: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        out = output if isinstance(output, dict) else self._parse_todolist_output_field(
+            row.get("output")
+        )
+        cp = out.get("hitl_checkpoint")
+        if not isinstance(cp, dict) or cp.get("stage") != "unified_post_procgen":
+            return None
+        task_type = str(row.get("task_type") or "").upper()
+        phase = str(out.get("pdf2bpmn_phase") or "").lower()
+        todo_id = str(row.get("id") or "")
+
+        def _log_resume(reason: str) -> Dict[str, Any]:
+            logger.info(
+                "[HITL][RESUME] %s — todo_id=%s process_index=%s task_type=%s phase=%s",
+                reason,
+                todo_id,
+                cp.get("process_index"),
+                task_type,
+                phase,
+            )
+            return cp
+
+        if task_type == "FB_REQUESTED":
+            return _log_resume("FB_REQUESTED 재진입")
+        if phase == "post_hitl_generate":
+            return _log_resume("post_hitl_generate phase")
+        if out.get("hitl_paused") or phase == "awaiting_hitl":
+            qids_map = cp.get("question_ids") if isinstance(cp.get("question_ids"), dict) else {}
+            # question_ids 값은 문자열(dmn) 또는 {proc_def_id: qid} dict(skills/agents) 둘 다 가능
+            qids: List[str] = []
+            for v in qids_map.values():
+                if isinstance(v, dict):
+                    qids.extend(str(x) for x in v.values() if str(x or "").strip())
+                elif str(v or "").strip():
+                    qids.append(str(v))
+            if qids and self.supabase_client and todo_id:
+                entries = read_batch_responses(
+                    self.supabase_client,
+                    todo_id,
+                    qids,
+                    cp.get("wait_started_at"),
+                )
+                if all(entries.get(q) for q in qids):
+                    return _log_resume("HITL 응답 완료(폴백 재진입)")
+        return None
+
+    async def _apply_unified_hitl_to_process(
+        self,
+        *,
+        proc_json: Dict[str, Any],
+        process_name: str,
+        process_skill_metas: List[Dict[str, Any]],
+        agent_candidates_for_process: List[Dict[str, Any]],
+        approved_skill_keys: Optional[Set[str]],
+        approved_agent_ids: Optional[Set[str]],
+        state: Dict[str, Any],
+        tenant_id: str,
+        agent_user_ids_for_skill_sync: Set[str],
+        agent_skill_names_for_sync: Dict[str, Set[str]],
+    ) -> List[Dict[str, Any]]:
+        """HITL 응답을 proc_json / 후보 목록에 반영."""
+        if approved_skill_keys is not None:
+            removed = self._remove_rejected_skills_from_proc_json(
+                proc_json=proc_json,
+                approved_skill_keys=approved_skill_keys,
+            )
+            if removed:
+                logger.info(f"[HITL][SKILL] {removed}개 스킬 거부 → proc_json 정리")
+            state.setdefault("__hitl_approved_skill_keys", set()).update(approved_skill_keys)
+
+        if agent_candidates_for_process and approved_agent_ids is not None:
+            try:
+                applied = await self._apply_approved_agents(
+                    proc_json=proc_json,
+                    tenant_id=tenant_id,
+                    candidates=agent_candidates_for_process,
+                    approved_ids=approved_agent_ids,
+                )
+                for aid, sk_set in (applied or {}).items():
+                    agent_user_ids_for_skill_sync.add(aid)
+                    agent_skill_names_for_sync.setdefault(aid, set()).update(sk_set)
+            except Exception as exc:
+                logger.warning(f"[HITL][AGENT] apply 실패: {exc}")
+
+        if process_skill_metas and approved_skill_keys is not None:
+            process_skill_metas = [
+                m for m in process_skill_metas
+                if isinstance(m, dict)
+                and self._normalize_skill_key(str(m.get("safe_name") or m.get("name") or ""))
+                in approved_skill_keys
+            ]
+        return process_skill_metas
+
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         """
         메인 실행 로직 - ProcessGPT SDK 인터페이스 구현
@@ -7455,6 +8009,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         # 부분 실패 상황에서도 NameError 없이 안전하게 drop 시도할 수 있도록 한다.
         workflow: Optional[Any] = None  # type: ignore[name-defined]
         age_graph_name_for_cleanup: str = ""
+        hitl_paused_only: bool = False
         
         try:
             # 2. 작업 시작 이벤트
@@ -7550,602 +8105,648 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # if retry_count >= max_retries:
             #     raise Exception("처리 시간 초과")
             
-            # =================================================================
-            # 4. 메멘토(process-gpt-memento)에서 사전 처리된 청크/임베딩 로드
-            #    - 메인 채팅 → 메멘토 → 메인 에이전트 → pdf2bpmn 흐름이 고정이므로
-            #      pdf2bpmn 시점에는 메멘토가 이미 다음을 끝낸 상태이다:
-            #        · Storage 업로드 (PDF 변환 포함)
-            #        · 페이지/문서 텍스트 추출 + chunking
-            #        · 임베딩(Chroma + Supabase documents)
-            #    - 따라서 pdf2bpmn은 더 이상 다운로드/변환/Synap/HWP 분기 처리를 하지 않고,
-            #      파일 형식과 무관하게 동일하게 메멘토의 청크를 받아 섹션 분할/노드 추출에
-            #      이어 사용한다.
-            # =================================================================
-            if not input_files:
-                raise Exception("파일 URL이 제공되지 않았습니다. query의 [InputData]에 file/files를 포함해주세요.")
-
-            pdf_paths_for_workflow: List[str] = []  # 더 이상 사용하지 않음 (호환용 placeholder)
+            fresh_output = await self._load_fresh_todolist_output(str(task_id))
+            resume_cp = self._get_hitl_resume_checkpoint_if_fb_requested(row, fresh_output)
+            main_loop = asyncio.get_running_loop()
+            request_graph_run_id = ""
             input_file_names: List[str] = []
-            fetch_errors: List[str] = []
-            preloaded_documents: List[PdfDocument] = []
-            preloaded_sections: List[Section] = []
-            preloaded_chunks: List[ReferenceChunk] = []
-            total_reused_embeddings = 0
+            extracted_by_proc_id: Dict[str, Dict[str, Any]] = {}
+            state: Dict[str, Any] = {}
 
-            # 사용자 [도구 설정] pdf2bpmnLevel 을 SOP 분할 단계에서 사용하기 위해 미리 추출.
-            # 이후 workflow.set_dedup_level 호출은 dedup 임계 적용용으로 동일 값을 다시 사용한다.
-            try:
-                _ts_for_section = parsed.get("tool_settings") or {}
-                _seg_level = (_ts_for_section.get("pdf2bpmnLevel") or "standard").strip().lower()
-                if _seg_level not in {"concise", "standard", "detailed"}:
-                    _seg_level = "standard"
-            except Exception:
-                _seg_level = "standard"
-            logger.info(f"[SECTION-LEVEL] pdf2bpmnLevel='{_seg_level}' applied to SOP segmentation")
-
-            for idx, file_info in enumerate(input_files, start=1):
-                file_url = (file_info.get("url") or "").strip()
-                display_name = (file_info.get("name") or f"document_{idx}").strip() or f"document_{idx}"
-                file_path = (file_info.get("path") or "").strip().rstrip("?")
-                file_room_id = (file_info.get("room_id") or parsed_room_id or "").strip()
-                file_tenant_id = (file_info.get("tenant_id") or effective_tenant_id or "").strip()
-
-                if not file_url and not file_path and not display_name:
-                    continue
-
+            if resume_cp:
                 await self._send_progress_event(
                     event_queue, context_id, task_id, job_id,
-                    f"[MEMENTO] 청크/임베딩 조회 중 ({idx}/{len(input_files)}): {display_name}",
-                    "tool_usage_started", 8
+                    "[RESUME] HITL 응답을 반영해 프로세스 생성을 이어갑니다...",
+                    "tool_usage_started", 73,
                 )
+                effective_tenant_id = str(resume_cp.get("effective_tenant_id") or effective_tenant_id)
+                age_graph_name = str(resume_cp.get("age_graph_name") or age_graph_name)
+                age_graph_name_for_cleanup = age_graph_name
+                user_input = str(resume_cp.get("user_input") or user_input or "")
+                pdf_name = str(resume_cp.get("pdf_name") or pdf_name)
+                input_file_names = list(resume_cp.get("input_file_names") or [])
+                request_graph_run_id = str(resume_cp.get("request_graph_run_id") or f"{task_id}-resume")
+                ws = resume_cp.get("workflow_state") if isinstance(resume_cp.get("workflow_state"), dict) else {}
+                state = {
+                    "dmn_decisions": list(ws.get("dmn_decisions") or []),
+                    "dmn_rules": list(ws.get("dmn_rules") or []),
+                    "skill_docs": dict(ws.get("skill_docs") or {}),
+                    "__hitl_dmn_decided": ws.get("__hitl_dmn_decided"),
+                    "__hitl_approved_dmn_gateways": set(ws.get("__hitl_approved_dmn_gateways") or []),
+                    "__hitl_approved_skill_keys": set(ws.get("__hitl_approved_skill_keys") or []),
+                    "processes": [],
+                }
+                # resume: checkpoint 의 prepared_processes(proc_json/extracted_payload 포함)를
+                # 그대로 복원하므로 Neo4j 재조회 불필요. extracted_by_proc_id 를 비워두면
+                # PASS1 for 루프가 0회 실행되어 자동으로 건너뛴다.
+                extracted_by_proc_id = {}
 
+            if not resume_cp:
+
+                # =================================================================
+                # 4. 메멘토(process-gpt-memento)에서 사전 처리된 청크/임베딩 로드
+                #    - 메인 채팅 → 메멘토 → 메인 에이전트 → pdf2bpmn 흐름이 고정이므로
+                #      pdf2bpmn 시점에는 메멘토가 이미 다음을 끝낸 상태이다:
+                #        · Storage 업로드 (PDF 변환 포함)
+                #        · 페이지/문서 텍스트 추출 + chunking
+                #        · 임베딩(Chroma + Supabase documents)
+                #    - 따라서 pdf2bpmn은 더 이상 다운로드/변환/Synap/HWP 분기 처리를 하지 않고,
+                #      파일 형식과 무관하게 동일하게 메멘토의 청크를 받아 섹션 분할/노드 추출에
+                #      이어 사용한다.
+                # =================================================================
+                if not input_files:
+                    raise Exception("파일 URL이 제공되지 않았습니다. query의 [InputData]에 file/files를 포함해주세요.")
+
+                pdf_paths_for_workflow: List[str] = []  # 더 이상 사용하지 않음 (호환용 placeholder)
+                input_file_names: List[str] = []
+                fetch_errors: List[str] = []
+                preloaded_documents: List[PdfDocument] = []
+                preloaded_sections: List[Section] = []
+                preloaded_chunks: List[ReferenceChunk] = []
+                total_reused_embeddings = 0
+
+                # 사용자 [도구 설정] pdf2bpmnLevel 을 SOP 분할 단계에서 사용하기 위해 미리 추출.
+                # 이후 workflow.set_dedup_level 호출은 dedup 임계 적용용으로 동일 값을 다시 사용한다.
                 try:
-                    memento_chunks = await self._fetch_memento_chunks(
-                        tenant_id=file_tenant_id,
-                        file_path=file_path,
-                        file_name=display_name,
-                        room_id=file_room_id,
-                        include_embeddings=True,
-                    )
-                    if not memento_chunks:
-                        raise Exception(
-                            f"메멘토에 사전 처리된 청크가 없습니다 (tenant={file_tenant_id}, "
-                            f"file_path={file_path or 'N/A'}, file_name={display_name})"
-                        )
+                    _ts_for_section = parsed.get("tool_settings") or {}
+                    _seg_level = (_ts_for_section.get("pdf2bpmnLevel") or "standard").strip().lower()
+                    if _seg_level not in {"concise", "standard", "detailed"}:
+                        _seg_level = "standard"
+                except Exception:
+                    _seg_level = "standard"
+                logger.info(f"[SECTION-LEVEL] pdf2bpmnLevel='{_seg_level}' applied to SOP segmentation")
 
-                    docs, secs, chs = self._build_state_from_memento_chunks(
-                        display_name=display_name,
-                        source=f"memento://{file_path or display_name}",
-                        memento_chunks=memento_chunks,
-                        pdf2bpmn_level=_seg_level,
-                    )
-                    if not docs or not chs:
-                        raise Exception(
-                            f"메멘토 청크로부터 문서 상태를 구성하지 못했습니다: {display_name}"
-                        )
+                for idx, file_info in enumerate(input_files, start=1):
+                    file_url = (file_info.get("url") or "").strip()
+                    display_name = (file_info.get("name") or f"document_{idx}").strip() or f"document_{idx}"
+                    file_path = (file_info.get("path") or "").strip().rstrip("?")
+                    file_room_id = (file_info.get("room_id") or parsed_room_id or "").strip()
+                    file_tenant_id = (file_info.get("tenant_id") or effective_tenant_id or "").strip()
 
-                    reused = sum(1 for c in chs if isinstance(c.embedding, list) and len(c.embedding) > 0)
-                    total_reused_embeddings += reused
-
-                    preloaded_documents.extend(docs)
-                    preloaded_sections.extend(secs)
-                    preloaded_chunks.extend(chs)
-                    input_file_names.append(display_name)
+                    if not file_url and not file_path and not display_name:
+                        continue
 
                     await self._send_progress_event(
                         event_queue, context_id, task_id, job_id,
-                        f"[MEMENTO] 재사용 완료 ({idx}/{len(input_files)}): {display_name} "
-                        f"(chunks={len(chs)}, embeddings={reused}/{len(chs)})",
-                        "tool_usage_started", 10
+                        f"[MEMENTO] 청크/임베딩 조회 중 ({idx}/{len(input_files)}): {display_name}",
+                        "tool_usage_started", 8
+                    )
+
+                    try:
+                        memento_chunks = await self._fetch_memento_chunks(
+                            tenant_id=file_tenant_id,
+                            file_path=file_path,
+                            file_name=display_name,
+                            room_id=file_room_id,
+                            include_embeddings=True,
+                        )
+                        if not memento_chunks:
+                            raise Exception(
+                                f"메멘토에 사전 처리된 청크가 없습니다 (tenant={file_tenant_id}, "
+                                f"file_path={file_path or 'N/A'}, file_name={display_name})"
+                            )
+
+                        docs, secs, chs = self._build_state_from_memento_chunks(
+                            display_name=display_name,
+                            source=f"memento://{file_path or display_name}",
+                            memento_chunks=memento_chunks,
+                            pdf2bpmn_level=_seg_level,
+                        )
+                        if not docs or not chs:
+                            raise Exception(
+                                f"메멘토 청크로부터 문서 상태를 구성하지 못했습니다: {display_name}"
+                            )
+
+                        reused = sum(1 for c in chs if isinstance(c.embedding, list) and len(c.embedding) > 0)
+                        total_reused_embeddings += reused
+
+                        preloaded_documents.extend(docs)
+                        preloaded_sections.extend(secs)
+                        preloaded_chunks.extend(chs)
+                        input_file_names.append(display_name)
+
+                        await self._send_progress_event(
+                            event_queue, context_id, task_id, job_id,
+                            f"[MEMENTO] 재사용 완료 ({idx}/{len(input_files)}): {display_name} "
+                            f"(chunks={len(chs)}, embeddings={reused}/{len(chs)})",
+                            "tool_usage_started", 10
+                        )
+                    except Exception as e:
+                        fetch_errors.append(f"{display_name}: {e}")
+                        logger.warning(
+                            f"[WARN] 메멘토 청크 로드 실패({idx}/{len(input_files)}): {display_name} - {e}"
+                        )
+
+                if not preloaded_chunks:
+                    raise Exception(
+                        "메멘토에서 사전 처리된 청크를 가져오지 못했습니다: "
+                        + ("; ".join(fetch_errors) if fetch_errors else "유효한 파일이 없습니다.")
+                    )
+
+                pdf_name = input_file_names[0] if input_file_names else (pdf_name or "document.pdf")
+                logger.info(
+                    "[MEMENTO] preload summary: files=%d sections=%d chunks=%d reused_embeddings=%d",
+                    len(preloaded_documents), len(preloaded_sections),
+                    len(preloaded_chunks), total_reused_embeddings,
+                )
+
+                # =================================================================
+                # 5. 선행 정리: 기존 프로세스 핵심 라벨만 삭제 (교차 실행 데이터 혼합 방지)
+                # =================================================================
+                await self._send_progress_event(
+                    event_queue, context_id, task_id, job_id,
+                    "[CLEANUP] 기존 프로세스/태스크 그래프를 정리합니다...",
+                    "tool_usage_started", 12
+                )
+
+                try:
+                    def _clear_process_core_labels_sync() -> Dict[str, Any]:
+                        client = Neo4jClient(graph_name=age_graph_name)
+                        try:
+                            return client.clear_process_core_labels()
+                        finally:
+                            client.close()
+
+                    cleanup_result = await asyncio.to_thread(_clear_process_core_labels_sync)
+                    deleted_nodes = int(cleanup_result.get("deleted_nodes", 0) or 0)
+                    logger.info(
+                        "[CLEANUP] Process-core labels cleared before run: "
+                        f"deleted_nodes={deleted_nodes}, labels={cleanup_result.get('labels', [])}"
+                    )
+                    await self._send_progress_event(
+                        event_queue, context_id, task_id, job_id,
+                        f"[CLEANUP] 기존 그래프 정리 완료 (삭제 노드: {deleted_nodes})",
+                        "tool_usage_finished", 14,
+                        {"cleanup": cleanup_result}
                     )
                 except Exception as e:
-                    fetch_errors.append(f"{display_name}: {e}")
-                    logger.warning(
-                        f"[WARN] 메멘토 청크 로드 실패({idx}/{len(input_files)}): {display_name} - {e}"
+                    logger.error(f"[CLEANUP] Failed to clear process-core labels: {e}")
+                    # Fail fast by design: run should not continue with mixed legacy graph data.
+                    raise Exception(
+                        f"Neo4j 선삭제 실패로 작업을 중단합니다: {e}"
+                    ) from e
+
+                # =================================================================
+                # 6. PDF2BPMN 워크플로우를 "직접 호출"로 실행 (FastAPI BackgroundTasks 제거)
+                # =================================================================
+                await self._send_progress_event(
+                    event_queue, context_id, task_id, job_id,
+                    "[PROCESSING] PDF 분석 및 엔티티 추출을 시작합니다...",
+                    "tool_usage_started", 15
+                )
+
+                # Import here to keep agent startup light
+                from src.pdf2bpmn.workflow.graph import PDF2BPMNWorkflow  # type: ignore
+
+                # IMPORTANT:
+                # - 일부 단계는 asyncio.to_thread(...)에서 실행되며 progress_callback도 워커 스레드에서 호출됩니다.
+                # - ProcessGPT SDK의 event_queue.enqueue_event()는 내부적으로 asyncio.create_task(...)를 사용하므로
+                #   "실행 중인 이벤트 루프가 있는 스레드"에서만 호출되어야 합니다.
+                # - 따라서 스레드에서 콜백이 오더라도 메인 루프 스레드로 안전하게 마샬링합니다.
+                main_loop = asyncio.get_running_loop()
+
+                def _enqueue_progress(msg: str, progress: int, extra: Optional[Dict[str, Any]] = None):
+                    # 워크플로우 sub-progress(0–100) → 전체 파이프라인 12–66% 로 매핑
+                    local_p = max(0, min(100, int(progress)))
+                    global_p = 12 + int(local_p * 0.54)
+                    event_data = {
+                        "message": msg,
+                        "status": "tool_usage_started",
+                        "progress": global_p,
+                        "job_id": job_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    if extra:
+                        event_data.update(extra)
+
+                    evt = TaskStatusUpdateEvent(
+                        status={
+                            "state": TaskState.working,
+                            "message": new_agent_text_message(
+                                json.dumps(event_data, ensure_ascii=False),
+                                context_id, task_id,
+                            ),
+                        },
+                        final=False,
+                        contextId=context_id,
+                        taskId=task_id,
+                        metadata={
+                            "crew_type": "pdf2bpmn",
+                            "event_type": "tool_usage_started",
+                            "job_id": job_id,
+                            "progress": int(progress),
+                        },
                     )
 
-            if not preloaded_chunks:
-                raise Exception(
-                    "메멘토에서 사전 처리된 청크를 가져오지 못했습니다: "
-                    + ("; ".join(fetch_errors) if fetch_errors else "유효한 파일이 없습니다.")
-                )
-
-            pdf_name = input_file_names[0] if input_file_names else (pdf_name or "document.pdf")
-            logger.info(
-                "[MEMENTO] preload summary: files=%d sections=%d chunks=%d reused_embeddings=%d",
-                len(preloaded_documents), len(preloaded_sections),
-                len(preloaded_chunks), total_reused_embeddings,
-            )
-
-            # =================================================================
-            # 5. 선행 정리: 기존 프로세스 핵심 라벨만 삭제 (교차 실행 데이터 혼합 방지)
-            # =================================================================
-            await self._send_progress_event(
-                event_queue, context_id, task_id, job_id,
-                "[CLEANUP] 기존 프로세스/태스크 그래프를 정리합니다...",
-                "tool_usage_started", 12
-            )
-
-            try:
-                def _clear_process_core_labels_sync() -> Dict[str, Any]:
-                    client = Neo4jClient(graph_name=age_graph_name)
+                    # Always marshal to main loop thread (safe for both same-thread and worker-thread callers)
                     try:
-                        return client.clear_process_core_labels()
-                    finally:
-                        client.close()
+                        main_loop.call_soon_threadsafe(event_queue.enqueue_event, evt)
+                    except Exception:
+                        # Extremely defensive fallback: if loop is unavailable, try direct enqueue
+                        event_queue.enqueue_event(evt)
 
-                cleanup_result = await asyncio.to_thread(_clear_process_core_labels_sync)
-                deleted_nodes = int(cleanup_result.get("deleted_nodes", 0) or 0)
-                logger.info(
-                    "[CLEANUP] Process-core labels cleared before run: "
-                    f"deleted_nodes={deleted_nodes}, labels={cleanup_result.get('labels', [])}"
-                )
-                await self._send_progress_event(
-                    event_queue, context_id, task_id, job_id,
-                    f"[CLEANUP] 기존 그래프 정리 완료 (삭제 노드: {deleted_nodes})",
-                    "tool_usage_finished", 14,
-                    {"cleanup": cleanup_result}
-                )
-            except Exception as e:
-                logger.error(f"[CLEANUP] Failed to clear process-core labels: {e}")
-                # Fail fast by design: run should not continue with mixed legacy graph data.
-                raise Exception(
-                    f"Neo4j 선삭제 실패로 작업을 중단합니다: {e}"
-                ) from e
+                workflow = PDF2BPMNWorkflow(graph_name=age_graph_name)
 
-            # =================================================================
-            # 6. PDF2BPMN 워크플로우를 "직접 호출"로 실행 (FastAPI BackgroundTasks 제거)
-            # =================================================================
-            await self._send_progress_event(
-                event_queue, context_id, task_id, job_id,
-                "[PROCESSING] PDF 분석 및 엔티티 추출을 시작합니다...",
-                "tool_usage_started", 15
-            )
+                # 사용자 [도구 설정] 다이얼로그에서 선택한 dedup 강도 적용.
+                # 메인 에이전트가 [InputData].tool_settings 로 넣어 준 값을 _parse_query 가 보존했고,
+                # 여기서 workflow 의 임계값을 일괄 오버라이드한다.
+                #   - "concise"  : 임계 ↓ → 간결한 결과
+                #   - "standard" : Config 기본값 (안 넣어도 동일)
+                #   - "detailed" : 임계 ↑ → 원문에 가까운 자세한 결과
+                try:
+                    tool_settings_in = parsed.get("tool_settings") or {}
+                    pdf2bpmn_level = (tool_settings_in.get("pdf2bpmnLevel") or "standard").strip().lower()
+                    workflow.set_dedup_level(pdf2bpmn_level)
+                    logger.info(
+                        f"[DEDUP] User pdf2bpmnLevel='{pdf2bpmn_level}' applied "
+                        f"(tool_settings={tool_settings_in})"
+                    )
+                except Exception as exc:
+                    logger.warning(f"[DEDUP] tool_settings 적용 실패 → standard 유지: {exc}")
+                    workflow.set_dedup_level("standard")
 
-            # Import here to keep agent startup light
-            from src.pdf2bpmn.workflow.graph import PDF2BPMNWorkflow  # type: ignore
-
-            # IMPORTANT:
-            # - 일부 단계는 asyncio.to_thread(...)에서 실행되며 progress_callback도 워커 스레드에서 호출됩니다.
-            # - ProcessGPT SDK의 event_queue.enqueue_event()는 내부적으로 asyncio.create_task(...)를 사용하므로
-            #   "실행 중인 이벤트 루프가 있는 스레드"에서만 호출되어야 합니다.
-            # - 따라서 스레드에서 콜백이 오더라도 메인 루프 스레드로 안전하게 마샬링합니다.
-            main_loop = asyncio.get_running_loop()
-
-            def _enqueue_progress(msg: str, progress: int, extra: Optional[Dict[str, Any]] = None):
-                event_data = {
-                    "message": msg,
-                    "status": "tool_usage_started",
-                    "progress": int(progress),
-                    "job_id": job_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                state: Dict[str, Any] = {
+                    # pdf_paths 는 메멘토 재사용 흐름에서는 사용하지 않지만, 워크플로우 state 스키마 호환을 위해 빈 리스트로 둔다.
+                    "pdf_paths": [],
+                    "documents": list(preloaded_documents),
+                    "sections": list(preloaded_sections),
+                    "reference_chunks": list(preloaded_chunks),
+                    "processes": [],
+                    "tasks": [],
+                    "roles": [],
+                    "gateways": [],
+                    "events": [],
+                    "skills": [],
+                    "evidences": [],
+                    "agent_generation_policy": "existing_only",
+                    "confidence_threshold": 0.8,
+                    "current_step": "ingest_pdf",
+                    "error": None,
+                    "bpmn_xml": None,
+                    "bpmn_xmls": {},
+                    "bpmn_files": {},
+                    "skill_docs": {},
+                    "dmn_xml": None,
                 }
-                if extra:
-                    event_data.update(extra)
 
-                evt = TaskStatusUpdateEvent(
-                    status={
-                        "state": TaskState.working,
-                        "message": new_agent_text_message(
-                            json.dumps(event_data, ensure_ascii=False),
-                            context_id, task_id,
-                        ),
-                    },
-                    final=False,
-                    contextId=context_id,
-                    taskId=task_id,
-                    metadata={
-                        "crew_type": "pdf2bpmn",
-                        "event_type": "tool_usage_started",
-                        "job_id": job_id,
-                        "progress": int(progress),
-                    },
-                )
-
-                # Always marshal to main loop thread (safe for both same-thread and worker-thread callers)
                 try:
-                    main_loop.call_soon_threadsafe(event_queue.enqueue_event, evt)
-                except Exception:
-                    # Extremely defensive fallback: if loop is unavailable, try direct enqueue
-                    event_queue.enqueue_event(evt)
+                    # Neo4j schema init (same as API)
+                    await asyncio.to_thread(workflow.neo4j.init_schema)
 
-            workflow = PDF2BPMNWorkflow(graph_name=age_graph_name)
+                    if self.is_cancelled:
+                        raise Exception("작업이 취소되었습니다.")
 
-            # 사용자 [도구 설정] 다이얼로그에서 선택한 dedup 강도 적용.
-            # 메인 에이전트가 [InputData].tool_settings 로 넣어 준 값을 _parse_query 가 보존했고,
-            # 여기서 workflow 의 임계값을 일괄 오버라이드한다.
-            #   - "concise"  : 임계 ↓ → 간결한 결과
-            #   - "standard" : Config 기본값 (안 넣어도 동일)
-            #   - "detailed" : 임계 ↑ → 원문에 가까운 자세한 결과
-            try:
-                tool_settings_in = parsed.get("tool_settings") or {}
-                pdf2bpmn_level = (tool_settings_in.get("pdf2bpmnLevel") or "standard").strip().lower()
-                workflow.set_dedup_level(pdf2bpmn_level)
-                logger.info(
-                    f"[DEDUP] User pdf2bpmnLevel='{pdf2bpmn_level}' applied "
-                    f"(tool_settings={tool_settings_in})"
-                )
-            except Exception as exc:
-                logger.warning(f"[DEDUP] tool_settings 적용 실패 → standard 유지: {exc}")
-                workflow.set_dedup_level("standard")
-
-            state: Dict[str, Any] = {
-                # pdf_paths 는 메멘토 재사용 흐름에서는 사용하지 않지만, 워크플로우 state 스키마 호환을 위해 빈 리스트로 둔다.
-                "pdf_paths": [],
-                "documents": list(preloaded_documents),
-                "sections": list(preloaded_sections),
-                "reference_chunks": list(preloaded_chunks),
-                "processes": [],
-                "tasks": [],
-                "roles": [],
-                "gateways": [],
-                "events": [],
-                "skills": [],
-                "evidences": [],
-                "agent_generation_policy": "existing_only",
-                "confidence_threshold": 0.8,
-                "current_step": "ingest_pdf",
-                "error": None,
-                "bpmn_xml": None,
-                "bpmn_xmls": {},
-                "bpmn_files": {},
-                "skill_docs": {},
-                "dmn_xml": None,
-            }
-
-            try:
-                # Neo4j schema init (same as API)
-                await asyncio.to_thread(workflow.neo4j.init_schema)
-
-                if self.is_cancelled:
-                    raise Exception("작업이 취소되었습니다.")
-
-                # Step 1: ingest_pdf 는 더 이상 호출하지 않는다.
-                # - 메멘토에서 받아온 청크/임베딩으로 이미 documents/sections/reference_chunks 를 채웠으므로
-                #   재파싱 없이 Neo4j에만 문서/섹션 노드를 등록한다.
-                if preloaded_documents:
-                    _enqueue_progress("[STEP] 메멘토 청크 기반 문서/섹션 그래프 등록 중...", 20)
-                    for doc in preloaded_documents:
-                        workflow.neo4j.create_document(doc)
-                    for sec in preloaded_sections:
-                        workflow.neo4j.create_section(sec)
-                page_count = 0
-                try:
-                    docs = state.get("documents") or []
-                    if docs:
-                        page_count = sum(int(getattr(d, "page_count", 0) or 0) for d in docs)
-                except Exception:
+                    # Step 1: ingest_pdf 는 더 이상 호출하지 않는다.
+                    # - 메멘토에서 받아온 청크/임베딩으로 이미 documents/sections/reference_chunks 를 채웠으므로
+                    #   재파싱 없이 Neo4j에만 문서/섹션 노드를 등록한다.
+                    if preloaded_documents:
+                        _enqueue_progress("[STEP] 메멘토 청크 기반 문서/섹션 그래프 등록 중...", 20)
+                        for doc in preloaded_documents:
+                            workflow.neo4j.create_document(doc)
+                        for sec in preloaded_sections:
+                            workflow.neo4j.create_section(sec)
                     page_count = 0
-                chunk_count = len(state.get("reference_chunks") or [])
-                parsed_file_count = len(preloaded_documents)
-                _enqueue_progress(
-                    f"[STEP] 메멘토 재사용 완료: 파일 {parsed_file_count}개, "
-                    f"총 {page_count}페이지, {chunk_count}개 청크 "
-                    f"(재사용 임베딩 {total_reused_embeddings}/{chunk_count})",
-                    28
-                )
+                    try:
+                        docs = state.get("documents") or []
+                        if docs:
+                            page_count = sum(int(getattr(d, "page_count", 0) or 0) for d in docs)
+                    except Exception:
+                        page_count = 0
+                    chunk_count = len(state.get("reference_chunks") or [])
+                    parsed_file_count = len(preloaded_documents)
+                    _enqueue_progress(
+                        f"[STEP] 메멘토 재사용 완료: 파일 {parsed_file_count}개, "
+                        f"총 {page_count}페이지, {chunk_count}개 청크 "
+                        f"(재사용 임베딩 {total_reused_embeddings}/{chunk_count})",
+                        28
+                    )
 
-                if self.is_cancelled:
-                    raise Exception("작업이 취소되었습니다.")
+                    if self.is_cancelled:
+                        raise Exception("작업이 취소되었습니다.")
 
-                # Step 2: segment_sections
-                _enqueue_progress("[STEP] 섹션 분석 및 임베딩 생성 중...", 32)
-                state.update(await asyncio.to_thread(workflow.segment_sections, state))
-                section_count = len(state.get("sections") or [])
-                _enqueue_progress(f"[STEP] 섹션 분석 완료: {section_count}개 섹션", 38)
+                    # Step 2: segment_sections
+                    _enqueue_progress("[STEP] 섹션 분석 및 임베딩 생성 중...", 32)
+                    state.update(await asyncio.to_thread(workflow.segment_sections, state))
+                    section_count = len(state.get("sections") or [])
+                    _enqueue_progress(f"[STEP] 섹션 분석 완료: {section_count}개 섹션", 38)
 
-                if self.is_cancelled:
-                    raise Exception("작업이 취소되었습니다.")
+                    if self.is_cancelled:
+                        raise Exception("작업이 취소되었습니다.")
 
-                # Step 3: extract_candidates_with_progress (LLM-heavy)
-                total_sections = len([s for s in (state.get("sections") or []) if getattr(s, "content", None) and len((s.content or "").strip()) >= 50])
-                _enqueue_progress(f"[STEP] 엔티티 추출 시작: {total_sections}개 섹션", 40, {"chunk_info": {"current": 0, "total": total_sections}})
+                    # Step 3: extract_candidates_with_progress (LLM-heavy)
+                    total_sections = len([s for s in (state.get("sections") or []) if getattr(s, "content", None) and len((s.content or "").strip()) >= 50])
+                    _enqueue_progress(f"[STEP] 엔티티 추출 시작: {total_sections}개 섹션", 40, {"chunk_info": {"current": 0, "total": total_sections}})
 
-                def _progress_callback(current: int, total: int, msg: str):
-                    # Map to 40~55
-                    mapped = 40 + int((current / max(total, 1)) * 15)
-                    _enqueue_progress(f"[EXTRACT] {msg}", mapped, {"chunk_info": {"current": current, "total": total}})
+                    def _progress_callback(current: int, total: int, msg: str):
+                        # Map to 40~55
+                        mapped = 40 + int((current / max(total, 1)) * 15)
+                        _enqueue_progress(f"[EXTRACT] {msg}", mapped, {"chunk_info": {"current": current, "total": total}})
 
-                state.update(await asyncio.to_thread(workflow.extract_candidates_with_progress, state, _progress_callback))
-                process_count = len(state.get("processes") or [])
-                task_count = len(state.get("tasks") or [])
-                role_count = len(state.get("roles") or [])
-                _enqueue_progress(f"[STEP] 추출 완료: 프로세스 {process_count}, 태스크 {task_count}, 역할 {role_count}", 58)
+                    state.update(await asyncio.to_thread(workflow.extract_candidates_with_progress, state, _progress_callback))
+                    process_count = len(state.get("processes") or [])
+                    task_count = len(state.get("tasks") or [])
+                    role_count = len(state.get("roles") or [])
+                    _enqueue_progress(f"[STEP] 추출 완료: 프로세스 {process_count}, 태스크 {task_count}, 역할 {role_count}", 58)
 
-                if self.is_cancelled:
-                    raise Exception("작업이 취소되었습니다.")
+                    if self.is_cancelled:
+                        raise Exception("작업이 취소되었습니다.")
 
-                # Step 4: normalize_entities
-                _enqueue_progress("[STEP] 엔티티 정규화 및 중복 제거 중...", 62)
-                state.update(await asyncio.to_thread(workflow.normalize_entities, state))
-                _enqueue_progress("[STEP] 정규화 완료", 70)
+                    # Step 4: normalize_entities
+                    _enqueue_progress("[STEP] 엔티티 정규화 및 중복 제거 중...", 62)
+                    state.update(await asyncio.to_thread(workflow.normalize_entities, state))
+                    _enqueue_progress("[STEP] 정규화 완료", 70)
 
-                if self.is_cancelled:
-                    raise Exception("작업이 취소되었습니다.")
+                    if self.is_cancelled:
+                        raise Exception("작업이 취소되었습니다.")
 
-                if self.is_cancelled:
-                    raise Exception("작업이 취소되었습니다.")
+                    if self.is_cancelled:
+                        raise Exception("작업이 취소되었습니다.")
 
-                # Step 5: ontology skill generation is disabled by policy.
-                # Skill creation now happens from runtime task instructions per process definition.
-                state["skills"] = []
-                state["skill_docs"] = {}
-                _enqueue_progress("[STEP] 온톨로지 스킬 생성 스킵(지침 기반 후처리 사용)", 80)
+                    # Step 5: ontology skill generation is disabled by policy.
+                    # Skill creation now happens from runtime task instructions per process definition.
+                    state["skills"] = []
+                    state["skill_docs"] = {}
+                    _enqueue_progress("[STEP] 온톨로지 스킬 생성 스킵(지침 기반 후처리 사용)", 80)
 
-                if self.is_cancelled:
-                    raise Exception("작업이 취소되었습니다.")
+                    if self.is_cancelled:
+                        raise Exception("작업이 취소되었습니다.")
 
-                # Step 6: generate_dmn
-                _enqueue_progress("[STEP] DMN 의사결정 테이블 생성 중...", 84)
-                state.update(await asyncio.to_thread(workflow.generate_dmn, state))
-                _enqueue_progress("[STEP] DMN 생성 완료", 88)
+                    # Step 6: generate_dmn — 자동 생성.
+                    # 사용자가 process loop 안 통합 elicit 에서 어떤 gateway 를 DMN 으로 만들지 선택하므로,
+                    # 여기서는 일단 모든 gateway 의 후보를 만들고, process loop 끝난 직후에
+                    # state["__hitl_approved_dmn_gateways"] 로 필터링한다.
+                    _enqueue_progress("[STEP] DMN 의사결정 테이블 후보 생성 중...", 84)
+                    state.update(await asyncio.to_thread(workflow.generate_dmn, state))
+                    _enqueue_progress("[STEP] DMN 후보 생성 완료 (사용자 선택은 process loop 통합 elicit 에서)", 88)
 
-                if self.is_cancelled:
-                    raise Exception("작업이 취소되었습니다.")
+                    if self.is_cancelled:
+                        raise Exception("작업이 취소되었습니다.")
 
-                # Step 7: export_artifacts
-                _enqueue_progress("[STEP] 결과물 저장 중...", 92)
-                state.update(await asyncio.to_thread(workflow.export_artifacts, state))
-                _enqueue_progress("[STEP] PDF2BPMN 워크플로우 완료", 95)
+                    # Step 7: export_artifacts
+                    _enqueue_progress("[STEP] 결과물 저장 중...", 92)
+                    state.update(await asyncio.to_thread(workflow.export_artifacts, state))
+                    _enqueue_progress("[STEP] PDF2BPMN 워크플로우 완료", 95)
 
-            finally:
-                try:
-                    workflow.neo4j.close()
-                except Exception:
-                    pass
-
-            # =================================================================
-            # 7. 이번 작업에서 생성된 process_id 목록을 state에서 직접 수집 + Neo4j에서 상세 조회
-            # =================================================================
-            await self._send_progress_event(
-                event_queue, context_id, task_id, job_id,
-                "[GENERATING] 이번 작업의 추출 정보(Neo4j)로 ProcessGPT 프로세스 정의/유저 매핑을 생성합니다...",
-                "tool_usage_started", 88
-            )
-            job_process_ids: List[str] = []
-            process_names_by_id: Dict[str, str] = {}
-            processes_state = state.get("processes", []) or []
-            for p in processes_state:
-                try:
-                    pid = getattr(p, "proc_id", None) or getattr(p, "process_id", None) or getattr(p, "id", None)
-                    pname = getattr(p, "name", None)
-                    if pid:
-                        job_process_ids.append(str(pid))
-                        if pname:
-                            process_names_by_id[str(pid)] = str(pname)
-                except Exception:
-                    continue
-
-            # 요청 단위 그래프 스냅샷 식별자
-            request_graph_run_id = f"{task_id}-{uuid.uuid4().hex[:8]}"
-            extracted_by_proc_id: Dict[str, Dict[str, Any]] = {}
-            if not job_process_ids:
-                await self._send_progress_event(
-                    event_queue, context_id, task_id, job_id,
-                    "[NOTICE] 문서에서 추출된 프로세스가 없어 생성할 BPMN이 없습니다. (이미지/슬라이드 위주 문서일 수 있습니다.)",
-                    "tool_usage_finished", 100,
-                    {"process_count": 0, "reason": "no_process_extracted"},
-                )
-            else:
-                logger.info(f"[INFO] 이번 작업 기준 추출 프로세스: {len(job_process_ids)}개")
-
-                # Re-open Neo4j client for detail queries (workflow.neo4j was closed)
-                neo4j = Neo4jClient(graph_name=age_graph_name)
-                try:
-                    for proc_id in job_process_ids:
-                        try:
-                            detail = await asyncio.to_thread(neo4j.get_process_with_details, proc_id)
-                            if not detail:
-                                continue
-                            flows = await asyncio.to_thread(neo4j.get_sequence_flows, proc_id)
-                            if isinstance(flows, list):
-                                detail["sequence_flows"] = flows
-                            graph_elements = await asyncio.to_thread(neo4j.get_process_graph_elements, proc_id)
-                            detail = self._enrich_tasks_with_role_from_graph(
-                                detail=detail,
-                                graph_elements=(graph_elements or {}),
-                            )
-                            extracted_by_proc_id[proc_id] = {
-                                "detail": detail,
-                                "graph_elements": graph_elements or {},
-                                "process_name": (detail.get("process", {}) or {}).get("name")
-                                or process_names_by_id.get(proc_id)
-                                or "",
-                            }
-                        except Exception as e:
-                            logger.warning(f"[WARN] process detail 조회 중 예외: proc_id={proc_id}, err={e}")
                 finally:
                     try:
-                        neo4j.close()
+                        workflow.neo4j.close()
                     except Exception:
                         pass
 
-            extracted_count2 = len(extracted_by_proc_id)
-            logger.info(f"[INFO] 이번 작업 기준 추출 프로세스: {extracted_count2}개")
-
-            # -----------------------------------------------------------------
-            # 동일/유사 이름 프로세스가 중복 추출된 경우, 저장 직전에 보수적으로 병합
-            # - 여러 파일이 하나의 프로세스를 나눠 설명하는 케이스에서 중복 저장 방지
-            # -----------------------------------------------------------------
-            def _norm_proc_name(name: Any) -> str:
-                text = str(name or "").strip().lower()
-                text = re.sub(r"\s+", " ", text)
-                return text
-
-            def _dedup_list(items: Any, key_builder):
-                if not isinstance(items, list):
-                    return []
-                seen: Set[str] = set()
-                out: List[Any] = []
-                for item in items:
+                # =================================================================
+                # 7. 이번 작업에서 생성된 process_id 목록을 state에서 직접 수집 + Neo4j에서 상세 조회
+                # =================================================================
+                await self._send_progress_event(
+                    event_queue, context_id, task_id, job_id,
+                    "[GENERATING] 이번 작업의 추출 정보(Neo4j)로 ProcessGPT 프로세스 정의/유저 매핑을 생성합니다...",
+                    "tool_usage_started", 58
+                )
+                job_process_ids: List[str] = []
+                process_names_by_id: Dict[str, str] = {}
+                processes_state = state.get("processes", []) or []
+                for p in processes_state:
                     try:
-                        key = key_builder(item)
+                        pid = getattr(p, "proc_id", None) or getattr(p, "process_id", None) or getattr(p, "id", None)
+                        pname = getattr(p, "name", None)
+                        if pid:
+                            job_process_ids.append(str(pid))
+                            if pname:
+                                process_names_by_id[str(pid)] = str(pname)
                     except Exception:
-                        key = ""
-                    key = str(key or "").strip()
-                    if not key:
-                        key = json.dumps(item, ensure_ascii=False, sort_keys=True)
-                    if key in seen:
                         continue
-                    seen.add(key)
-                    out.append(item)
-                return out
 
-            def _merge_graph_elements(g1: Any, g2: Any) -> Dict[str, Any]:
-                base = g1 if isinstance(g1, dict) else {}
-                inc = g2 if isinstance(g2, dict) else {}
-                e1 = base.get("elements") if isinstance(base.get("elements"), list) else []
-                e2 = inc.get("elements") if isinstance(inc.get("elements"), list) else []
-                merged: List[Dict[str, Any]] = []
-                seen_ids: Set[str] = set()
-                for el in (e1 + e2):
-                    if not isinstance(el, dict):
-                        continue
-                    data = el.get("data") or {}
-                    eid = str(data.get("id") or "").strip()
-                    if not eid:
-                        continue
-                    if eid in seen_ids:
-                        continue
-                    seen_ids.add(eid)
-                    merged.append(el)
-                counts = dict(base.get("counts") or {})
-                counts["elements"] = len(merged)
-                return {
-                    **base,
-                    "elements": merged,
-                    "counts": counts,
-                }
+                # 요청 단위 그래프 스냅샷 식별자
+                request_graph_run_id = f"{task_id}-{uuid.uuid4().hex[:8]}"
+                extracted_by_proc_id: Dict[str, Dict[str, Any]] = {}
+                if not job_process_ids:
+                    await self._send_progress_event(
+                        event_queue, context_id, task_id, job_id,
+                        "[NOTICE] 문서에서 추출된 프로세스가 없어 생성할 BPMN이 없습니다. (이미지/슬라이드 위주 문서일 수 있습니다.)",
+                        "tool_usage_finished", 100,
+                        {"process_count": 0, "reason": "no_process_extracted"},
+                    )
+                else:
+                    logger.info(f"[INFO] 이번 작업 기준 추출 프로세스: {len(job_process_ids)}개")
 
-            merged_by_name: Dict[str, Dict[str, Any]] = {}
-            for proc_id, pinfo in extracted_by_proc_id.items():
-                process_name = (pinfo.get("process_name") or "").strip()
-                norm_name = _norm_proc_name(process_name)
-                detail = pinfo.get("detail") or {}
-                graph_elements = pinfo.get("graph_elements") or {}
-
-                # 이름이 비어있으면 병합하지 않고 독립 유지
-                merge_key = norm_name if norm_name else f"__{proc_id}"
-                if merge_key not in merged_by_name:
-                    pinfo_copy = dict(pinfo)
-                    pinfo_copy["detail"] = dict(detail) if isinstance(detail, dict) else {}
-                    pinfo_copy["graph_elements"] = dict(graph_elements) if isinstance(graph_elements, dict) else {}
-                    pinfo_copy["_source_proc_ids"] = [proc_id]
-                    merged_by_name[merge_key] = pinfo_copy
-                    continue
-
-                target = merged_by_name[merge_key]
-                target_detail = target.get("detail") or {}
-                target_detail = target_detail if isinstance(target_detail, dict) else {}
-                incoming_detail = detail if isinstance(detail, dict) else {}
-
-                # process 본문은 설명이 더 긴 쪽을 우선
-                t_proc = target_detail.get("process") if isinstance(target_detail.get("process"), dict) else {}
-                i_proc = incoming_detail.get("process") if isinstance(incoming_detail.get("process"), dict) else {}
-                t_desc = str(t_proc.get("description") or "")
-                i_desc = str(i_proc.get("description") or "")
-                if len(i_desc) > len(t_desc):
-                    target_detail["process"] = i_proc
-                    if i_proc.get("name"):
-                        target["process_name"] = str(i_proc.get("name"))
-
-                target_detail["tasks"] = _dedup_list(
-                    (target_detail.get("tasks") or []) + (incoming_detail.get("tasks") or []),
-                    lambda x: (x or {}).get("task_id") or (x or {}).get("id") or (x or {}).get("name") or "",
-                )
-                target_detail["roles"] = _dedup_list(
-                    (target_detail.get("roles") or []) + (incoming_detail.get("roles") or []),
-                    lambda x: (x or {}).get("role_id") or (x or {}).get("id") or (x or {}).get("name") or "",
-                )
-                target_detail["gateways"] = _dedup_list(
-                    (target_detail.get("gateways") or []) + (incoming_detail.get("gateways") or []),
-                    lambda x: (x or {}).get("gateway_id") or (x or {}).get("id") or (x or {}).get("name") or "",
-                )
-                target_detail["events"] = _dedup_list(
-                    (target_detail.get("events") or []) + (incoming_detail.get("events") or []),
-                    lambda x: (x or {}).get("event_id") or (x or {}).get("id") or (x or {}).get("name") or "",
-                )
-                target_detail["sequence_flows"] = _dedup_list(
-                    (target_detail.get("sequence_flows") or target_detail.get("flows") or [])
-                    + (incoming_detail.get("sequence_flows") or incoming_detail.get("flows") or []),
-                    lambda x: f"{(x or {}).get('source')}>{(x or {}).get('target')}|{(x or {}).get('condition') or ''}",
-                )
-                target["detail"] = target_detail
-                target["graph_elements"] = _merge_graph_elements(target.get("graph_elements"), graph_elements)
-                src = target.get("_source_proc_ids") if isinstance(target.get("_source_proc_ids"), list) else []
-                src.append(proc_id)
-                target["_source_proc_ids"] = src
-
-            if len(merged_by_name) != len(extracted_by_proc_id):
-                logger.info(
-                    f"[MERGE] duplicate-name merge applied: {len(extracted_by_proc_id)} -> {len(merged_by_name)}"
-                )
-            extracted_by_proc_id = {
-                (v.get("_source_proc_ids")[0] if isinstance(v.get("_source_proc_ids"), list) and v.get("_source_proc_ids") else k): v
-                for k, v in merged_by_name.items()
-            }
-
-            # -----------------------------------------------------------------
-            # 요청 단위 통합 그래프 + 최종 프로세스 그래프 스냅샷 저장
-            # -----------------------------------------------------------------
-            try:
-                process_graphs: Dict[str, Dict[str, Any]] = {}
-                integrated_elements: List[Dict[str, Any]] = []
-                seen_element_ids: Set[str] = set()
-                for pid, pinfo in extracted_by_proc_id.items():
-                    g = pinfo.get("graph_elements") or {}
-                    if isinstance(g, dict):
-                        process_graphs[pid] = g
-                        for el in g.get("elements") or []:
-                            if not isinstance(el, dict):
-                                continue
-                            data = el.get("data") or {}
-                            eid = str(data.get("id") or "").strip()
-                            if not eid or eid in seen_element_ids:
-                                continue
-                            seen_element_ids.add(eid)
-                            integrated_elements.append(el)
-
-                integrated_graph = {
-                    "run_id": request_graph_run_id,
-                    "task_id": str(task_id or ""),
-                    "graph_name": age_graph_name,
-                    "process_ids": list(extracted_by_proc_id.keys()),
-                    "elements": integrated_elements,
-                    "counts": {
-                        "elements": len(integrated_elements),
-                        "processes": len(process_graphs),
-                    },
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                }
-
-                def _save_graph_snapshots_sync():
-                    client = Neo4jClient(graph_name=age_graph_name)
+                    # Re-open Neo4j client for detail queries (workflow.neo4j was closed)
+                    neo4j = Neo4jClient(graph_name=age_graph_name)
                     try:
-                        return client.save_request_graph_snapshots(
-                            run_id=request_graph_run_id,
-                            integrated_graph=integrated_graph,
-                            process_graphs=process_graphs,
-                            metadata={
-                                "task_id": str(task_id or ""),
-                                "tenant_id": str(effective_tenant_id or ""),
-                                "graph_name": age_graph_name,
-                                "process_count": len(process_graphs),
-                            },
-                        )
+                        for proc_id in job_process_ids:
+                            try:
+                                detail = await asyncio.to_thread(neo4j.get_process_with_details, proc_id)
+                                if not detail:
+                                    continue
+                                flows = await asyncio.to_thread(neo4j.get_sequence_flows, proc_id)
+                                if isinstance(flows, list):
+                                    detail["sequence_flows"] = flows
+                                graph_elements = await asyncio.to_thread(neo4j.get_process_graph_elements, proc_id)
+                                detail = self._enrich_tasks_with_role_from_graph(
+                                    detail=detail,
+                                    graph_elements=(graph_elements or {}),
+                                )
+                                extracted_by_proc_id[proc_id] = {
+                                    "detail": detail,
+                                    "graph_elements": graph_elements or {},
+                                    "process_name": (detail.get("process", {}) or {}).get("name")
+                                    or process_names_by_id.get(proc_id)
+                                    or "",
+                                }
+                            except Exception as e:
+                                logger.warning(f"[WARN] process detail 조회 중 예외: proc_id={proc_id}, err={e}")
                     finally:
-                        client.close()
+                        try:
+                            neo4j.close()
+                        except Exception:
+                            pass
 
-                graph_snapshot_result = await asyncio.to_thread(_save_graph_snapshots_sync)
-                logger.info(
-                    "[GRAPH] request graph snapshots saved: "
-                    f"run_id={request_graph_run_id}, result={graph_snapshot_result}"
-                )
-            except Exception as e:
-                logger.warning(f"[WARN] request graph snapshot save failed: {e}")
+                extracted_count2 = len(extracted_by_proc_id)
+                logger.info(f"[INFO] 이번 작업 기준 추출 프로세스: {extracted_count2}개")
+
+                # -----------------------------------------------------------------
+                # 동일/유사 이름 프로세스가 중복 추출된 경우, 저장 직전에 보수적으로 병합
+                # - 여러 파일이 하나의 프로세스를 나눠 설명하는 케이스에서 중복 저장 방지
+                # -----------------------------------------------------------------
+                def _norm_proc_name(name: Any) -> str:
+                    text = str(name or "").strip().lower()
+                    text = re.sub(r"\s+", " ", text)
+                    return text
+
+                def _dedup_list(items: Any, key_builder):
+                    if not isinstance(items, list):
+                        return []
+                    seen: Set[str] = set()
+                    out: List[Any] = []
+                    for item in items:
+                        try:
+                            key = key_builder(item)
+                        except Exception:
+                            key = ""
+                        key = str(key or "").strip()
+                        if not key:
+                            key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        out.append(item)
+                    return out
+
+                def _merge_graph_elements(g1: Any, g2: Any) -> Dict[str, Any]:
+                    base = g1 if isinstance(g1, dict) else {}
+                    inc = g2 if isinstance(g2, dict) else {}
+                    e1 = base.get("elements") if isinstance(base.get("elements"), list) else []
+                    e2 = inc.get("elements") if isinstance(inc.get("elements"), list) else []
+                    merged: List[Dict[str, Any]] = []
+                    seen_ids: Set[str] = set()
+                    for el in (e1 + e2):
+                        if not isinstance(el, dict):
+                            continue
+                        data = el.get("data") or {}
+                        eid = str(data.get("id") or "").strip()
+                        if not eid:
+                            continue
+                        if eid in seen_ids:
+                            continue
+                        seen_ids.add(eid)
+                        merged.append(el)
+                    counts = dict(base.get("counts") or {})
+                    counts["elements"] = len(merged)
+                    return {
+                        **base,
+                        "elements": merged,
+                        "counts": counts,
+                    }
+
+                merged_by_name: Dict[str, Dict[str, Any]] = {}
+                for proc_id, pinfo in extracted_by_proc_id.items():
+                    process_name = (pinfo.get("process_name") or "").strip()
+                    norm_name = _norm_proc_name(process_name)
+                    detail = pinfo.get("detail") or {}
+                    graph_elements = pinfo.get("graph_elements") or {}
+
+                    # 이름이 비어있으면 병합하지 않고 독립 유지
+                    merge_key = norm_name if norm_name else f"__{proc_id}"
+                    if merge_key not in merged_by_name:
+                        pinfo_copy = dict(pinfo)
+                        pinfo_copy["detail"] = dict(detail) if isinstance(detail, dict) else {}
+                        pinfo_copy["graph_elements"] = dict(graph_elements) if isinstance(graph_elements, dict) else {}
+                        pinfo_copy["_source_proc_ids"] = [proc_id]
+                        merged_by_name[merge_key] = pinfo_copy
+                        continue
+
+                    target = merged_by_name[merge_key]
+                    target_detail = target.get("detail") or {}
+                    target_detail = target_detail if isinstance(target_detail, dict) else {}
+                    incoming_detail = detail if isinstance(detail, dict) else {}
+
+                    # process 본문은 설명이 더 긴 쪽을 우선
+                    t_proc = target_detail.get("process") if isinstance(target_detail.get("process"), dict) else {}
+                    i_proc = incoming_detail.get("process") if isinstance(incoming_detail.get("process"), dict) else {}
+                    t_desc = str(t_proc.get("description") or "")
+                    i_desc = str(i_proc.get("description") or "")
+                    if len(i_desc) > len(t_desc):
+                        target_detail["process"] = i_proc
+                        if i_proc.get("name"):
+                            target["process_name"] = str(i_proc.get("name"))
+
+                    target_detail["tasks"] = _dedup_list(
+                        (target_detail.get("tasks") or []) + (incoming_detail.get("tasks") or []),
+                        lambda x: (x or {}).get("task_id") or (x or {}).get("id") or (x or {}).get("name") or "",
+                    )
+                    target_detail["roles"] = _dedup_list(
+                        (target_detail.get("roles") or []) + (incoming_detail.get("roles") or []),
+                        lambda x: (x or {}).get("role_id") or (x or {}).get("id") or (x or {}).get("name") or "",
+                    )
+                    target_detail["gateways"] = _dedup_list(
+                        (target_detail.get("gateways") or []) + (incoming_detail.get("gateways") or []),
+                        lambda x: (x or {}).get("gateway_id") or (x or {}).get("id") or (x or {}).get("name") or "",
+                    )
+                    target_detail["events"] = _dedup_list(
+                        (target_detail.get("events") or []) + (incoming_detail.get("events") or []),
+                        lambda x: (x or {}).get("event_id") or (x or {}).get("id") or (x or {}).get("name") or "",
+                    )
+                    target_detail["sequence_flows"] = _dedup_list(
+                        (target_detail.get("sequence_flows") or target_detail.get("flows") or [])
+                        + (incoming_detail.get("sequence_flows") or incoming_detail.get("flows") or []),
+                        lambda x: f"{(x or {}).get('source')}>{(x or {}).get('target')}|{(x or {}).get('condition') or ''}",
+                    )
+                    target["detail"] = target_detail
+                    target["graph_elements"] = _merge_graph_elements(target.get("graph_elements"), graph_elements)
+                    src = target.get("_source_proc_ids") if isinstance(target.get("_source_proc_ids"), list) else []
+                    src.append(proc_id)
+                    target["_source_proc_ids"] = src
+
+                if len(merged_by_name) != len(extracted_by_proc_id):
+                    logger.info(
+                        f"[MERGE] duplicate-name merge applied: {len(extracted_by_proc_id)} -> {len(merged_by_name)}"
+                    )
+                extracted_by_proc_id = {
+                    (v.get("_source_proc_ids")[0] if isinstance(v.get("_source_proc_ids"), list) and v.get("_source_proc_ids") else k): v
+                    for k, v in merged_by_name.items()
+                }
+
+                # -----------------------------------------------------------------
+                # 요청 단위 통합 그래프 + 최종 프로세스 그래프 스냅샷 저장
+                # -----------------------------------------------------------------
+                try:
+                    process_graphs: Dict[str, Dict[str, Any]] = {}
+                    integrated_elements: List[Dict[str, Any]] = []
+                    seen_element_ids: Set[str] = set()
+                    for pid, pinfo in extracted_by_proc_id.items():
+                        g = pinfo.get("graph_elements") or {}
+                        if isinstance(g, dict):
+                            process_graphs[pid] = g
+                            for el in g.get("elements") or []:
+                                if not isinstance(el, dict):
+                                    continue
+                                data = el.get("data") or {}
+                                eid = str(data.get("id") or "").strip()
+                                if not eid or eid in seen_element_ids:
+                                    continue
+                                seen_element_ids.add(eid)
+                                integrated_elements.append(el)
+
+                    integrated_graph = {
+                        "run_id": request_graph_run_id,
+                        "task_id": str(task_id or ""),
+                        "graph_name": age_graph_name,
+                        "process_ids": list(extracted_by_proc_id.keys()),
+                        "elements": integrated_elements,
+                        "counts": {
+                            "elements": len(integrated_elements),
+                            "processes": len(process_graphs),
+                        },
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+
+                    def _save_graph_snapshots_sync():
+                        client = Neo4jClient(graph_name=age_graph_name)
+                        try:
+                            return client.save_request_graph_snapshots(
+                                run_id=request_graph_run_id,
+                                integrated_graph=integrated_graph,
+                                process_graphs=process_graphs,
+                                metadata={
+                                    "task_id": str(task_id or ""),
+                                    "tenant_id": str(effective_tenant_id or ""),
+                                    "graph_name": age_graph_name,
+                                    "process_count": len(process_graphs),
+                                },
+                            )
+                        finally:
+                            client.close()
+
+                    graph_snapshot_result = await asyncio.to_thread(_save_graph_snapshots_sync)
+                    logger.info(
+                        "[GRAPH] request graph snapshots saved: "
+                        f"run_id={request_graph_run_id}, result={graph_snapshot_result}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[WARN] request graph snapshot save failed: {e}")
             
+
+            # --- end skip workflow when HITL resume ---
             # 9. 각 추출 프로세스에 대해 ProcessGPT 정의/유저매핑 → XML 생성 → DB 저장
-            saved_processes = []
+            saved_processes: List[Dict[str, Any]] = []
             all_bpmn_xmls = {}  # proc_def_id -> bpmn_xml 매핑
             total_bpmn = len(extracted_by_proc_id)
             agent_user_ids_for_skill_sync: Set[str] = set()
@@ -8160,6 +8761,21 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
             # 프로세스 후처리(지침 기반)에서 생성된 스킬 메타 누적
             generated_skill_metas: List[Dict[str, Any]] = []
+            if resume_cp:
+                saved_processes = list(resume_cp.get("completed_processes") or [])
+                generated_skill_metas = list(resume_cp.get("generated_skill_metas") or [])
+                agent_user_ids_for_skill_sync = {
+                    str(x) for x in (resume_cp.get("agent_user_ids_for_skill_sync") or []) if str(x).strip()
+                }
+                assigned_agent_user_ids = {
+                    str(x) for x in (resume_cp.get("assigned_agent_user_ids") or []) if str(x).strip()
+                }
+                for aid, names in (resume_cp.get("agent_skill_names_for_sync") or {}).items():
+                    if not str(aid or "").strip():
+                        continue
+                    agent_skill_names_for_sync[str(aid)] = {
+                        str(n) for n in (names or []) if str(n or "").strip()
+                    }
 
             def _sync_agent_graph_for_process_sync(
                 neo4j_proc_id: str,
@@ -8200,6 +8816,15 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                             neo4j.link_agent_to_skill_by_name(aid, sk)
                 finally:
                     neo4j.close()
+
+            # =================================================================
+            # PASS 1 — 모든 프로세스의 proc_json 생성 + HITL 후보 수집 (DB 저장/HITL 없음)
+            #   resume 시: checkpoint 의 prepared_processes 를 복원하고 PASS1 을 건너뛴다
+            #   (resume 시 extracted_by_proc_id 가 비어 있어 PASS1 for 루프가 자동 skip 됨)
+            # =================================================================
+            prepared_processes: List[Dict[str, Any]] = (
+                list(resume_cp.get("prepared_processes") or []) if resume_cp else []
+            )
             
             logger.info(f"[DEBUG] extracted_by_proc_id keys: {list(extracted_by_proc_id.keys())}")
             
@@ -8325,21 +8950,341 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     proc_def_id = str(uuid.uuid4())
                     proc_json["processDefinitionId"] = proc_def_id
 
-                # NEW: task instruction 기반 스킬 추출 + LLM enrichment + task 스킬 할당
+                # === [HITL] 후보 추출 → 통합 elicit → 응답 반영 ===
+                # 사용자에게 "스킬/에이전트/DMN 을 어떻게 생성할지" 를 한 번에 묻고, 응답대로만 실제 생성.
+                # 단일 process 시나리오에서 사용자 개입 1회. 다중 process 면 process 마다 발생.
+
+                # 1) 스킬 후보 추출 — _postprocess_skills_and_tasks 는 proc_json 을 mutate 하지만
+                #    그 결과 자체가 후보 카드이므로, 거부된 항목은 _remove_rejected_skills_from_proc_json
+                #    로 사후 정리한다.
                 process_skill_metas = await self._postprocess_skills_and_tasks(
                     proc_json=proc_json,
                     process_name=process_name,
                 )
-                if process_skill_metas:
-                    generated_skill_metas.extend(process_skill_metas)
 
-                # NEW: lane(role)-skill 집계 기반 에이전트 생성/재사용 + 활동 배정
-                await self._apply_assignment_and_maybe_create_agents(
+                # 2) 에이전트 후보 수집 (INSERT 없음, LLM 프로필만 미리 만들어 미리보기 제공)
+                agent_candidates_for_process: List[Dict[str, Any]] = []
+                try:
+                    agent_candidates_for_process = await self._collect_agent_candidates(
+                        proc_json=proc_json,
+                        tenant_id=tenant_id,
+                        process_name=process_name,
+                    )
+                except Exception as exc:
+                    logger.warning(f"[HITL][CAND][AGENT] 수집 실패: {exc}")
+
+                # 3) DMN 후보 — 실제 생성될 proc_json 게이트웨이 기준으로 수집
+                #    (parallel/분기<2 게이트웨이 제외 → 실제 DMN 으로 만들 수 있는 것만 노출)
+                dmn_candidates = self._collect_dmn_candidates_from_proc_json(
                     proc_json=proc_json,
-                    tenant_id=tenant_id,
+                    proc_def_id=proc_def_id,
                     process_name=process_name,
-                    extracted=extracted_payload,
                 )
+
+                # 이 프로세스의 생성 결과 + HITL 후보를 모아둔다 (DB 저장은 PASS2 에서)
+                prepared_processes.append({
+                    "process_index": idx,
+                    "proc_id": str(proc_id),
+                    "process_name": process_name,
+                    "proc_def_id": proc_def_id,
+                    "proc_json": proc_json,
+                    "extracted_payload": extracted_payload,
+                    "process_skill_metas": process_skill_metas,
+                    "agent_candidates_for_process": agent_candidates_for_process,
+                    "dmn_candidates": dmn_candidates,
+                })
+            # --- PASS1 끝: 모든 proc_json 생성 + 스킬/에이전트/DMN 후보 수집 완료 ---
+
+            # =================================================================
+            # [HITL] 통합 elicit — 모든 프로세스의 스킬/에이전트/DMN 후보를 한 패널에
+            #   묶어 1회만 질문한다 (사용자 개입 1회). 미응답이면 checkpoint 저장 후 pause.
+            # =================================================================
+            dmn_qid = stable_hitl_question_id(str(task_id), "dmn_apply")
+            unified_questions: List[Dict[str, Any]] = []
+            skill_qid_by_pdid: Dict[str, str] = {}
+            agent_qid_by_pdid: Dict[str, str] = {}
+            all_dmn_candidates: List[Dict[str, Any]] = []
+
+            for prep in prepared_processes:
+                p_pdid = str(prep.get("proc_def_id") or "")
+                p_name = str(prep.get("process_name") or "")
+                p_skill_metas = prep.get("process_skill_metas") or []
+                p_agent_cands = prep.get("agent_candidates_for_process") or []
+                all_dmn_candidates.extend(prep.get("dmn_candidates") or [])
+
+                # 스킬 질문 (유효한 후보가 있을 때만)
+                skill_items: List[Dict[str, Any]] = []
+                for meta in p_skill_metas:
+                    if not isinstance(meta, dict):
+                        continue
+                    safe = str(meta.get("safe_name") or "").strip()
+                    name = str(meta.get("name") or "").strip()
+                    if not safe or not name:
+                        continue
+                    summary = (
+                        str(meta.get("description") or meta.get("summary") or meta.get("purpose") or "").strip()
+                    )
+                    if len(summary) > 140:
+                        summary = summary[:140].rstrip() + "…"
+                    skill_items.append({
+                        "id": safe,
+                        "label": name,
+                        "description": summary or "반복 지침 기반 공통 스킬",
+                    })
+                if skill_items:
+                    sk_qid = stable_hitl_question_id(str(task_id), f"skills_{p_pdid}")
+                    skill_qid_by_pdid[p_pdid] = sk_qid
+                    unified_questions.append(build_question_payload(
+                        question=f"[{p_name}] 어떤 스킬을 생성할까요?",
+                        feedback_type="select_items",
+                        items=skill_items,
+                        context=(
+                            "선택한 스킬만 등록됩니다. 모두 해제하면 이 프로세스의 스킬 생성을 건너뜁니다.\n"
+                            "직접 입력란에는 스킬 이름 변경 요청 (예: \"검토 처리 → 결재 검토\") 이나 추가 요청을 적을 수 있습니다."
+                        ),
+                        allow_multiple=True,
+                        min_select=0,
+                        allow_other=True,
+                        target_type="skills_batch",
+                        target_id=task_id,
+                        question_id=sk_qid,
+                        option_meta={
+                            "tool": "pdf2bpmn", "key": "skills_approval", "stage": "skills",
+                            "task_id": task_id, "proc_def_id": p_pdid,
+                        },
+                    ))
+
+                # 에이전트 질문 (후보 있을 때만)
+                if p_agent_cands:
+                    ag_qid = stable_hitl_question_id(str(task_id), f"agents_{p_pdid}")
+                    agent_qid_by_pdid[p_pdid] = ag_qid
+                    agent_items = [
+                        {
+                            "id": c["candidate_id"],
+                            "label": c["label"],
+                            "description": c["description"],
+                        }
+                        for c in p_agent_cands
+                    ]
+                    unified_questions.append(build_question_payload(
+                        question=f"[{p_name}] 어떤 에이전트를 생성/연결할까요?",
+                        feedback_type="select_items",
+                        items=agent_items,
+                        context=(
+                            "선택한 에이전트만 활동에 연결됩니다. '기존 에이전트 재사용' 표시가 있는 항목은 신규 생성 없이 매칭만 이뤄집니다.\n"
+                            "직접 입력란에는 추가 의견을 자유롭게 적을 수 있습니다."
+                        ),
+                        allow_multiple=True,
+                        min_select=0,
+                        allow_other=True,
+                        target_type="agents_batch",
+                        target_id=task_id,
+                        question_id=ag_qid,
+                        option_meta={
+                            "tool": "pdf2bpmn", "key": "agents_approval", "stage": "agents",
+                            "task_id": task_id, "proc_def_id": p_pdid,
+                        },
+                    ))
+
+            # DMN 질문 (전체 프로세스의 게이트웨이를 한 질문에 통합)
+            if all_dmn_candidates:
+                dmn_items = [
+                    {
+                        "id": c["candidate_id"],
+                        "label": c["label"],
+                        "description": c["description"],
+                    }
+                    for c in all_dmn_candidates
+                ]
+                unified_questions.append(build_question_payload(
+                    question="DMN 의사결정 테이블을 어떤 게이트웨이에 만들까요?",
+                    feedback_type="select_items",
+                    items=dmn_items,
+                    context=(
+                        "선택한 게이트웨이만 DMN 의사결정 테이블로 변환됩니다.\n"
+                        "선택하지 않은 게이트웨이는 BPMN 분기 조건만 사용합니다."
+                    ),
+                    allow_multiple=True,
+                    min_select=0,
+                    allow_other=True,
+                    target_type="dmn_batch",
+                    target_id=task_id,
+                    question_id=dmn_qid,
+                    option_meta={
+                        "tool": "pdf2bpmn", "key": "dmn_apply", "stage": "dmn",
+                        "task_id": task_id,
+                    },
+                ))
+
+            # emit + pause (사용자 개입 1회). 응답이 모두 있으면 즉시 진행.
+            hitl_entries_map: Dict[str, Optional[Dict[str, Any]]] = {}
+            if unified_questions:
+                qids_to_wait = [q["question_id"] for q in unified_questions if q.get("question_id")]
+                if not self.supabase_client:
+                    logger.error(
+                        "[HITL][UNIFIED] supabase_client 없음 — 사용자 응답 대기 불가. "
+                        "스킬/에이전트/DMN 은 기본값(미선택)으로 진행합니다."
+                    )
+                else:
+                    out_hitl_state = await self._load_fresh_todolist_output(str(task_id))
+                    prior_wait = str(out_hitl_state.get("hitl_wait_started_at") or "")
+                    hitl_entries_map = await asyncio.to_thread(
+                        read_batch_responses,
+                        self.supabase_client,
+                        str(task_id),
+                        qids_to_wait,
+                        prior_wait or None,
+                    )
+                    missing_qids = [q for q in qids_to_wait if hitl_entries_map.get(q) is None]
+                    if missing_qids:
+                        emit_waiting_for_user(
+                            event_queue=event_queue,
+                            context_id=context_id,
+                            task_id=task_id,
+                            job_id=job_id,
+                            main_loop=main_loop,
+                            questions=unified_questions,
+                            progress=72,
+                            message_text=(
+                                f"[HITL] 사용자 확인 대기 중: {len(prepared_processes)}개 프로세스의 "
+                                "스킬/에이전트/DMN 생성 결정"
+                            ),
+                        )
+                        checkpoint = {
+                            "version": 2,
+                            "stage": "unified_post_procgen",
+                            "prepared_processes": prepared_processes,
+                            "question_ids": {
+                                "dmn": dmn_qid,
+                                "skills": skill_qid_by_pdid,
+                                "agents": agent_qid_by_pdid,
+                            },
+                            "job_process_ids": [
+                                str(p.get("proc_id") or "") for p in prepared_processes
+                            ],
+                            "age_graph_name": age_graph_name,
+                            "effective_tenant_id": effective_tenant_id,
+                            "request_graph_run_id": request_graph_run_id,
+                            "user_input": (user_input or "")[:8000],
+                            "pdf_name": pdf_name,
+                            "input_file_names": list(input_file_names),
+                            "workflow_state": {
+                                "dmn_decisions": state.get("dmn_decisions") or [],
+                                "dmn_rules": state.get("dmn_rules") or [],
+                                "skill_docs": state.get("skill_docs") or {},
+                            },
+                        }
+                        await asyncio.to_thread(
+                            pause_for_hitl,
+                            self.supabase_client,
+                            str(task_id),
+                            checkpoint,
+                            qids_to_wait,
+                        )
+                        logger.info(
+                            "[HITL][UNIFIED] pause — todo_id=%s processes=%s (HUMAN_ASKED)",
+                            task_id, len(prepared_processes),
+                        )
+                        raise HitlPauseException()
+                    # 응답 모두 수신 — 재개 또는 즉시 진행
+                    emit_human_feedback_received(
+                        event_queue=event_queue,
+                        context_id=context_id,
+                        task_id=task_id,
+                        job_id=job_id,
+                        main_loop=main_loop,
+                        question_id=qids_to_wait[0] if qids_to_wait else "",
+                        summary="HITL 응답 수신 — 프로세스 생성 계속",
+                        progress=74,
+                    )
+                    await asyncio.to_thread(
+                        clear_hitl_checkpoint, self.supabase_client, str(task_id)
+                    )
+                    await asyncio.to_thread(
+                        mark_hitl_process_resolved, self.supabase_client, str(task_id), 0
+                    )
+
+            # DMN 선택 파싱 — candidate_id 형식 "dmn::<proc_def_id>::<gateway_id>"
+            #   approved_dmn_tokens 에는 "<proc_def_id>::<gateway_id>" 토큰을 담는다.
+            approved_dmn_tokens: Set[str] = set()
+            dmn_entry = hitl_entries_map.get(dmn_qid)
+            if dmn_entry is not None and not hitl_is_skipped(dmn_entry):
+                for x in hitl_selected_ids(dmn_entry):
+                    sx = str(x or "")
+                    if sx.startswith("dmn::"):
+                        approved_dmn_tokens.add(sx[len("dmn::"):])
+            state["__hitl_dmn_decided"] = True
+            state["__hitl_approved_dmn_gateways"] = approved_dmn_tokens
+
+            # =================================================================
+            # PASS 2 — 각 프로세스에 HITL 응답을 반영하고 DB 에 저장
+            # =================================================================
+            total_bpmn = len(prepared_processes)
+            for prepared in prepared_processes:
+                idx = int(prepared.get("process_index") or 0)
+                proc_id = str(prepared.get("proc_id") or "")
+                process_name = str(prepared.get("process_name") or f"Process {idx + 1}")
+                proc_def_id = str(prepared.get("proc_def_id") or "")
+                proc_json = prepared.get("proc_json") or {}
+                extracted_payload = prepared.get("extracted_payload") or {}
+                process_skill_metas = list(prepared.get("process_skill_metas") or [])
+                agent_candidates_for_process = list(prepared.get("agent_candidates_for_process") or [])
+
+                # 이 프로세스의 스킬/에이전트 HITL 응답 파싱
+                sk_qid = skill_qid_by_pdid.get(proc_def_id) or ""
+                ag_qid = agent_qid_by_pdid.get(proc_def_id) or ""
+                approved_skill_keys: Optional[Set[str]] = None
+                approved_agent_ids: Optional[Set[str]] = None
+                if sk_qid:
+                    sk_entry = hitl_entries_map.get(sk_qid)
+                    if sk_entry is not None and not hitl_is_skipped(sk_entry):
+                        approved_skill_keys = {
+                            self._normalize_skill_key(x)
+                            for x in hitl_selected_ids(sk_entry)
+                            if str(x or "").strip()
+                        }
+                    else:
+                        approved_skill_keys = set()
+                if ag_qid:
+                    ag_entry = hitl_entries_map.get(ag_qid)
+                    if ag_entry is not None and not hitl_is_skipped(ag_entry):
+                        approved_agent_ids = set(hitl_selected_ids(ag_entry))
+                    else:
+                        approved_agent_ids = set()
+
+                # 응답 반영 (스킬/에이전트)
+                if approved_skill_keys is not None or approved_agent_ids is not None:
+                    process_skill_metas = await self._apply_unified_hitl_to_process(
+                        proc_json=proc_json,
+                        process_name=process_name,
+                        process_skill_metas=process_skill_metas,
+                        agent_candidates_for_process=agent_candidates_for_process,
+                        approved_skill_keys=approved_skill_keys,
+                        approved_agent_ids=approved_agent_ids,
+                        state=state,
+                        tenant_id=tenant_id,
+                        agent_user_ids_for_skill_sync=agent_user_ids_for_skill_sync,
+                        agent_skill_names_for_sync=agent_skill_names_for_sync,
+                    )
+                generated_skill_metas.extend(process_skill_metas)
+
+                # DMN 적용 — 사용자가 선택한 게이트웨이만 proc_json 에 DMN 테이블 보강
+                this_proc_dmn_gids = {
+                    tok.split("::", 1)[1]
+                    for tok in approved_dmn_tokens
+                    if "::" in tok and tok.split("::", 1)[0] == proc_def_id
+                }
+                if this_proc_dmn_gids:
+                    proc_json = self._augment_runtime_with_gateway_dmn(
+                        runtime_def=proc_json,
+                        extracted=extracted_payload,
+                        approved_gateway_ids=this_proc_dmn_gids,
+                    )
+                    prepared["proc_json"] = proc_json
+                    logger.info(
+                        "[HITL][DMN] proc=%s — 게이트웨이 %d개를 DMN 의사결정 테이블로 생성",
+                        process_name, len(this_proc_dmn_gids),
+                    )
                 
                 # DB에 저장
                 proc_def_data = {
@@ -8370,7 +9315,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         await self._send_progress_event(
                             event_queue, context_id, task_id, job_id,
                             f"[FORM] 프로세스 폼 생성/저장을 시작합니다: {process_name}",
-                            "tool_usage_started", 91,
+                            "tool_usage_started", 78,
                             {"proc_def_id": proc_def_id, "process_name": process_name},
                         )
                         forms_result = await self._ensure_forms_for_process(
@@ -8429,7 +9374,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         await self._send_progress_event(
                             event_queue, context_id, task_id, job_id,
                             f"[FORM] 프로세스 폼 처리 완료: {process_name} (saved={forms_result.get('forms_saved')}/{forms_result.get('activities')})",
-                            "tool_usage_finished", 96,
+                            "tool_usage_finished", 82,
                             {"proc_def_id": proc_def_id, "forms_result": forms_result},
                         )
                     except Exception as e:
@@ -8549,7 +9494,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 await self._send_progress_event(
                     event_queue, context_id, task_id, job_id,
                     f"[SAVED] 프로세스 저장 완료: {process_name}",
-                    "tool_usage_finished", 90 + int(10 * (idx + 1) / total_bpmn),
+                    "tool_usage_finished", 75 + int(8 * (idx + 1) / max(total_bpmn, 1)),
                     {
                         "process_id": proc_def_id, 
                         "process_name": process_name,
@@ -8560,6 +9505,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # 10. 최종 결과 구성 (saved_processes에는 이미 bpmn_xml 포함됨)
             actual_count = len(saved_processes)
             logger.info(f"[DEBUG] Actual saved process count: {actual_count}")
+
+            # DMN 응답 반영은 PASS2 에서 proc_json 별로 이미 완료됨:
+            #   사용자가 선택한 게이트웨이만 _augment_runtime_with_gateway_dmn 으로
+            #   해당 proc_json 에 DMN 의사결정 테이블을 생성한 뒤 DB 저장했다.
+            #   (이전의 state.dmn_decisions 필터링 방식은 추출 단계 엔티티를 대상으로 해
+            #    proc_def 의 실제 게이트웨이와 ID 가 일치하지 않아 제거되었다.)
 
             # 10.5 NEW: 생성된 스킬을 Claude Skills 서비스에 업로드하고 Supabase에 동기화
             # - 워크플로우에서 만든 skill_docs(markdown)를 제품이 쓰는 스킬 저장소로 등록
@@ -8596,16 +9547,28 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                             )
                         skill_docs[key] = md
                 if isinstance(skill_docs, dict) and skill_docs:
+                    # 사용자가 process loop 안의 통합 elicit 에서 이미 결정함.
+                    # state["__hitl_approved_skill_keys"] 에 승인된 스킬 키가 있으면 그대로 사용,
+                    # 없으면 (단일 process 시나리오 아니거나 응답 없었음) 모두 자동 승인.
+                    approved_keys: Optional[Set[str]] = state.get("__hitl_approved_skill_keys")
+                    if approved_keys is not None and not isinstance(approved_keys, set):
+                        approved_keys = set(approved_keys) if approved_keys else set()
+
                     await self._send_progress_event(
                         event_queue, context_id, task_id, job_id,
                         f"[SKILL] 생성된 스킬({len(skill_docs)}) 업로드/동기화를 시작합니다...",
-                        "tool_usage_started", 97,
-                        {"skill_count": len(skill_docs)},
+                        "tool_usage_started", 88,
+                        {"skill_count": len(skill_docs), "approved_count": (
+                            len(approved_keys) if approved_keys is not None else len(skill_docs)
+                        )},
                     )
 
                     uploaded: List[str] = []
-                    for md in skill_docs.values():
+                    for key, md in skill_docs.items():
                         if not isinstance(md, str) or not md.strip():
+                            continue
+                        # 사용자가 선택한 키만 업로드. None 이면 폴백(전체 자동 승인).
+                        if approved_keys is not None and key not in approved_keys:
                             continue
                         sname = self._extract_skill_name_from_markdown(md) or "generated-skill"
                         safe = self._normalize_skill_key(sname) or "generated-skill"
@@ -8642,7 +9605,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     await self._send_progress_event(
                         event_queue, context_id, task_id, job_id,
                         f"[SKILL] 스킬 업로드/동기화 완료: {len(uploaded)}/{len(skill_docs)}",
-                        "tool_usage_finished", 99,
+                        "tool_usage_finished", 94,
                         {
                             "skills_uploaded": uploaded,
                             "agents_updated": len(agent_skill_names_for_sync),
@@ -8709,27 +9672,41 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # ----------------------------------------------------------------
             integrated_graph_full: Dict[str, Any] = {"elements": [], "counts": {"nodes": 0, "edges": 0}}
             process_graphs: Dict[str, Any] = {}
+            neo4j_for_graph: Any = None
+            neo4j_graph_owned = False
             try:
-                integrated_graph_full = workflow.neo4j.get_full_graph_elements(max_nodes=3000) or {
-                    "elements": [], "counts": {"nodes": 0, "edges": 0}
-                }
-                for p in saved_processes:
-                    pid = str(p.get("neo4j_proc_id") or p.get("id") or "").strip()
-                    if not pid:
-                        continue
-                    try:
-                        process_graphs[pid] = workflow.neo4j.get_process_graph_elements(pid) or {
-                            "elements": [], "counts": {"nodes": 0, "edges": 0}
-                        }
-                    except Exception as exc_proc:
-                        logger.warning(f"[GRAPH] process({pid}) elements 추출 실패: {exc_proc}")
-                logger.info(
-                    f"[GRAPH] elements 추출 완료 — full: nodes={integrated_graph_full.get('counts', {}).get('nodes', 0)}, "
-                    f"edges={integrated_graph_full.get('counts', {}).get('edges', 0)}, "
-                    f"per_process: {len(process_graphs)} 개"
-                )
+                if workflow is not None and getattr(workflow, "neo4j", None):
+                    neo4j_for_graph = workflow.neo4j
+                elif age_graph_name:
+                    neo4j_for_graph = Neo4jClient(graph_name=age_graph_name)
+                    neo4j_graph_owned = True
+                if neo4j_for_graph is not None:
+                    integrated_graph_full = neo4j_for_graph.get_full_graph_elements(max_nodes=3000) or {
+                        "elements": [], "counts": {"nodes": 0, "edges": 0}
+                    }
+                    for p in saved_processes:
+                        pid = str(p.get("neo4j_proc_id") or p.get("id") or "").strip()
+                        if not pid:
+                            continue
+                        try:
+                            process_graphs[pid] = neo4j_for_graph.get_process_graph_elements(pid) or {
+                                "elements": [], "counts": {"nodes": 0, "edges": 0}
+                            }
+                        except Exception as exc_proc:
+                            logger.warning(f"[GRAPH] process({pid}) elements 추출 실패: {exc_proc}")
+                    logger.info(
+                        f"[GRAPH] elements 추출 완료 — full: nodes={integrated_graph_full.get('counts', {}).get('nodes', 0)}, "
+                        f"edges={integrated_graph_full.get('counts', {}).get('edges', 0)}, "
+                        f"per_process: {len(process_graphs)} 개"
+                    )
             except Exception as exc_full:
                 logger.warning(f"[GRAPH] AGE elements 추출 실패 (그래프 미리보기 누락 가능): {exc_full}")
+            finally:
+                if neo4j_graph_owned and neo4j_for_graph is not None:
+                    try:
+                        neo4j_for_graph.close()
+                    except Exception:
+                        pass
 
             final_result = {
                 "message": completed_message,
@@ -8750,7 +9727,11 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 #   - process_graphs: { neo4j_proc_id: { elements, counts } }
                 "integrated_graph": integrated_graph_full,
                 "process_graphs": process_graphs,
-                "graph_name": str(getattr(workflow, "neo4j", None) and workflow.neo4j.graph_name or ""),
+                "graph_name": str(
+                    age_graph_name
+                    or (getattr(workflow, "neo4j", None) and workflow.neo4j.graph_name)
+                    or ""
+                ),
                 "generated_at": datetime.now(timezone.utc).isoformat()
             }
             
@@ -8784,7 +9765,11 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 # 프론트는 우선 이 데이터를 사용하며, 없을 때만 외부 API 로 fallback 한다.
                 "integrated_graph": integrated_graph_full,
                 "process_graphs": process_graphs,
-                "graph_name": str(getattr(workflow, "neo4j", None) and workflow.neo4j.graph_name or ""),
+                "graph_name": str(
+                    age_graph_name
+                    or (getattr(workflow, "neo4j", None) and workflow.neo4j.graph_name)
+                    or ""
+                ),
                 "success": True,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "task_type": "pdf2bpmn"
@@ -8827,6 +9812,14 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             
             logger.info(f"[DONE] Task completed: {job_id} ({actual_count} processes)")
             
+        except HitlPauseException:
+            hitl_paused_only = True
+            logger.info(
+                "[HITL] execute paused — todo HUMAN_ASKED, consumer released; "
+                "will resume on FB_REQUESTED"
+            )
+            return
+
         except httpx.ConnectError as e:
             # 보통은 _download_file에서 ConnectError를 Exception으로 감싸 올리지만,
             # 방어적으로 남겨둡니다(네트워크 계층 오류).
@@ -8857,8 +9850,24 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             #   - 따라서 이 ScaledJob 워커가 종료되기 전 AGE 인스턴스에 남은 그래프를
             #     drop 하여 데이터가 무한정 부풀지 않도록 정리한다.
             try:
-                if age_graph_name_for_cleanup and workflow is not None and getattr(workflow, "neo4j", None):
-                    dropped = workflow.neo4j.drop_graph(age_graph_name_for_cleanup)
+                if hitl_paused_only:
+                    logger.info(
+                        "[CLEANUP] AGE graph drop skipped (HITL pause — resume needs graph): %s",
+                        age_graph_name_for_cleanup,
+                    )
+                elif age_graph_name_for_cleanup:
+                    dropped = False
+                    if workflow is not None and getattr(workflow, "neo4j", None):
+                        dropped = workflow.neo4j.drop_graph(age_graph_name_for_cleanup)
+                    else:
+                        nc_drop = Neo4jClient(graph_name=age_graph_name_for_cleanup)
+                        try:
+                            dropped = nc_drop.drop_graph(age_graph_name_for_cleanup)
+                        finally:
+                            try:
+                                nc_drop.close()
+                            except Exception:
+                                pass
                     if dropped:
                         logger.info(f"[CLEANUP] AGE graph dropped: {age_graph_name_for_cleanup}")
                     else:

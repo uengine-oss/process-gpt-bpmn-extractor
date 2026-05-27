@@ -27,6 +27,7 @@ from src.pdf2bpmn.processgpt.bpmn_xml_generator import ProcessGPTBPMNXmlGenerato
 from src.pdf2bpmn.processgpt.process_definition_prompt import build_system_prompt_processgpt
 from src.pdf2bpmn.processgpt.process_consulting_prompt import get_process_consulting_system_prompt
 from src.pdf2bpmn.processgpt.process_generation_messages import build_process_definition_messages
+from src.pdf2bpmn.processgpt.consulting_to_extracted_messages import build_consulting_to_extracted_messages
 from src.pdf2bpmn.config import Config
 from src.pdf2bpmn.models.entities import Document as PdfDocument, Section, ReferenceChunk
 from src.pdf2bpmn.process_post_processor import ProcessPostProcessor
@@ -296,6 +297,45 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         self.user_mapping_model = os.getenv("USER_MAPPING_MODEL", self.openai_model)
         self.process_definition_model = os.getenv("PROCESS_DEF_MODEL", self.openai_model)
         self.openai_client: Optional[OpenAI] = None
+
+        # ---- 프로세스 실행 검증(validation) 설정 --------------------------------
+        # 생성 완료 후 process-gpt-completion 실행 엔진(실제 /initiate·/complete)으로
+        # start→end 실행 테스트를 돌려, 결함이 있으면 자동 개선한다.
+        # - PDF2BPMN_VALIDATION_ENABLED: 검증 단계 on/off (기본 on)
+        # - COMPLETION_ENGINE_URL: process-gpt-completion API 서버 base URL
+        # - PDF2BPMN_VALIDATION_MAX_ITERS: 검증-개선 루프 최대 반복 횟수
+        # - PDF2BPMN_VALIDATION_CLEANUP: 검증용 테스트 인스턴스 정리 여부 (기본 on)
+        self.validation_enabled = (
+            os.getenv("PDF2BPMN_VALIDATION_ENABLED", "true").strip().lower() == "true"
+        )
+        self.completion_engine_url = (
+            os.getenv("COMPLETION_ENGINE_URL", "http://localhost:8000").strip()
+        )
+        if self._is_running_in_docker():
+            self.completion_engine_url = self._rewrite_localhost_url(
+                self.completion_engine_url, localhost_target="127.0.0.1"
+            )
+        try:
+            self.validation_max_iters = max(
+                1, int(os.getenv("PDF2BPMN_VALIDATION_MAX_ITERS", "100"))
+            )
+        except Exception:
+            self.validation_max_iters = 100
+        # 검증은 실제 프로세스 인스턴스를 만든다. 기본값은 '보존'(false) — 검증이 실제
+        # 엔진으로 어떤 흐름을 탔는지 DB(todolist/bpm_proc_inst)에서 직접 확인할 수 있게
+        # 남겨둔다. 누적이 부담되면 PDF2BPMN_VALIDATION_CLEANUP=true 로 삭제 가능.
+        self.validation_cleanup = (
+            os.getenv("PDF2BPMN_VALIDATION_CLEANUP", "false").strip().lower() == "true"
+        )
+        # 제출(/complete) 후 폴링 서비스가 다음 단계로 진행(SUBMITTED→다음 활동 또는
+        # 프로세스 완료)할 때까지 기다리는 최대 시간(초). 마지막 태스크의 완료 처리가
+        # 폴링 주기상 늦어질 수 있어 넉넉히 둔다(기본 70초).
+        try:
+            self.validation_advance_timeout = max(
+                5.0, float(os.getenv("PDF2BPMN_VALIDATION_ADVANCE_TIMEOUT", "70"))
+            )
+        except Exception:
+            self.validation_advance_timeout = 70.0
         if OPENAI_AVAILABLE and self.openai_api_key:
             try:
                 client_kwargs = {"api_key": self.openai_api_key}
@@ -2215,6 +2255,10 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # workflow.set_dedup_level() 호출에 사용된다.
             # 예: {"pdf2bpmnLevel": "concise" | "standard" | "detailed"}
             "tool_settings": {},
+            # 컨설팅 기반 생성 모드: [InputData].input_mode == "consulting" 이면
+            # 파일 대신 컨설팅 내용(user_request/consulting_outline/user_answer/image_analysis)을
+            # 담는다. 이 값이 채워지면 execute() 가 메멘토/섹션/그래프 추출을 건너뛴다.
+            "consulting_payload": None,
             "raw_query": query
         }
 
@@ -2350,6 +2394,14 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         def _apply_parsed_data(data: Dict[str, Any]):
             result["room_id"] = str(data.get("room_id") or result.get("room_id") or "").strip()
             result["tenant_id"] = str(data.get("tenant_id") or result.get("tenant_id") or "").strip()
+            # 컨설팅 기반 생성 모드 감지: 업로드 문서 없이 컨설팅 내용으로 프로세스를 만든다.
+            if str(data.get("input_mode") or "").strip().lower() == "consulting":
+                result["consulting_payload"] = {
+                    "user_request": str(data.get("user_request") or "").strip(),
+                    "consulting_outline": str(data.get("consulting_outline") or "").strip(),
+                    "user_answer": str(data.get("user_answer") or "").strip(),
+                    "image_analysis": str(data.get("image_analysis") or "").strip(),
+                }
             # tool_settings 화이트리스트 검증 후 보존.
             ts = data.get("tool_settings")
             if isinstance(ts, dict) and ts:
@@ -3177,8 +3229,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         *,
         messages: List[Dict[str, str]],
         max_tokens: int = 3500,
+        temperature: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
-        """프로세스 정의 생성용: JSON-only 출력 강제 + 파싱 실패 시 재시도."""
+        """프로세스 정의 생성용: JSON-only 출력 강제 + 파싱 보강.
+
+        temperature 가 None 이면 환경변수 기본값을 쓴다(호출부 재시도 시 값 지정 가능).
+        """
         if not self.openai_client:
             return None
 
@@ -3321,12 +3377,15 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
             # Give up: let caller handle retry path
             return _try_load(s2)        # Prefer deterministic output for strict JSON parsing.
-        temperature = float(
-            os.getenv(
-                "LLM_PROCESS_DEFINITION_TEMPERATURE",
-                os.getenv("LLM_PROCESS_TEMPERATURE", "0.0"),
+        if temperature is None:
+            temperature = float(
+                os.getenv(
+                    "LLM_PROCESS_DEFINITION_TEMPERATURE",
+                    os.getenv("LLM_PROCESS_TEMPERATURE", "0.0"),
+                )
             )
-        )
+        else:
+            temperature = float(temperature)
         try:
             def _run():
                 # Prefer JSON mode when supported; fallback gracefully if SDK/model doesn't support it.
@@ -3729,9 +3788,30 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         ex_events_n = len(ex_events) if isinstance(ex_events, list) else 0
         ex_flows_n = len(ex_flows) if isinstance(ex_flows, list) else 0
 
+        # extracted gateway 중 '실제로 시퀀스 흐름에 연결된' 것만 따로 센다.
+        # 추출 단계가 같은 의사결정에 대해 중복/고립 게이트웨이를 만드는 사례가 있어
+        # (예: 'X 여부 판단' 게이트웨이 + 'X 에 따라 분기' 게이트웨이를 별도로),
+        # ex_gateways_n 전체로 비교하면 LLM 이 올바르게 통합·정리한 결과를
+        # gateway_count_severely_reduced 로 오판해 불필요하게 fallback 한다.
+        _ex_gw_ids = set()
+        for _g in (ex_gateways if isinstance(ex_gateways, list) else []):
+            if isinstance(_g, dict):
+                _gid = str(_g.get("gateway_id") or _g.get("id") or "").strip()
+                if _gid:
+                    _ex_gw_ids.add(_gid)
+        _wired_gw_ids = set()
+        for _f in (ex_flows if isinstance(ex_flows, list) else []):
+            if not isinstance(_f, dict):
+                continue
+            for _k in ("from_id", "to_id", "source", "target"):
+                _v = str(_f.get(_k) or "").strip()
+                if _v and _v in _ex_gw_ids:
+                    _wired_gw_ids.add(_v)
+        ex_gateways_wired_n = len(_wired_gw_ids)
+
         if ex_tasks_n > 0 and llm_activities == 0:
             return True, "no_activities_while_extracted_has_tasks"
-        if ex_gateways_n > 0 and llm_gateways == 0 and ex_gateways_n >= 2:
+        if ex_gateways_wired_n >= 2 and llm_gateways == 0:
             return True, "no_gateways_while_extracted_has_gateways"
         if ex_flows_n > 2 and llm_sequences <= 1:
             return True, "no_sequences_while_extracted_has_flows"
@@ -3743,8 +3823,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         #   본 문서의 흐름을 보존하지 못한다. validator 의 single-branch gateway collapse 가
         #   이어서 동작하면서 게이트웨이가 0 까지 떨어지는 회귀가 관측되었기 때문에,
         #   이 시점에서 미리 컷한다.
-        if ex_gateways_n >= 2 and llm_gateways * 2 < ex_gateways_n:
-            return True, f"gateway_count_severely_reduced({llm_gateways}<{ex_gateways_n}/2)"
+        # - 단, '연결된(wired)' 게이트웨이 수로 비교한다. 추출 단계의 중복/고립 게이트웨이를
+        #   세면 LLM 의 정상적인 dedup 을 오판하기 때문이다.
+        if ex_gateways_wired_n >= 2 and llm_gateways * 2 < ex_gateways_wired_n:
+            return True, (
+                f"gateway_count_severely_reduced({llm_gateways}<{ex_gateways_wired_n}/2 "
+                f"wired; extracted_total={ex_gateways_n})"
+            )
         # - 마찬가지로 sequence 도 절반 이하이면 분기/병합/역방향 흐름이 다수 누락된 것으로
         #   판단해 fallback. (LLM 이 모든 노드를 직선 chain 으로 만들어버린 회귀 사례 대응)
         if ex_flows_n >= 6 and llm_sequences * 2 < ex_flows_n:
@@ -3770,7 +3855,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         logger.info(
             f"[PROCDEF][FALLBACK-CHECK] keep_llm process={process_name!r} "
             f"llm(events={llm_events},activities={llm_activities},gateways={llm_gateways},sequences={llm_sequences}) "
-            f"extracted(tasks={ex_tasks_n},roles={ex_roles_n},gateways={ex_gateways_n},events={ex_events_n},flows={ex_flows_n})"
+            f"extracted(tasks={ex_tasks_n},roles={ex_roles_n},gateways={ex_gateways_n}"
+            f"[wired={ex_gateways_wired_n}],events={ex_events_n},flows={ex_flows_n})"
         )
         return False, "ok"
 
@@ -4762,6 +4848,56 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 if rule_id not in seen_rule_ids:
                     _append_rule(rule)
                     added_rules += 1
+
+            # 분기 조건을 프론트(ConditionExampleField) 스키마의 good/bad 예시로 변환해
+            # 각 분기 시퀀스플로우의 properties.examples 에 기록한다.
+            # exclusive 게이트웨이에서 한 분기의 '좋은 예시'(= 이 분기 조건)와
+            # '나쁜 예시'(= 다른 분기 조건)는 서로 반대 케이스이므로 LLM 없이 도출된다.
+            conditioned: List[Tuple[Dict[str, Any], str, str]] = []
+            for s in outs:
+                c = str(s.get("condition") or "").strip()
+                if not c:
+                    continue
+                tgt = str(s.get("target") or "").strip()
+                tname = node_name_by_id.get(tgt) or tgt
+                conditioned.append((s, c, tname))
+            if len(conditioned) >= 2:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                given_text = gname or "분기 판단"
+                for s, cond, tname in conditioned:
+                    good_examples = [{
+                        "given": given_text,
+                        "when": cond,
+                        "then": f"{tname} 경로로 진행",
+                        "valid_at": now_iso,
+                    }]
+                    bad_examples = [
+                        {
+                            "given": given_text,
+                            "when": cond2,
+                            "then": "이 경로로 진행하지 않음",
+                            "invalid_at": now_iso,
+                        }
+                        for s2, cond2, _tn2 in conditioned
+                        if s2 is not s
+                    ]
+                    try:
+                        raw_props = s.get("properties")
+                        if isinstance(raw_props, str) and raw_props.strip():
+                            props = json.loads(raw_props)
+                        elif isinstance(raw_props, dict):
+                            props = dict(raw_props)
+                        else:
+                            props = {}
+                    except Exception:
+                        props = {}
+                    if not isinstance(props, dict):
+                        props = {}
+                    props["examples"] = {
+                        "good_examples": good_examples,
+                        "bad_examples": bad_examples,
+                    }
+                    s["properties"] = json.dumps(props, ensure_ascii=False)
 
         if added_decisions > 0 or added_rules > 0:
             logger.info(
@@ -5870,6 +6006,265 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         hints["simplified"] = self._simplify_assignment_hints(hints)
         return hints
 
+    # =========================================================================
+    # 컨설팅 모드: 컨설팅 내용 → extracted 변환
+    # -------------------------------------------------------------------------
+    # 파일 모드는 "메멘토 청크 → 섹션 분리 → Neo4j 그래프 추출" 로 extracted 를 만든다.
+    # 컨설팅 모드는 업로드 문서가 없으므로 위 앞단을 건너뛰고, 사용자의 자연어 요청 +
+    # 컨설팅 초안 + 사용자 답변 + 이미지 분석 내용을 LLM 으로 동일한 extracted 구조로
+    # 변환한다. 이후 JSON 생성 로직은 파일 모드와 100% 동일하게 재사용된다.
+    # =========================================================================
+    def _normalize_consulting_extracted_detail(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        """LLM 이 만든 컨설팅 추출 결과를 downstream 파이프라인이 기대하는 detail 구조로 정규화."""
+        process = raw.get("process") if isinstance(raw.get("process"), dict) else {}
+
+        tasks_in = raw.get("tasks") if isinstance(raw.get("tasks"), list) else []
+        tasks: List[Dict[str, Any]] = []
+        role_names_seen: List[str] = []
+        for i, t in enumerate(tasks_in, start=1):
+            if not isinstance(t, dict):
+                continue
+            name = str(t.get("name") or "").strip()
+            if not name:
+                continue
+            tid = str(t.get("task_id") or t.get("id") or f"task_{i}").strip() or f"task_{i}"
+            order_val = t.get("task_order")
+            if order_val is None:
+                order_val = t.get("order")
+            try:
+                order_int = int(order_val)
+            except Exception:
+                order_int = i
+            role = str(t.get("role") or t.get("performer_role") or "").strip()
+            if role and role not in role_names_seen:
+                role_names_seen.append(role)
+            tasks.append({
+                "task_id": tid,
+                "name": name,
+                "instruction": str(t.get("instruction") or "").strip(),
+                "description": str(t.get("description") or "").strip(),
+                "role": role,
+                "task_order": order_int,
+            })
+
+        roles_in = raw.get("roles") if isinstance(raw.get("roles"), list) else []
+        roles: List[Dict[str, Any]] = []
+        role_names_added: Set[str] = set()
+        for i, r in enumerate(roles_in, start=1):
+            if isinstance(r, dict):
+                rn = str(r.get("name") or r.get("role") or "").strip()
+                rid = str(r.get("role_id") or r.get("id") or f"role_{i}").strip() or f"role_{i}"
+            elif isinstance(r, str):
+                rn = r.strip()
+                rid = f"role_{i}"
+            else:
+                continue
+            if rn and rn not in role_names_added:
+                role_names_added.add(rn)
+                roles.append({"role_id": rid, "name": rn})
+        # tasks 에서 등장했지만 roles 에 없는 역할 보강
+        for rn in role_names_seen:
+            if rn and rn not in role_names_added:
+                role_names_added.add(rn)
+                roles.append({"role_id": f"role_{len(roles) + 1}", "name": rn})
+        if not roles:
+            roles = [{"role_id": "role_1", "name": "담당자"}]
+        default_role = roles[0]["name"]
+        for t in tasks:
+            if not t.get("role"):
+                t["role"] = default_role
+
+        gateways_in = raw.get("gateways") if isinstance(raw.get("gateways"), list) else []
+        gateways: List[Dict[str, Any]] = []
+        for i, g in enumerate(gateways_in, start=1):
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get("gateway_id") or g.get("id") or f"gw_{i}").strip() or f"gw_{i}"
+            gateways.append({
+                "gateway_id": gid,
+                "name": str(g.get("name") or "").strip(),
+                "gateway_type": str(g.get("gateway_type") or g.get("type") or "ExclusiveGateway").strip(),
+                "condition": str(g.get("condition") or "").strip(),
+                "description": str(g.get("description") or "").strip(),
+                "role": str(g.get("role") or default_role).strip() or default_role,
+            })
+
+        events_in = raw.get("events") if isinstance(raw.get("events"), list) else []
+        events: List[Dict[str, Any]] = []
+        has_start = has_end = False
+        for e in events_in:
+            if not isinstance(e, dict):
+                continue
+            etype = str(e.get("event_type") or e.get("type") or "").strip()
+            eid = str(e.get("event_id") or e.get("id") or "").strip()
+            low = (etype + " " + eid).lower()
+            if "start" in low:
+                has_start = True
+                eid = eid or "start_event"
+                etype = "StartEvent"
+            elif "end" in low:
+                has_end = True
+                eid = eid or "end_event"
+                etype = "EndEvent"
+            if not eid:
+                continue
+            events.append({
+                "event_id": eid,
+                "event_type": etype or "IntermediateEvent",
+                "name": str(e.get("name") or "").strip(),
+            })
+        if not has_start:
+            events.insert(0, {"event_id": "start_event", "event_type": "StartEvent", "name": "프로세스 시작"})
+        if not has_end:
+            events.append({"event_id": "end_event", "event_type": "EndEvent", "name": "프로세스 종료"})
+
+        flows_in = raw.get("sequence_flows") if isinstance(raw.get("sequence_flows"), list) else []
+        if not flows_in and isinstance(raw.get("flows"), list):
+            flows_in = raw.get("flows")
+        flows: List[Dict[str, Any]] = []
+        for f in flows_in:
+            if not isinstance(f, dict):
+                continue
+            src = str(f.get("source") or f.get("from_id") or "").strip()
+            tgt = str(f.get("target") or f.get("to_id") or "").strip()
+            if not src or not tgt:
+                continue
+            flows.append({
+                "source": src,
+                "target": tgt,
+                "condition": str(f.get("condition") or "").strip(),
+            })
+        # flow 가 비어 있으면 task_order 순서로 직선 흐름을 합성한다.
+        if not flows and tasks:
+            ordered = sorted(tasks, key=lambda x: x.get("task_order") or 0)
+            chain = ["start_event"] + [t["task_id"] for t in ordered] + ["end_event"]
+            for a, b in zip(chain, chain[1:]):
+                flows.append({"source": a, "target": b, "condition": ""})
+
+        return {
+            "process": {
+                "name": str(process.get("name") or "").strip(),
+                "description": str(process.get("description") or "").strip(),
+            },
+            "tasks": tasks,
+            "roles": roles,
+            "gateways": gateways,
+            "events": events,
+            "sequence_flows": flows,
+        }
+
+    def _fallback_consulting_extracted_detail(
+        self,
+        *,
+        user_request: str,
+        consulting_outline: str,
+    ) -> Dict[str, Any]:
+        """LLM 변환 실패 시: 컨설팅 초안의 번호/불릿 목록을 단계로 파싱한 최소 구조."""
+        steps: List[str] = []
+        for line in (consulting_outline or "").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            m = re.match(r"^(?:\d+[.)]|[-*•])\s*(.+)$", s)
+            if m:
+                text = m.group(1).strip()
+                # "단계명: 설명" 형태면 앞부분만 단계명으로
+                text = re.split(r"[:：]", text, 1)[0].strip() or text
+                if text:
+                    steps.append(text[:60])
+        if not steps:
+            base = (user_request or consulting_outline or "업무 처리").strip()
+            steps = [f"{base[:40]} 처리"]
+
+        tasks = [
+            {
+                "task_id": f"task_{i}",
+                "name": name,
+                "instruction": "",
+                "description": "",
+                "role": "담당자",
+                "task_order": i,
+            }
+            for i, name in enumerate(steps, start=1)
+        ]
+        detail = {
+            "process": {"name": "", "description": (user_request or "").strip()[:200]},
+            "tasks": tasks,
+            "roles": [{"role_id": "role_1", "name": "담당자"}],
+            "gateways": [],
+            "events": [],
+            "sequence_flows": [],
+        }
+        return self._normalize_consulting_extracted_detail(detail)
+
+    def _derive_process_name_from_consulting(self, user_request: str, consulting_outline: str) -> str:
+        """프로세스명이 비었을 때 요청/초안에서 적당한 이름을 유도."""
+        text = (user_request or "").strip() or (consulting_outline or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        if not text:
+            return "신규 프로세스"
+        name = text[:30].strip()
+        if not name.endswith("프로세스"):
+            name = f"{name} 프로세스"
+        return name
+
+    async def _build_extracted_by_proc_id_from_consulting(
+        self,
+        *,
+        consulting_payload: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        컨설팅 내용을 LLM 으로 extracted 구조로 변환해 extracted_by_proc_id 를 만든다.
+        파일 모드의 메멘토/섹션/Neo4j 추출 단계를 대체하며, 반환 구조는 파일 모드와 동일하다:
+            { proc_id: {"detail": {...}, "graph_elements": {}, "process_name": "..."} }
+        """
+        user_request = str(consulting_payload.get("user_request") or "").strip()
+        consulting_outline = str(consulting_payload.get("consulting_outline") or "").strip()
+        user_answer = str(consulting_payload.get("user_answer") or "").strip()
+        image_analysis = str(consulting_payload.get("image_analysis") or "").strip()
+
+        detail: Dict[str, Any] = {}
+        if self.openai_client:
+            try:
+                messages = build_consulting_to_extracted_messages(
+                    user_request=user_request,
+                    consulting_outline=consulting_outline,
+                    user_answer=user_answer,
+                    image_analysis=image_analysis,
+                )
+                converted = await self._call_openai_json_messages(messages=messages, max_tokens=4000)
+                if isinstance(converted, dict):
+                    detail = self._normalize_consulting_extracted_detail(converted)
+                    logger.info(
+                        f"[CONSULTING] consulting→extracted 변환 완료: "
+                        f"tasks={len(detail.get('tasks') or [])}, "
+                        f"roles={len(detail.get('roles') or [])}, "
+                        f"gateways={len(detail.get('gateways') or [])}"
+                    )
+            except Exception as e:
+                logger.warning(f"[CONSULTING] consulting→extracted 변환 실패: {type(e).__name__}: {e}")
+
+        if not detail.get("tasks"):
+            logger.warning("[CONSULTING] LLM 변환 결과가 비어 fallback 파서를 사용합니다.")
+            detail = self._fallback_consulting_extracted_detail(
+                user_request=user_request,
+                consulting_outline=consulting_outline,
+            )
+
+        process_name = str((detail.get("process") or {}).get("name") or "").strip()
+        if not process_name:
+            process_name = self._derive_process_name_from_consulting(user_request, consulting_outline)
+            detail.setdefault("process", {})["name"] = process_name
+
+        proc_id = f"consulting_{uuid.uuid4().hex[:12]}"
+        return {
+            proc_id: {
+                "detail": detail,
+                "graph_elements": {},
+                "process_name": process_name,
+            }
+        }
+
     async def _generate_processgpt_definition_and_bpmn(
         self,
         *,
@@ -5877,6 +6272,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         process_name: str,
         extracted: Dict[str, Any],
         user_request: str,
+        consulting_outline: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         (프로세스 생성 LLM) 단계:
@@ -5914,10 +6310,15 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         except Exception:
             pass
 
-        # 1) 컨설팅 단계 우회:
-        #    추출 정보 + 생성 규칙만으로 바로 ProcessDefinition 생성
-        consulting_outline = None
-        logger.info(f"[PROCDEF][CONSULTING] skipped (direct generation from extracted, process={process_name!r})")
+        # 1) 컨설팅 초안 처리:
+        #    - 파일 모드: consulting_outline=None → 추출 정보 + 생성 규칙만으로 바로 생성
+        #    - 컨설팅 모드: 호출자가 컨설팅 초안을 넘겨주면, extracted 와 함께 생성 LLM 의
+        #      추가 근거(grounding)로 사용한다.
+        consulting_outline = (consulting_outline or "").strip() or None
+        if consulting_outline:
+            logger.info(f"[PROCDEF][CONSULTING] consulting outline provided (process={process_name!r})")
+        else:
+            logger.info(f"[PROCDEF][CONSULTING] skipped (direct generation from extracted, process={process_name!r})")
 
         # 2) Build prompt inputs for create-only process definition generation
         # NOTE:
@@ -5951,43 +6352,89 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     extracted=extracted,
                 )
             else:
-                elements_model = await self._call_openai_process_definition(messages=messages)
-                if not isinstance(elements_model, dict):
-                    logger.warning(f"[PROCDEF][LLM] elements_model is not dict -> fallback deterministic (process={process_name!r})")
+                # LLM 으로 elements 모델 생성.
+                # 생성 실패(JSON 미생성 / elements 누락 / 추출 대비 심각히 빈약)면
+                # 바로 추출 기반 폴백하지 않고 최대 3회까지 재시도한다.
+                # 재시도는 절단(truncation) 대비로 max_tokens 를 키우고, 결정론적
+                # 실패를 벗어나도록 temperature 를 조금씩 올린다.
+                # 3회 모두 실패할 때만 추출 기반 결정론 폴백으로 넘어간다.
+                _gen_attempts = [
+                    {"max_tokens": 8000, "temperature": None},
+                    {"max_tokens": 11000, "temperature": 0.2},
+                    {"max_tokens": 14000, "temperature": 0.4},
+                ]
+                _n_attempts = len(_gen_attempts)
+                elements_model = None
+                for _attempt_i, _opt in enumerate(_gen_attempts, 1):
+                    try:
+                        _candidate = await self._call_openai_process_definition(
+                            messages=messages,
+                            max_tokens=_opt["max_tokens"],
+                            temperature=_opt["temperature"],
+                        )
+                    except Exception as _gen_e:
+                        logger.warning(
+                            f"[PROCDEF][LLM] 생성 시도 {_attempt_i}/{_n_attempts} 예외: "
+                            f"{type(_gen_e).__name__}: {_gen_e} (process={process_name!r})"
+                        )
+                        _candidate = None
+
+                    if not isinstance(_candidate, dict):
+                        logger.warning(
+                            f"[PROCDEF][LLM] 생성 시도 {_attempt_i}/{_n_attempts}: "
+                            f"JSON 미생성(not dict) — {'재시도' if _attempt_i < _n_attempts else '재시도 소진'} "
+                            f"(process={process_name!r})"
+                        )
+                        continue
+
+                    _cand_elems = _candidate.get("elements")
+                    if not (isinstance(_cand_elems, list) and len(_cand_elems) > 0):
+                        logger.warning(
+                            f"[PROCDEF][LLM] 생성 시도 {_attempt_i}/{_n_attempts}: "
+                            f"elements 누락/빈값 — {'재시도' if _attempt_i < _n_attempts else '재시도 소진'} "
+                            f"(process={process_name!r})"
+                        )
+                        continue
+
+                    # 추출 대비 심각히 빈약하면 그것도 '생성 실패'로 보고 재시도한다.
+                    try:
+                        _degraded, _deg_reason = self._should_fallback_to_extracted_elements(
+                            elements_model=_candidate,
+                            extracted=extracted,
+                            process_name=process_name,
+                        )
+                    except Exception as _deg_e:
+                        logger.exception(
+                            f"[PROCDEF][FALLBACK] fallback decision failed: "
+                            f"{type(_deg_e).__name__}: {_deg_e}"
+                        )
+                        _degraded, _deg_reason = False, ""
+                    if _degraded:
+                        logger.warning(
+                            f"[PROCDEF][LLM] 생성 시도 {_attempt_i}/{_n_attempts}: "
+                            f"추출 대비 빈약({_deg_reason}) — "
+                            f"{'재시도' if _attempt_i < _n_attempts else '재시도 소진'} "
+                            f"(process={process_name!r})"
+                        )
+                        continue
+
+                    elements_model = _candidate
+                    logger.info(
+                        f"[PROCDEF][LLM] 생성 성공 (시도 {_attempt_i}/{_n_attempts}, "
+                        f"elements_len={len(_cand_elems)}, keys={list(_candidate.keys())}, "
+                        f"process={process_name!r})"
+                    )
+                    break
+
+                if elements_model is None:
+                    logger.warning(
+                        f"[PROCDEF][FALLBACK] LLM 생성 {_n_attempts}회 모두 실패 -> "
+                        f"추출 기반 결정론 폴백 (process={process_name!r})"
+                    )
                     elements_model = self._build_elements_model_from_extracted(
                         process_name=process_name,
                         extracted=extracted,
                     )
-                else:
-                    # LLM raw shape summary
-                    try:
-                        elems = elements_model.get("elements")
-                        elems_len = len(elems) if isinstance(elems, list) else None
-                        logger.info(
-                            f"[PROCDEF][LLM] elements_model received: keys={list(elements_model.keys())} elements_len={elems_len} "
-                            f"(process={process_name!r})"
-                        )
-                    except Exception:
-                        pass
-
-                    # LLM이 스키마를 지키지 못해 extracted 대비 내용이 크게 줄어든 경우 강제 폴백
-                    try:
-                        use_fallback, reason = self._should_fallback_to_extracted_elements(
-                            elements_model=elements_model,
-                            extracted=extracted,
-                            process_name=process_name,
-                        )
-                        if use_fallback:
-                            logger.warning(
-                                f"[PROCDEF][FALLBACK] using extracted-based elements "
-                                f"(process={process_name!r}, reason={reason}, llm_keys={list(elements_model.keys())})"
-                            )
-                            elements_model = self._build_elements_model_from_extracted(
-                                process_name=process_name,
-                                extracted=extracted,
-                            )
-                    except Exception as e:
-                        logger.exception(f"[PROCDEF][FALLBACK] fallback decision/build failed: {type(e).__name__}: {e}")
 
         # 5) Strict validate/normalize elements model (connectivity + ids + required fields)
         elements_model = self._validate_and_normalize_elements_model(elements_model, process_name=process_name)
@@ -5997,8 +6444,39 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         # - We intentionally IGNORE model-provided processDefinitionId to prevent accidental reuse.
         # - BPMN XML generator does not use this id for <bpmn:process id="..."> (it uses Process_1),
         #   so UUID starting with digits is safe.
-        forced_proc_def_id = str(uuid.uuid4())
+        # - 하이픈 없는 형태('-' → '_')로 강제한다. form id 는 "formHandler:<snake(pid)>_..."
+        #   처럼 _snake_id 로 만들어져 하이픈이 '_'로 바뀌는데, 프론트(FormWorkItem.vue)는
+        #   `${processDefinitionId}_${activity_id}_form` 으로 processDefinitionId 를 '그대로'
+        #   이어 붙여 form id 를 재구성한다. processDefinitionId 에 하이픈이 있으면 이
+        #   재구성 결과(하이픈)와 실제 form_def.id(언더스코어)가 어긋나 폼/입력값을 못 찾는다.
+        #   → 애초에 하이픈 없는 id 로 강제하면 snake 변환 전후가 동일해 항상 일치한다.
+        prev_proc_def_id = str(elements_model.get("processDefinitionId") or "").strip()
+        forced_proc_def_id = str(uuid.uuid4()).replace("-", "_")
         elements_model["processDefinitionId"] = forced_proc_def_id
+        # processDefinitionId 를 새로 강제하면, 그 직전 id 로 이미 만들어진 form id 참조
+        # (activity.tool = "formHandler:<snake(pid)>_<activity_id>_form") 가 새 id 와 어긋난다.
+        # 이 어긋남이 남으면: form_def.id / todolist.output 키 / activity.tool 은 옛 접두사를
+        # 쓰는데 processDefinitionId 만 새 값이라, 프론트(FormWorkItem.vue)가 form id 를
+        # `${processDefinitionId}_${activity_id}_form` 으로 재구성할 때 폼을 찾지 못해
+        # todolist '입력값'·instance '산출물' 화면에 값이 표시되지 않는다.
+        # → 강제 변경 시 activity.tool 의 접두사를 새 id 로 즉시 재작성해 일관성을 유지한다.
+        if prev_proc_def_id and prev_proc_def_id != forced_proc_def_id:
+            _old_tool_pfx = f"formHandler:{self._snake_id(prev_proc_def_id)}_"
+            _new_tool_pfx = f"formHandler:{self._snake_id(forced_proc_def_id)}_"
+            _rewired = 0
+            for _e in (elements_model.get("elements") or []):
+                if not isinstance(_e, dict):
+                    continue
+                _tool = str(_e.get("tool") or "")
+                if _tool.startswith(_old_tool_pfx):
+                    _e["tool"] = _new_tool_pfx + _tool[len(_old_tool_pfx):]
+                    _rewired += 1
+            if _rewired:
+                logger.info(
+                    f"[PROCDEF] processDefinitionId 강제 변경 "
+                    f"({prev_proc_def_id} → {forced_proc_def_id}); "
+                    f"form id 접두사 {_rewired}건을 새 id 로 재작성"
+                )
 
         # 6) Convert to runtime definition + enrich + assignment(again, as safety)
         runtime_def = self._elements_model_to_runtime_definition(elements_model)
@@ -7060,11 +7538,11 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
           - ExclusiveGateway (parallel/inclusive 는 조건 평가 의미가 달라 제외)
           - outgoing sequence 2개 이상
 
-        각 후보:
+        각 후보 (같은 이름의 게이트웨이는 하나로 병합 — HITL 옵션 중복 방지):
           {
-            "candidate_id": "dmn::<proc_def_id>::<gateway_id>",
+            "candidate_id": "dmn::<proc_def_id>::<gid1>~<gid2>~...",
             "proc_def_id":  "...",
-            "gateway_id":   "...",
+            "gateway_ids":  ["...", ...],
             "gateway_name": "...",
             "label":        "[프로세스명] 게이트웨이명",
             "description":  "분기 N개: 조건1 → 대상1 / 조건2 → 대상2",
@@ -7097,6 +7575,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 if src:
                     outgoing_by_source.setdefault(src, []).append(s)
 
+        # 1) DMN 자격 게이트웨이 수집 (exclusive + 분기 2개 이상)
+        gw_entries: List[Dict[str, Any]] = []
         for gw in gateways:
             if not isinstance(gw, dict):
                 continue
@@ -7124,13 +7604,42 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     branch_descs.append(cond[:80])
                 elif tgt_name:
                     branch_descs.append(f"→ {tgt_name}"[:80])
-            desc = f"분기 {len(outs)}개" + (
-                ": " + " / ".join(branch_descs) if branch_descs else ""
+            gw_entries.append({
+                "gid": gid,
+                "gname": gname,
+                "branch_count": len(outs),
+                "branch_descs": branch_descs,
+            })
+
+        # 2) 게이트웨이 이름 기준으로 중복 병합.
+        #    추출 단계에서 같은 의사결정에 대해 게이트웨이가 여러 개 만들어지는 일이 잦다
+        #    (예: "긴급휴가 여부 판단" 게이트웨이 2개). 같은 이름은 한 후보로 합쳐
+        #    HITL 옵션 중복을 없애고, 선택 시 같은 이름의 모든 게이트웨이에 DMN 을 적용한다.
+        by_name: Dict[str, List[Dict[str, Any]]] = {}
+        order: List[str] = []
+        for e in gw_entries:
+            key = self._normalize_text_key(e["gname"]) or e["gid"]
+            if key not in by_name:
+                by_name[key] = []
+                order.append(key)
+            by_name[key].append(e)
+
+        for key in order:
+            group = by_name[key]
+            # 대표(분기 수가 가장 많은 항목)로 라벨/설명을 구성
+            primary = max(group, key=lambda x: x["branch_count"])
+            gname = primary["gname"]
+            # 같은 게이트웨이 id 가 중복 등장하는 경우까지 제거
+            gids = list(dict.fromkeys(e["gid"] for e in group))
+            desc = f"분기 {primary['branch_count']}개" + (
+                ": " + " / ".join(primary["branch_descs"]) if primary["branch_descs"] else ""
             )
+            if len(gids) > 1:
+                desc = f"(동일 이름 게이트웨이 {len(gids)}개 통합) " + desc
             out.append({
-                "candidate_id": f"dmn::{proc_def_id}::{gid}",
+                "candidate_id": f"dmn::{proc_def_id}::{'~'.join(gids)}",
                 "proc_def_id": str(proc_def_id),
-                "gateway_id": gid,
+                "gateway_ids": gids,
                 "gateway_name": gname,
                 "label": f"[{process_name}] {gname}" if process_name else gname,
                 "description": desc[:200],
@@ -7218,6 +7727,200 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 }
             )
         )
+
+    async def _validate_generated_process(
+        self,
+        *,
+        proc_def_id: str,
+        process_name: str,
+        proc_json: Dict[str, Any],
+        forms_result: Dict[str, Any],
+        extracted: Dict[str, Any],
+        tenant_id: str,
+        event_queue: EventQueue,
+        context_id: str,
+        task_id: str,
+        job_id: str,
+    ) -> Dict[str, Any]:
+        """생성 완료된 프로세스를 실행 엔진으로 검증/자동개선한다.
+
+        process-gpt-completion 의 실제 /initiate·/complete 로 start→end 를 실행시켜
+        (다음 태스크 결정·분기 평가는 폴링 서비스가 수행) 결함을 찾고, 결함이 있으면
+        LLM 으로 proc_json 을 교정 후 재저장한다. 다음 활동 조회/검증 인스턴스 정리는
+        Supabase 로 DB 를 직접 read/delete 한다.
+        실패해도 예외를 던지지 않고 리포트(dict)를 반환한다 — todo 는 정상 완료시킨다.
+        """
+        if not getattr(self, "validation_enabled", False):
+            return {"proc_def_id": proc_def_id, "skipped": True,
+                    "skip_reason": "검증 비활성화(PDF2BPMN_VALIDATION_ENABLED=false)",
+                    "passed": None, "process_name": process_name}
+
+        if not self.supabase_client:
+            return {"proc_def_id": proc_def_id, "skipped": True,
+                    "skip_reason": "Supabase 클라이언트 없음 — 검증 불가",
+                    "passed": None, "process_name": process_name}
+
+        try:
+            from src.pdf2bpmn.validation import ProcessValidator
+        except Exception as e:
+            logger.warning(f"[VALIDATION] 모듈 import 실패: {e}")
+            return {"proc_def_id": proc_def_id, "skipped": True,
+                    "skip_reason": f"검증 모듈 import 실패: {e}",
+                    "passed": None, "process_name": process_name}
+
+        forms = (forms_result or {}).get("forms") or {}
+
+        async def _progress(message: str, pct: int, extra: Dict[str, Any] = None):
+            await self._send_progress_event(
+                event_queue, context_id, task_id, job_id,
+                message, "tool_usage_started", pct, extra or {},
+            )
+
+        async def _save_definition(pdid: str, definition: Dict[str, Any]) -> bool:
+            return await self._update_proc_def_definition_only(
+                proc_def_id=pdid, tenant_id=tenant_id, definition=definition,
+            )
+
+        async def _llm(messages, max_tokens):
+            return await self._call_openai_json_messages(
+                messages=messages, max_tokens=max_tokens,
+                model=self.process_definition_model, temperature=0.0,
+            )
+
+        # ③ 다음 활동 조회: bpm_proc_inst 를 DB 에서 직접 읽는다.
+        #   제출하면 폴링 서비스가 다음 태스크를 찾아 current_activity_ids 에 반영하므로,
+        #   검증기는 그 결과만 읽으면 된다(다음-태스크 탐색 로직을 재구현하지 않는다).
+        def _fetch_instance_state_sync(proc_inst_id: str) -> Dict[str, Any]:
+            rows = (
+                self.supabase_client.table("bpm_proc_inst")
+                .select("proc_inst_id,status,current_activity_ids")
+                .or_(f"proc_inst_id.eq.{proc_inst_id},root_proc_inst_id.eq.{proc_inst_id}")
+                .eq("tenant_id", tenant_id)
+                .execute()
+                .data
+            ) or []
+            status = "RUNNING"
+            active: List[str] = []
+            for row in rows:
+                cids = row.get("current_activity_ids") or []
+                if isinstance(cids, str):
+                    cids = [cids]
+                if row.get("proc_inst_id") == proc_inst_id:
+                    status = row.get("status") or "RUNNING"
+                    active.extend(str(c) for c in cids if c)
+                elif str(row.get("status") or "").upper() == "RUNNING":
+                    # 서브프로세스 자식 인스턴스의 활성 활동도 합친다.
+                    active.extend(str(c) for c in cids if c)
+            return {"status": status, "current_activity_ids": list(dict.fromkeys(active))}
+
+        async def _fetch_instance_state(proc_inst_id: str) -> Dict[str, Any]:
+            return await asyncio.to_thread(_fetch_instance_state_sync, proc_inst_id)
+
+        # ④ 검증용 인스턴스 정리: 테스트 인스턴스/워크아이템 row 를 DB 에서 직접 삭제.
+        def _cleanup_instance_sync(proc_inst_id: str) -> None:
+            for table in ("todolist", "bpm_proc_inst"):
+                try:
+                    (
+                        self.supabase_client.table(table)
+                        .delete()
+                        .or_(f"proc_inst_id.eq.{proc_inst_id},root_proc_inst_id.eq.{proc_inst_id}")
+                        .eq("tenant_id", tenant_id)
+                        .execute()
+                    )
+                except Exception as ce:
+                    logger.debug(f"[VALIDATION] cleanup({table}) 실패(무시): {ce}")
+
+        async def _cleanup_instance(proc_inst_id: str) -> None:
+            if not getattr(self, "validation_cleanup", True):
+                return
+            await asyncio.to_thread(_cleanup_instance_sync, proc_inst_id)
+
+        # 검증 실행 시 /initiate·/complete 에 넘길 행위자 이메일.
+        # 실제 사용자가 있으면 그 사용자로(휴먼 우선), 없으면 None → 검증기 기본값 사용.
+        # (엔진은 미등록 이메일도 graceful 처리하므로 흐름 검증엔 어떤 값이든 무방.)
+        actor_email = None
+        try:
+            for _u in (self._users or []):
+                if isinstance(_u, dict) and _u.get("email") and not _u.get("is_agent"):
+                    actor_email = _u.get("email")
+                    break
+            if not actor_email:
+                for _u in (self._users or []):
+                    if isinstance(_u, dict) and _u.get("email"):
+                        actor_email = _u.get("email")
+                        break
+        except Exception:
+            actor_email = None
+
+        # 검증 흐름 상세 리포트(.md) 파일 경로 — output/validation/ 아래.
+        report_path = None
+        try:
+            _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _safe_pdid = "".join(
+                c if (c.isalnum() or c in "-_") else "_" for c in str(proc_def_id)
+            )[:80]
+            report_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "output", "validation",
+                f"validation_{_safe_pdid}_{_ts}.md",
+            )
+        except Exception:
+            report_path = None
+
+        validator = ProcessValidator(
+            llm_call=_llm,
+            save_definition=_save_definition,
+            engine_base_url=self.completion_engine_url,
+            tenant_id=tenant_id,
+            fetch_instance_state=_fetch_instance_state,
+            cleanup_instance=_cleanup_instance,
+            max_iters=self.validation_max_iters,
+            advance_timeout=self.validation_advance_timeout,
+            actor_email=actor_email,
+            report_path=report_path,
+            logger=logger,
+            progress=_progress,
+        )
+        await self._send_progress_event(
+            event_queue, context_id, task_id, job_id,
+            f"[VALIDATION] 생성된 프로세스 실행 검증 시작: {process_name}",
+            "tool_usage_started", 83,
+            {"proc_def_id": proc_def_id, "process_name": process_name},
+        )
+        report = await validator.validate_and_repair(
+            proc_def_id=proc_def_id,
+            process_name=process_name,
+            proc_json=proc_json,
+            forms=forms,
+            extracted=extracted,
+        )
+        if isinstance(report, dict) and report_path:
+            report["report_path"] = report_path  # 상세 리포트 파일 위치
+        # 결과 요약 이벤트
+        if report.get("skipped"):
+            msg = f"[VALIDATION] 검증 건너뜀: {process_name} — {report.get('skip_reason')}"
+        elif report.get("passed"):
+            msg = (f"[VALIDATION] 검증 통과: {process_name} "
+                   f"({report.get('iterations')}회차, start→end 정상 실행)")
+        else:
+            msg = (f"[VALIDATION] 검증 미통과: {process_name} — "
+                   f"잔여 결함 {len(report.get('remaining_defects') or [])}건, "
+                   f"{report.get('iterations')}회 개선 시도")
+        await self._send_progress_event(
+            event_queue, context_id, task_id, job_id,
+            msg, "tool_usage_finished", 89,
+            {"proc_def_id": proc_def_id,
+             "passed": report.get("passed"),
+             "skipped": report.get("skipped"),
+             "iterations": report.get("iterations"),
+             "repaired": report.get("repaired")},
+        )
+        logger.info(
+            f"[VALIDATION] {proc_def_id}: passed={report.get('passed')} "
+            f"skipped={report.get('skipped')} iters={report.get('iterations')} "
+            f"repaired={report.get('repaired')}"
+        )
+        return report
 
     async def _send_bpmn_artifact(
         self,
@@ -7893,14 +8596,24 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         if phase == "post_hitl_generate":
             return _log_resume("post_hitl_generate phase")
         if out.get("hitl_paused") or phase == "awaiting_hitl":
-            qids_map = cp.get("question_ids") if isinstance(cp.get("question_ids"), dict) else {}
-            # question_ids 값은 문자열(dmn) 또는 {proc_def_id: qid} dict(skills/agents) 둘 다 가능
+            # 검사 대상 = '실제로 사용자에게 물어본' 질문 id 목록.
+            #   hitl_pending_question_ids 는 pause_for_hitl 이 qids_to_wait(=실제 생성된
+            #   질문) 만 기록한다. 반면 checkpoint.question_ids 의 'dmn' 키는 DMN 후보가
+            #   0개여서 질문이 생성되지 않았어도 항상 채워지므로, 그걸로 검사하면
+            #   '묻지도 않은 DMN 답변' 을 기다리다 재개에 실패 → 처음부터 무한 재실행한다.
             qids: List[str] = []
-            for v in qids_map.values():
-                if isinstance(v, dict):
-                    qids.extend(str(x) for x in v.values() if str(x or "").strip())
-                elif str(v or "").strip():
-                    qids.append(str(v))
+            pending = out.get("hitl_pending_question_ids")
+            if isinstance(pending, list):
+                qids = [str(q) for q in pending if str(q or "").strip()]
+            if not qids:
+                # fallback: hitl_pending_question_ids 가 없을 때만 checkpoint 에서 유도.
+                # question_ids 값은 문자열(dmn) 또는 {proc_def_id: qid} dict(skills/agents).
+                qids_map = cp.get("question_ids") if isinstance(cp.get("question_ids"), dict) else {}
+                for v in qids_map.values():
+                    if isinstance(v, dict):
+                        qids.extend(str(x) for x in v.values() if str(x or "").strip())
+                    elif str(v or "").strip():
+                        qids.append(str(v))
             if qids and self.supabase_client and todo_id:
                 entries = read_batch_responses(
                     self.supabase_client,
@@ -7908,8 +8621,17 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     qids,
                     cp.get("wait_started_at"),
                 )
-                if all(entries.get(q) for q in qids):
-                    return _log_resume("HITL 응답 완료(폴백 재진입)")
+                answered = [q for q in qids if entries.get(q)]
+                # 물어본 질문 개수만큼 답변이 모두 채워졌으면 재개 (후보 개수와 무관).
+                if len(answered) == len(qids):
+                    return _log_resume(
+                        f"HITL 응답 완료(폴백 재진입, {len(answered)}/{len(qids)} 질문)"
+                    )
+                logger.info(
+                    "[HITL][RESUME] 대기 — todo_id=%s 답변 %d/%d (미응답=%s)",
+                    todo_id, len(answered), len(qids),
+                    [q for q in qids if not entries.get(q)],
+                )
         return None
 
     async def _apply_unified_hitl_to_process(
@@ -8022,6 +8744,12 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # 3. Query 파싱 (PDF 정보 추출)
             parsed = self._parse_query(user_input or "")
             input_files = parsed.get("input_files") or []
+            # 컨설팅 기반 생성 모드: 파일 대신 컨설팅 내용으로 프로세스를 생성한다.
+            consulting_payload = (
+                parsed.get("consulting_payload")
+                if isinstance(parsed.get("consulting_payload"), dict)
+                else None
+            )
             parsed_room_id = str(parsed.get("room_id") or "").strip()
             parsed_tenant_id = str(parsed.get("tenant_id") or "").strip() or str(tenant_id or "")
             effective_tenant_id = parsed_tenant_id or str(tenant_id or "")
@@ -8141,7 +8869,49 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 # PASS1 for 루프가 0회 실행되어 자동으로 건너뛴다.
                 extracted_by_proc_id = {}
 
-            if not resume_cp:
+            # 컨설팅 모드일 때 PASS1 생성 LLM 에 넘길 컨설팅 초안(파일 모드는 빈 값)
+            consulting_outline_for_gen = ""
+
+            if (not resume_cp) and consulting_payload:
+                # =================================================================
+                # 4'. 컨설팅 기반 생성 모드
+                #    - 업로드 문서가 없으므로 메멘토 청크/섹션 분리/Neo4j 그래프 추출을
+                #      모두 건너뛴다.
+                #    - 대신 사용자의 자연어 요청 + 컨설팅 초안 + 사용자 답변 + 이미지 분석
+                #      내용을 LLM 으로 동일한 extracted 구조로 변환한다.
+                #    - 이후 PASS1(JSON 생성) → 스킬/에이전트/DMN HITL → 저장/검증 흐름은
+                #      파일 모드와 100% 동일하게 재사용된다.
+                # =================================================================
+                await self._send_progress_event(
+                    event_queue, context_id, task_id, job_id,
+                    "[CONSULTING] 컨설팅 내용을 분석해 프로세스 구조를 추출합니다...",
+                    "tool_usage_started", 20,
+                )
+                request_graph_run_id = f"{task_id}-{uuid.uuid4().hex[:8]}"
+                input_file_names = []
+                pdf_name = "컨설팅 기반 프로세스"
+                consulting_outline_for_gen = str(consulting_payload.get("consulting_outline") or "")
+                extracted_by_proc_id = await self._build_extracted_by_proc_id_from_consulting(
+                    consulting_payload=consulting_payload,
+                )
+                # PASS1/PASS2/HITL 에서 참조하는 최소 state 초기화 (파일 모드 resume 경로와 동일 키)
+                state = {
+                    "dmn_decisions": [],
+                    "dmn_rules": [],
+                    "skill_docs": {},
+                    "processes": [],
+                }
+                _consulting_task_count = sum(
+                    len((pinfo.get("detail") or {}).get("tasks") or [])
+                    for pinfo in extracted_by_proc_id.values()
+                )
+                await self._send_progress_event(
+                    event_queue, context_id, task_id, job_id,
+                    f"[CONSULTING] 프로세스 구조 추출 완료 (단계 {_consulting_task_count}개)",
+                    "tool_usage_finished", 40,
+                )
+
+            if (not resume_cp) and (not consulting_payload):
 
                 # =================================================================
                 # 4. 메멘토(process-gpt-memento)에서 사전 처리된 청크/임베딩 로드
@@ -8889,6 +9659,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         process_name=process_name,
                         extracted=extracted_payload,
                         user_request=(user_input or ""),
+                        consulting_outline=(consulting_outline_for_gen or None),
                     )
                 except Exception as e:
                     logger.exception(
@@ -9154,8 +9925,10 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                             "version": 2,
                             "stage": "unified_post_procgen",
                             "prepared_processes": prepared_processes,
+                            # DMN qid 는 후보가 있어 질문이 실제 생성된 경우에만 기록한다.
+                            # (없는데 기록하면 재개 게이트가 묻지도 않은 답을 기다린다.)
                             "question_ids": {
-                                "dmn": dmn_qid,
+                                "dmn": (dmn_qid if all_dmn_candidates else ""),
                                 "skills": skill_qid_by_pdid,
                                 "agents": agent_qid_by_pdid,
                             },
@@ -9220,6 +9993,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             # PASS 2 — 각 프로세스에 HITL 응답을 반영하고 DB 에 저장
             # =================================================================
             total_bpmn = len(prepared_processes)
+            # 프로세스별 실행 검증 리포트 누적 (최종 결과/아티팩트에 첨부)
+            validation_results: Dict[str, Any] = {}
             for prepared in prepared_processes:
                 idx = int(prepared.get("process_index") or 0)
                 proc_id = str(prepared.get("proc_id") or "")
@@ -9227,6 +10002,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 proc_def_id = str(prepared.get("proc_def_id") or "")
                 proc_json = prepared.get("proc_json") or {}
                 extracted_payload = prepared.get("extracted_payload") or {}
+                # 폼 생성 단계가 실패해도 검증 호출에서 참조할 수 있도록 미리 초기화
+                forms_result: Dict[str, Any] = {}
                 process_skill_metas = list(prepared.get("process_skill_metas") or [])
                 agent_candidates_for_process = list(prepared.get("agent_candidates_for_process") or [])
 
@@ -9269,11 +10046,18 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 generated_skill_metas.extend(process_skill_metas)
 
                 # DMN 적용 — 사용자가 선택한 게이트웨이만 proc_json 에 DMN 테이블 보강
-                this_proc_dmn_gids = {
-                    tok.split("::", 1)[1]
-                    for tok in approved_dmn_tokens
-                    if "::" in tok and tok.split("::", 1)[0] == proc_def_id
-                }
+                # candidate_id 는 같은 이름의 게이트웨이를 '~' 로 묶을 수 있으므로 분해한다.
+                this_proc_dmn_gids: Set[str] = set()
+                for tok in approved_dmn_tokens:
+                    if "::" not in tok:
+                        continue
+                    tok_pdid, tok_gids = tok.split("::", 1)
+                    if tok_pdid != proc_def_id:
+                        continue
+                    for g in tok_gids.split("~"):
+                        g = g.strip()
+                        if g:
+                            this_proc_dmn_gids.add(g)
                 if this_proc_dmn_gids:
                     proc_json = self._augment_runtime_with_gateway_dmn(
                         runtime_def=proc_json,
@@ -9384,7 +10168,43 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     # FINAL(XML disabled): 요청사항에 따라 BPMN XML 생성/저장 비활성화
                     # -----------------------------------------------------------------
                     all_bpmn_xmls[proc_def_id] = None
-                
+
+                    # -----------------------------------------------------------------
+                    # VALIDATION: 생성된 프로세스를 실행 엔진으로 검증/자동개선
+                    #  - start→end 실제 실행 테스트 후, 결함이 있으면 proc_json 자동 교정
+                    #  - 교정 시 _update_proc_def_definition_only 로 이미 재저장된 상태
+                    # -----------------------------------------------------------------
+                    try:
+                        val_report = await self._validate_generated_process(
+                            proc_def_id=proc_def_id,
+                            process_name=process_name,
+                            proc_json=proc_json,
+                            forms_result=forms_result,
+                            extracted=extracted_payload,
+                            tenant_id=tenant_id,
+                            event_queue=event_queue,
+                            context_id=context_id,
+                            task_id=task_id,
+                            job_id=job_id,
+                        )
+                        # 검증 과정에서 proc_json 이 교정됐다면 최신본으로 갱신
+                        fixed_def = val_report.get("final_definition")
+                        if isinstance(fixed_def, dict) and fixed_def:
+                            proc_json = fixed_def
+                            prepared["proc_json"] = proc_json
+                        # 최종 결과 payload 비대화 방지: 전체 정의는 proc_def 에 이미 저장돼 있으므로 제외
+                        val_report.pop("final_definition", None)
+                        validation_results[proc_def_id] = val_report
+                    except Exception as e:
+                        logger.warning(f"[VALIDATION] 검증 단계 실패(무시): {e}")
+                        validation_results[proc_def_id] = {
+                            "proc_def_id": proc_def_id,
+                            "process_name": process_name,
+                            "skipped": True,
+                            "skip_reason": f"검증 단계 예외: {e}",
+                            "passed": None,
+                        }
+
                 # saved_processes에 bpmn_xml 포함
                 #   - neo4j_proc_id 를 함께 저장하여 프론트가 process_graphs 캐시를
                 #     `neo4j_proc_id` 키로 매칭할 수 있도록 한다.
@@ -9721,6 +10541,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 "saved_processes": saved_processes,  # bpmn_xml 포함
                 "saved_skills": saved_skills_summary,
                 "saved_agents": saved_agents_summary,
+                # 프로세스별 실행 검증 리포트 (start→end 실행 테스트 + 자동개선 결과)
+                "validation": validation_results,
                 # 프론트 그래프 미리보기 전용 payload (final_artifact 와 동일 내용)
                 #   - 이 데이터로 프론트는 외부 API 호출 없이 그래프를 즉시 렌더링한다.
                 #   - integrated_graph: 통합(전체) 그래프 elements (showIntegratedGraphByTask 용)
@@ -9746,7 +10568,23 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 }
                 for p in saved_processes
             ]
-            
+
+            # 검증 리포트 요약 (아티팩트 크기 제한 고려 — history/trace 등 상세는 제외)
+            validation_summary: Dict[str, Any] = {}
+            for _pdid, _rep in (validation_results or {}).items():
+                if not isinstance(_rep, dict):
+                    continue
+                validation_summary[_pdid] = {
+                    "process_name": _rep.get("process_name"),
+                    "passed": _rep.get("passed"),
+                    "skipped": _rep.get("skipped"),
+                    "skip_reason": _rep.get("skip_reason"),
+                    "iterations": _rep.get("iterations"),
+                    "repaired": _rep.get("repaired"),
+                    "remaining_defects": _rep.get("remaining_defects") or [],
+                    "note": _rep.get("note"),
+                }
+
             final_artifact_data = {
                 "type": "pdf2bpmn_result",
                 "task_id": str(task_id or ""),
@@ -9758,6 +10596,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 "saved_processes": saved_processes_summary,  # 요약만
                 "saved_skills": saved_skills_summary,
                 "saved_agents": saved_agents_summary,
+                "validation": validation_summary,  # 프로세스별 검증 결과 요약
                 "bpmn_xmls": all_bpmn_xmls,  # 모든 XML 내용
                 # 프론트 그래프 미리보기 전용 payload.
                 #  - integrated_graph: 통합(전체) 그래프 elements (showIntegratedGraphByTask 용)

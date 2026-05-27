@@ -1232,5 +1232,40 @@ class EntityExtractor:
                         "to_task_id": to_task.task_id,
                         "condition": ""
                     })
-        
+
+        # ─────────────────────────────────────────────────────────────────────
+        # 미연결 게이트웨이 제거.
+        #   LLM 이 같은 의사결정을 게이트웨이 2개로 내보내거나(예: "X 여부 판단"
+        #   게이트웨이 + "X 에 따라 분기" 게이트웨이), outgoing_branches 를 비운 채
+        #   게이트웨이만 만든 경우 — 같은 name 으로 정규화되며 gateway_name_to_id 에서
+        #   서로 덮어써져, 한쪽이 어떤 sequence_flow 에도 연결되지 않는 고립 노드로 남는다.
+        #   이는 노이즈일 뿐 아니라 process-definition 생성의 fallback 판정
+        #   (gateway_count)을 교란하므로 여기서 버린다.
+        #   (추출 프롬프트도 "outgoing_branches 없는 게이트웨이는 discard" 라고 명시.)
+        # ─────────────────────────────────────────────────────────────────────
+        if entities["gateways"]:
+            _wired_ids: set = set()
+            for _sf in entities["sequence_flows"]:
+                if not isinstance(_sf, dict):
+                    continue
+                for _k in ("from_id", "to_id", "from_task_id", "to_task_id"):
+                    _v = str(_sf.get(_k) or "").strip()
+                    if _v:
+                        _wired_ids.add(_v)
+            _kept_gw = []
+            _dropped_gw = 0
+            for _gw in entities["gateways"]:
+                _gid = str(getattr(_gw, "gateway_id", "") or "")
+                if _gid and _gid in _wired_ids:
+                    _kept_gw.append(_gw)
+                else:
+                    _dropped_gw += 1
+                    entities["entity_chunk_map"].pop(_gid, None)
+            if _dropped_gw:
+                print(
+                    f"   🧹 미연결 게이트웨이 {_dropped_gw}개 제거 "
+                    f"(중복/빈 분기: {len(entities['gateways'])} → {len(_kept_gw)})"
+                )
+                entities["gateways"] = _kept_gw
+
         return entities

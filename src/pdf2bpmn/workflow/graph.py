@@ -231,19 +231,129 @@ class PDF2BPMNWorkflow:
             self._task_global_order_key[tid] = (section_index, pos)
 
     def _reassign_global_task_order(self, all_tasks: list) -> None:
-        """모든 section 처리 후 task.order 를 글로벌 위치 기반으로 재할당."""
+        """모든 section 처리 후 task.order 를 재할당.
+
+        1순위: 추출된 sequence_flows 의 위상(topological) 순서.
+          - source text 등장 위치만 쓰면, 문서 개요/요약이 후행 단계를 먼저 언급할 때
+            (예: '최종 승인 면담' 이 도입부에 언급) 종결 단계가 order 1 로 잘못 잡힌다.
+          - flow 그래프에서 in-degree 0 후보가 여럿이면 reach_count(그 노드에서 도달
+            가능한 task 수)가 큰 것을 실제 시작점으로 본다. text 위치는 동률 tie-break.
+        2순위/fallback: flows 가 빈약하면 (section_index, section 내 첫 등장 offset).
+        """
         if not all_tasks:
             return
-        indexed: list[tuple[tuple[int, int], int, object]] = []
-        for i, t in enumerate(all_tasks):
-            tid = getattr(t, "task_id", None) or ""
-            key = self._task_global_order_key.get(tid, (10**9, 10**9))
-            indexed.append((key, i, t))
-        indexed.sort(key=lambda x: (x[0], x[1]))
 
+        def _text_key(t) -> tuple:
+            tid = getattr(t, "task_id", None) or ""
+            return self._task_global_order_key.get(tid, (10**9, 10**9))
+
+        task_ids = {getattr(t, "task_id", None) for t in all_tasks
+                    if getattr(t, "task_id", None)}
+        flows = self.sequence_flows if isinstance(self.sequence_flows, list) else []
+        use_topology = bool(task_ids) and len(flows) >= max(2, len(task_ids) // 4)
+
+        ordered: list = []
+        if use_topology:
+            # --- flow DAG 빌드 (task/gateway/event 모든 노드 포함; reachability 용) ---
+            adjacency: dict = {}
+            in_degree: dict = {}
+            all_nodes: set = set(task_ids)
+
+            def _fid(f, *keys) -> str:
+                for k in keys:
+                    v = f.get(k) if isinstance(f, dict) else None
+                    if v:
+                        return str(v).strip()
+                return ""
+
+            for f in flows:
+                if not isinstance(f, dict):
+                    continue
+                s = _fid(f, "source", "from_id", "from_task_id")
+                d = _fid(f, "target", "to_id", "to_task_id")
+                if not s or not d or s == d:
+                    continue
+                all_nodes.add(s)
+                all_nodes.add(d)
+                adjacency.setdefault(s, []).append(d)
+                in_degree[d] = in_degree.get(d, 0) + 1
+                in_degree.setdefault(s, in_degree.get(s, 0))
+            for n in all_nodes:
+                in_degree.setdefault(n, 0)
+
+            reach_cache: dict = {}
+
+            def _reach(start: str) -> int:
+                if start in reach_cache:
+                    return reach_cache[start]
+                seen = {start}
+                stack = [start]
+                while stack:
+                    cur = stack.pop()
+                    for nxt in adjacency.get(cur, []):
+                        if nxt not in seen:
+                            seen.add(nxt)
+                            stack.append(nxt)
+                cnt = sum(1 for v in seen if v in task_ids)
+                reach_cache[start] = cnt
+                return cnt
+
+            task_obj_by_id = {getattr(t, "task_id", None): t for t in all_tasks
+                              if getattr(t, "task_id", None)}
+            orig_index = {getattr(t, "task_id", None): i
+                          for i, t in enumerate(all_tasks)}
+
+            def _cand_key(nid: str, succ_of_last: set) -> tuple:
+                # 1) 직전 처리 노드의 후행 우선(체인 연속성 — 끊긴 sub-chain 으로 점프 방지)
+                # 2) task 우선 → 3) reach 큰 것(실제 시작점) → 4) text 위치 → 5) 원래 인덱스
+                tk = _text_key(task_obj_by_id.get(nid)) if nid in task_ids else (10**9, 10**9)
+                return (
+                    0 if nid in succ_of_last else 1,
+                    0 if nid in task_ids else 1,
+                    -_reach(nid),
+                    tk,
+                    orig_index.get(nid, 10**9),
+                    str(nid),
+                )
+
+            # Kahn — in-degree 0 후보를 우선순위로 선택
+            remaining = dict(in_degree)
+            seen_tasks: set = set()
+            last_picked = None
+            guard = len(remaining) + 8
+            while remaining and guard > 0:
+                guard -= 1
+                zero = [n for n, d in remaining.items() if d == 0]
+                if not zero:
+                    zero = list(remaining.keys())   # cycle — 강제 진행
+                succ_of_last = set(adjacency.get(last_picked, [])) if last_picked else set()
+                zero.sort(key=lambda n: _cand_key(n, succ_of_last))
+                chosen = zero[0]
+                for nxt in adjacency.get(chosen, []):
+                    if nxt in remaining:
+                        remaining[nxt] = max(0, remaining[nxt] - 1)
+                remaining.pop(chosen, None)
+                last_picked = chosen
+                if chosen in task_ids and chosen not in seen_tasks:
+                    seen_tasks.add(chosen)
+                    obj = task_obj_by_id.get(chosen)
+                    if obj is not None:
+                        ordered.append(obj)
+            # flow 에 한 번도 안 나타난 잔여 task 는 text 위치 순으로 뒤에 붙임
+            leftovers = [t for t in all_tasks
+                         if getattr(t, "task_id", None) not in seen_tasks]
+            leftovers.sort(key=_text_key)
+            ordered.extend(leftovers)
+        else:
+            # flows 빈약 → 기존 방식(텍스트 위치 기반)
+            indexed = [(_text_key(t), i, t) for i, t in enumerate(all_tasks)]
+            indexed.sort(key=lambda x: (x[0], x[1]))
+            ordered = [t for _, _, t in indexed]
+
+        # order 부여 (동일 이름 task 는 같은 order 공유 — 기존 동작 유지)
         name_to_assigned_order: dict[str, int] = {}
         next_order = 1
-        for _, _, t in indexed:
+        for t in ordered:
             nm = str(getattr(t, "name", "") or "").strip().lower()
             if nm and nm in name_to_assigned_order:
                 t.order = name_to_assigned_order[nm]
@@ -255,11 +365,11 @@ class PDF2BPMNWorkflow:
         try:
             head_names = [
                 f"{getattr(t, 'order', '?')}.{getattr(t, 'name', '?')!r}"
-                for _, _, t in indexed[:6]
+                for t in ordered[:6]
             ]
             print(
-                f"   📊 [GLOBAL-ORDER] reassigned task.order for {len(all_tasks)} tasks. "
-                f"head6={head_names}"
+                f"   📊 [GLOBAL-ORDER] reassigned task.order for {len(all_tasks)} tasks "
+                f"(flow-topology={'on' if use_topology else 'off'}). head6={head_names}"
             )
         except Exception:
             pass
@@ -633,7 +743,29 @@ class PDF2BPMNWorkflow:
         # 3. 게이트웨이, 이벤트의 process_id도 업데이트
         gateways = self._update_entity_process_ids(gateways, process_id_mapping, "gateway_id")
         events = self._update_entity_process_ids(events, process_id_mapping, "event_id")
-        
+
+        # 3.5 미연결 게이트웨이 제거 (gateway 정규화).
+        #   normalize 는 tasks/roles/decisions/skills 만 중복 제거하고 gateway 는
+        #   다루지 않았다. 추출/섹션 병합 후에도 어떤 sequence_flow 에도 연결되지 않은
+        #   고립 게이트웨이(같은 의사결정의 빈 사본 등)가 남으면 BPMN 흐름을 어지럽히고,
+        #   process-definition 생성의 fallback 판정도 교란한다. 여기서 정리한다.
+        if gateways:
+            wired_gw_ids: set = set()
+            for sf in (self.sequence_flows or []):
+                if not isinstance(sf, dict):
+                    continue
+                for k in ("from_id", "to_id", "from_task_id", "to_task_id"):
+                    v = str(sf.get(k) or "").strip()
+                    if v:
+                        wired_gw_ids.add(v)
+            gw_before = len(gateways)
+            gateways = [
+                g for g in gateways
+                if str(getattr(g, "gateway_id", "") or "") in wired_gw_ids
+            ]
+            if len(gateways) != gw_before:
+                print(f"   🧹 Gateways: {gw_before} → {len(gateways)} (미연결 게이트웨이 제거)")
+
         # 4. task_process_map도 업데이트
         self._update_task_process_map(process_id_mapping)
 
@@ -670,6 +802,7 @@ class PDF2BPMNWorkflow:
         print(f"   Roles: {len(roles)} → {len(unique_roles)}")
         print(f"   Decisions: {len(decisions)} → {len(unique_decisions)}")
         print(f"   Skills: {len(skills)} → {len(unique_skills)}")
+        print(f"   Gateways: {len(gateways)} (미연결 제거 후)")
 
         # task 0 role 통계 출력 (위원 후보 풀 / 자문 풀 같은 비활성 role 식별).
         # task 가 1개도 할당되지 않은 role 은 BPMN 의 lane 으로 사용해도 빈 swimlane 만

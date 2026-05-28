@@ -261,12 +261,56 @@ def _read_todolist_output(supabase_client, todo_id: str) -> Dict[str, Any]:
         return {}
 
 
+def _to_jsonable(obj: Any) -> Any:
+    """dataclass / pydantic / set / 기타 비-JSON 객체를 supabase 가 받을 수 있는 형태로 변환.
+
+    이 함수는 hitl_checkpoint 의 workflow_state.dmn_decisions(=DMNDecision dataclass) 같은
+    객체를 dict 으로 풀어줘서 update 가 'Object of type X is not JSON serializable' 로
+    통째로 실패하는 것을 방지한다. update 가 실패하면 hitl_checkpoint 가 저장되지 않아
+    재개 시 워커가 처음부터(메멘토/섹션분리/PASS1) 다시 실행되는 치명적인 회귀가 발생한다.
+    """
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    if isinstance(obj, set):
+        return [_to_jsonable(v) for v in obj]
+    try:
+        import dataclasses
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            return _to_jsonable(dataclasses.asdict(obj))
+    except Exception:
+        pass
+    for attr in ("model_dump", "dict"):
+        fn = getattr(obj, attr, None)
+        if callable(fn):
+            try:
+                return _to_jsonable(fn())
+            except Exception:
+                pass
+    try:
+        json.dumps(obj)
+        return obj
+    except Exception:
+        try:
+            return str(obj)
+        except Exception:
+            return None
+
+
 def _write_todolist_output(supabase_client, todo_id: str, output: Dict[str, Any]) -> bool:
     try:
-        supabase_client.table("todolist").update({"output": output}).eq("id", todo_id).execute()
+        safe_output = _to_jsonable(output)
+    except Exception as exc:
+        logger.error(f"[HITL] todolist.output 직렬화 실패: {exc}")
+        safe_output = output
+    try:
+        supabase_client.table("todolist").update({"output": safe_output}).eq("id", todo_id).execute()
         return True
     except Exception as exc:
-        logger.warning(f"[HITL] todolist.output 업데이트 실패: {exc}")
+        logger.error(f"[HITL] todolist.output 업데이트 실패: {exc}")
         return False
 
 

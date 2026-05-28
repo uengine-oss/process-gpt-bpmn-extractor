@@ -27,7 +27,6 @@ from src.pdf2bpmn.processgpt.bpmn_xml_generator import ProcessGPTBPMNXmlGenerato
 from src.pdf2bpmn.processgpt.process_definition_prompt import build_system_prompt_processgpt
 from src.pdf2bpmn.processgpt.process_consulting_prompt import get_process_consulting_system_prompt
 from src.pdf2bpmn.processgpt.process_generation_messages import build_process_definition_messages
-from src.pdf2bpmn.processgpt.consulting_to_extracted_messages import build_consulting_to_extracted_messages
 from src.pdf2bpmn.config import Config
 from src.pdf2bpmn.models.entities import Document as PdfDocument, Section, ReferenceChunk
 from src.pdf2bpmn.process_post_processor import ProcessPostProcessor
@@ -6007,12 +6006,11 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         return hints
 
     # =========================================================================
-    # 컨설팅 모드: 컨설팅 내용 → extracted 변환
+    # (DEPRECATED) 컨설팅 모드 — extracted 중간 변환 단계
     # -------------------------------------------------------------------------
-    # 파일 모드는 "메멘토 청크 → 섹션 분리 → Neo4j 그래프 추출" 로 extracted 를 만든다.
-    # 컨설팅 모드는 업로드 문서가 없으므로 위 앞단을 건너뛰고, 사용자의 자연어 요청 +
-    # 컨설팅 초안 + 사용자 답변 + 이미지 분석 내용을 LLM 으로 동일한 extracted 구조로
-    # 변환한다. 이후 JSON 생성 로직은 파일 모드와 100% 동일하게 재사용된다.
+    # 더 이상 사용되지 않는다. 컨설팅 모드는 컨설팅 텍스트 + JSON 생성 규칙으로
+    # 곧바로 프로세스 정의를 생성한다 (executor.py 의 컨설팅 분기 참고).
+    # 아래 4개 함수는 향후 일괄 삭제 예정.
     # =========================================================================
     def _normalize_consulting_extracted_detail(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         """LLM 이 만든 컨설팅 추출 결과를 downstream 파이프라인이 기대하는 detail 구조로 정규화."""
@@ -6213,57 +6211,15 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         *,
         consulting_payload: Dict[str, Any],
     ) -> Dict[str, Dict[str, Any]]:
+        """[DEPRECATED] 더 이상 사용되지 않는다.
+
+        컨설팅 모드는 컨설팅 텍스트를 그대로 LLM 입력으로 사용해 프로세스 정의를 생성한다.
+        이 함수는 향후 일괄 삭제 예정.
         """
-        컨설팅 내용을 LLM 으로 extracted 구조로 변환해 extracted_by_proc_id 를 만든다.
-        파일 모드의 메멘토/섹션/Neo4j 추출 단계를 대체하며, 반환 구조는 파일 모드와 동일하다:
-            { proc_id: {"detail": {...}, "graph_elements": {}, "process_name": "..."} }
-        """
-        user_request = str(consulting_payload.get("user_request") or "").strip()
-        consulting_outline = str(consulting_payload.get("consulting_outline") or "").strip()
-        user_answer = str(consulting_payload.get("user_answer") or "").strip()
-        image_analysis = str(consulting_payload.get("image_analysis") or "").strip()
-
-        detail: Dict[str, Any] = {}
-        if self.openai_client:
-            try:
-                messages = build_consulting_to_extracted_messages(
-                    user_request=user_request,
-                    consulting_outline=consulting_outline,
-                    user_answer=user_answer,
-                    image_analysis=image_analysis,
-                )
-                converted = await self._call_openai_json_messages(messages=messages, max_tokens=4000)
-                if isinstance(converted, dict):
-                    detail = self._normalize_consulting_extracted_detail(converted)
-                    logger.info(
-                        f"[CONSULTING] consulting→extracted 변환 완료: "
-                        f"tasks={len(detail.get('tasks') or [])}, "
-                        f"roles={len(detail.get('roles') or [])}, "
-                        f"gateways={len(detail.get('gateways') or [])}"
-                    )
-            except Exception as e:
-                logger.warning(f"[CONSULTING] consulting→extracted 변환 실패: {type(e).__name__}: {e}")
-
-        if not detail.get("tasks"):
-            logger.warning("[CONSULTING] LLM 변환 결과가 비어 fallback 파서를 사용합니다.")
-            detail = self._fallback_consulting_extracted_detail(
-                user_request=user_request,
-                consulting_outline=consulting_outline,
-            )
-
-        process_name = str((detail.get("process") or {}).get("name") or "").strip()
-        if not process_name:
-            process_name = self._derive_process_name_from_consulting(user_request, consulting_outline)
-            detail.setdefault("process", {})["name"] = process_name
-
-        proc_id = f"consulting_{uuid.uuid4().hex[:12]}"
-        return {
-            proc_id: {
-                "detail": detail,
-                "graph_elements": {},
-                "process_name": process_name,
-            }
-        }
+        raise NotImplementedError(
+            "_build_extracted_by_proc_id_from_consulting is deprecated; "
+            "consulting mode now feeds consulting text directly to the JSON generation prompt."
+        )
 
     async def _generate_processgpt_definition_and_bpmn(
         self,
@@ -8877,23 +8833,41 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 # 4'. 컨설팅 기반 생성 모드
                 #    - 업로드 문서가 없으므로 메멘토 청크/섹션 분리/Neo4j 그래프 추출을
                 #      모두 건너뛴다.
-                #    - 대신 사용자의 자연어 요청 + 컨설팅 초안 + 사용자 답변 + 이미지 분석
-                #      내용을 LLM 으로 동일한 extracted 구조로 변환한다.
-                #    - 이후 PASS1(JSON 생성) → 스킬/에이전트/DMN HITL → 저장/검증 흐름은
+                #    - 컨설팅 내용(=consulting_outline 등) 자체를 LLM 입력으로 그대로 사용하고,
+                #      JSON 생성 규칙은 파일 모드와 동일한 것을 그대로 적용한다.
+                #      → 별도의 "consulting → extracted" 중간 변환 단계를 두지 않는다.
+                #    - PASS1(JSON 생성) → 스킬/에이전트/DMN HITL → 저장/검증 흐름은
                 #      파일 모드와 100% 동일하게 재사용된다.
                 # =================================================================
                 await self._send_progress_event(
                     event_queue, context_id, task_id, job_id,
-                    "[CONSULTING] 컨설팅 내용을 분석해 프로세스 구조를 추출합니다...",
+                    "[CONSULTING] 컨설팅 내용으로 프로세스 정의를 생성합니다...",
                     "tool_usage_started", 20,
                 )
                 request_graph_run_id = f"{task_id}-{uuid.uuid4().hex[:8]}"
                 input_file_names = []
                 pdf_name = "컨설팅 기반 프로세스"
-                consulting_outline_for_gen = str(consulting_payload.get("consulting_outline") or "")
-                extracted_by_proc_id = await self._build_extracted_by_proc_id_from_consulting(
-                    consulting_payload=consulting_payload,
-                )
+                # 컨설팅 입력 텍스트(요청 + 초안 + 사용자 답변 + 이미지 분석)를 하나로 합쳐
+                # 그대로 LLM 의 user 메시지로 사용한다. (별도 helper 없이 인라인으로 합친다.)
+                _cp = consulting_payload or {}
+                _consulting_parts: List[str] = []
+                if str(_cp.get("user_request") or "").strip():
+                    _consulting_parts.append(f"[사용자 요청]\n{_cp['user_request']}")
+                if str(_cp.get("consulting_outline") or "").strip():
+                    _consulting_parts.append(f"[컨설팅 초안]\n{_cp['consulting_outline']}")
+                if str(_cp.get("user_answer") or "").strip():
+                    _consulting_parts.append(f"[사용자 답변]\n{_cp['user_answer']}")
+                if str(_cp.get("image_analysis") or "").strip():
+                    _consulting_parts.append(f"[이미지 분석]\n{_cp['image_analysis']}")
+                consulting_outline_for_gen = "\n\n".join(_consulting_parts)
+                # PASS1 루프가 한 번 도는 단일 프로세스 단위만 만든다 — extracted 는 비워둔다.
+                extracted_by_proc_id = {
+                    f"consulting_{uuid.uuid4().hex[:12]}": {
+                        "detail": {},
+                        "graph_elements": {},
+                        "process_name": "",
+                    }
+                }
                 # PASS1/PASS2/HITL 에서 참조하는 최소 state 초기화 (파일 모드 resume 경로와 동일 키)
                 state = {
                     "dmn_decisions": [],
@@ -8901,13 +8875,9 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     "skill_docs": {},
                     "processes": [],
                 }
-                _consulting_task_count = sum(
-                    len((pinfo.get("detail") or {}).get("tasks") or [])
-                    for pinfo in extracted_by_proc_id.values()
-                )
                 await self._send_progress_event(
                     event_queue, context_id, task_id, job_id,
-                    f"[CONSULTING] 프로세스 구조 추출 완료 (단계 {_consulting_task_count}개)",
+                    "[CONSULTING] 컨설팅 내용 준비 완료",
                     "tool_usage_finished", 40,
                 )
 
@@ -9673,6 +9643,14 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
                 elements_model = generated.get("elements_model") or {}
                 proc_json = generated.get("definition") or {}
+                # 컨설팅 모드: LLM 이 채운 processDefinitionName 으로 PASS2 의 process_name 갱신
+                _llm_pname = str(
+                    proc_json.get("processDefinitionName")
+                    or elements_model.get("processDefinitionName")
+                    or ""
+                ).strip()
+                if _llm_pname and (not pinfo.get("process_name")):
+                    process_name = _llm_pname
                 proc_json = self._ensure_end_event_connectivity(
                     proc_json,
                     process_name=process_name,
@@ -9682,34 +9660,41 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 # - 프론트에서 실제 Neo4j 그래프(노드/관계)를 조회할 때 사용
                 # - tenant_id/todo_id 도 함께 저장하여 프론트가 그래프 식별자를
                 #   재구성할 수 있도록 한다 (graph_name 도 동일 값을 가짐)
+                # - 컨설팅 모드(consulting_payload 가 있는 경우)는 Neo4j 그래프가 없으므로
+                #   source 만 "consulting" 으로 표시하고 나머지 그래프 키는 생략한다.
                 try:
                     ex = proc_json.get("extraction")
                     if not isinstance(ex, dict):
                         ex = {}
-                    ex["source"] = "pdf2bpmn"
-                    ex["neo4j_proc_id"] = str(proc_id)
-                    ex["neo4j_graph_name"] = age_graph_name
-                    ex["tenant_id"] = str(effective_tenant_id or "")
-                    ex["todo_id"] = str(task_id or "")
-                    ex["task_id"] = str(task_id or "")
-                    ex["graph_run_id"] = request_graph_run_id
-                    ex["graph_snapshot_ref"] = {
-                        "run_id": request_graph_run_id,
-                        "snapshot_type": "process",
-                        "proc_id": str(proc_id),
-                    }
-                    ex["integrated_graph_ref"] = {
-                        "run_id": request_graph_run_id,
-                        "snapshot_type": "integrated",
-                        "tenant_id": str(effective_tenant_id or ""),
-                        "task_id": str(task_id or ""),
-                    }
-                    # 가벼운 임베드(디버깅/복구용): 실제 조회는 GraphSnapshot API 권장
-                    if isinstance(pinfo.get("graph_elements"), dict):
-                        ex["process_graph_preview"] = {
-                            "process_id": str(proc_id),
-                            "counts": (pinfo.get("graph_elements") or {}).get("counts") or {},
+                    if consulting_payload:
+                        ex["source"] = "consulting"
+                        ex["task_id"] = str(task_id or "")
+                        ex["tenant_id"] = str(effective_tenant_id or "")
+                    else:
+                        ex["source"] = "pdf2bpmn"
+                        ex["neo4j_proc_id"] = str(proc_id)
+                        ex["neo4j_graph_name"] = age_graph_name
+                        ex["tenant_id"] = str(effective_tenant_id or "")
+                        ex["todo_id"] = str(task_id or "")
+                        ex["task_id"] = str(task_id or "")
+                        ex["graph_run_id"] = request_graph_run_id
+                        ex["graph_snapshot_ref"] = {
+                            "run_id": request_graph_run_id,
+                            "snapshot_type": "process",
+                            "proc_id": str(proc_id),
                         }
+                        ex["integrated_graph_ref"] = {
+                            "run_id": request_graph_run_id,
+                            "snapshot_type": "integrated",
+                            "tenant_id": str(effective_tenant_id or ""),
+                            "task_id": str(task_id or ""),
+                        }
+                        # 가벼운 임베드(디버깅/복구용): 실제 조회는 GraphSnapshot API 권장
+                        if isinstance(pinfo.get("graph_elements"), dict):
+                            ex["process_graph_preview"] = {
+                                "process_id": str(proc_id),
+                                "counts": (pinfo.get("graph_elements") or {}).get("counts") or {},
+                            }
                     proc_json["extraction"] = ex
                 except Exception:
                     pass

@@ -165,23 +165,44 @@ def build_process_definition_messages(
 ) -> List[Dict[str, str]]:
     """
     Build the messages array passed to the LLM for ProcessGPT process definition generation.
-    """
-    # IMPORTANT:
-    # - 이 백엔드는 "무조건 생성(create)"만 수행합니다.
-    # - 따라서 askProcessDef/modifications 같은 다중 모드 규칙을 프롬프트에 포함하면 모델이 혼란을 느끼고
-    #   {"error":"cannot_comply"} 같은 폴백을 선택할 수 있습니다.
-    # - 최종 입력은 "컨설팅 초안 + extracted 전체"만 포함합니다. (user_request는 컨설팅 단계에서 이미 반영됨)
 
-    user_prompt = (
-        ((f"컨설팅 기반 프로세스 초안:\n{consulting_outline}\n\n") if consulting_outline else "")
-        + "추출된 프로세스 정보(extracted 전체):\n"
-        + f"{json.dumps(extracted_summary, ensure_ascii=False)}\n"
+    입력 소스 두 가지를 모두 지원한다 (system prompt 의 생성 규칙은 동일):
+    - 파일/그래프 추출 경로: extracted_summary 에 extracted 가 채워져 들어옴
+    - 컨설팅 경로: extracted 가 비어있고 consulting_outline 만 들어옴 → 컨설팅 내용 자체를 입력으로 사용
+    """
+    # extracted 가 사실상 비어있는지 판정 (tasks 가 1개 이상이면 비어있지 않다고 본다)
+    extracted = (extracted_summary or {}).get("extracted") or {}
+    has_extracted = bool(
+        isinstance(extracted, dict)
+        and (extracted.get("tasks") or extracted.get("activities"))
     )
 
+    parts: List[str] = []
+    if consulting_outline:
+        parts.append(f"컨설팅 내용:\n{consulting_outline}\n")
+    if has_extracted:
+        parts.append(
+            "추출된 프로세스 정보(extracted 전체):\n"
+            f"{json.dumps(extracted_summary, ensure_ascii=False)}\n"
+        )
+    user_prompt = "\n".join(parts) if parts else (
+        "추출된 프로세스 정보(extracted 전체):\n"
+        f"{json.dumps(extracted_summary or {}, ensure_ascii=False)}\n"
+    )
+
+    # NOTE:
+    # - 일부 모델(예: 사내 frentis-ai-model 등)은 "system 메시지는 맨 앞에 1개만 허용" 정책을
+    #   적용해 system 을 여러 개 보내면 400 BadRequest 를 반환한다.
+    # - 호환성을 위해 system 메시지 3개를 하나의 system 메시지로 합쳐서 보낸다.
+    system_content = (
+        create_only_process_definition_system_instructions()
+        + "\n\n"
+        + process_quality_system_instructions()
+        + "\n\n"
+        + strict_json_only_no_error_system_instructions()
+    )
     return [
-        {"role": "system", "content": create_only_process_definition_system_instructions()},
-        {"role": "system", "content": process_quality_system_instructions()},
-        {"role": "system", "content": strict_json_only_no_error_system_instructions()},
+        {"role": "system", "content": system_content},
         {"role": "user", "content": user_prompt},
     ]
 

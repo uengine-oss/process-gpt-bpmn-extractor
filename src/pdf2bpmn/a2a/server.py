@@ -284,7 +284,7 @@ class A2AServer:
                             "task_id": self.task_id,
                             "root_proc_inst_id": self.task_id,
                             "proc_inst_id": self.task_id,
-                            "tenant_id": input_data.get("tenant_id", "uengine"),
+                            "tenant_id": input_data.get("tenant_id") or "",
                             "query": self.get_user_input(),
                             "description": f"PDF to BPMN conversion: {input_data.get('pdf_file_name', 'document.pdf')}"
                         },

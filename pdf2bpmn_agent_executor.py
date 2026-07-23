@@ -8656,7 +8656,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         task_id = row.get("id")
         # context_id가 None이면 task_id를 사용 (adhoc task의 경우)
         context_id = row.get("root_proc_inst_id") or row.get("proc_inst_id") or task_id
-        tenant_id = row.get("tenant_id", "uengine")
+        # todolist row 의 tenant_id 를 그대로 사용한다.
+        # "uengine" 으로 하드코딩 fallback 하면 tenant_id 가 비어 들어온 작업이
+        # 조용히 남의 테넌트(uengine)에서 실행되어 결과물이 엉뚱한 테넌트에 저장된다.
+        tenant_id = (row.get("tenant_id") or "").strip()
+        if not tenant_id:
+            logger.error(f"[TENANT] todolist row 에 tenant_id 가 없습니다. task_id={task_id} — 작업을 중단합니다.")
+            raise ValueError(f"tenant_id is required for pdf2bpmn task (task_id={task_id})")
         
         # Query 가져오기 - 여러 소스에서 시도
         user_input = context.get_user_input()

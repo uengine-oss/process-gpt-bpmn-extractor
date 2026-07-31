@@ -120,8 +120,9 @@ class ProcessValidator:
         cleanup_instance=None,
         max_iters: int = 5,
         actor_email: str = None,
-        advance_timeout: float = 70.0,
+        advance_timeout: float = 30.0,
         poll_interval: float = 1.5,
+        case_concurrency: int = 4,
         report_path: str = None,
         logger=None,
         progress=None,
@@ -134,8 +135,11 @@ class ProcessValidator:
         self.tenant_id = tenant_id or "localhost"
         self.max_iters = max(1, int(max_iters or 1))
         self.actor_email = actor_email or "pdf2bpmn-validation@validation.local"
-        self._advance_timeout = max(5.0, float(advance_timeout or 70.0))
+        # 한 스텝 진행 대기 상한. 막힌 케이스는 이 시간을 통째로 소모한다(케이스마다 1회).
+        self._advance_timeout = max(5.0, float(advance_timeout or 30.0))
         self._poll_interval = max(0.3, float(poll_interval or 1.5))
+        # 분기 케이스 동시 실행 수(케이스끼리는 독립 인스턴스라 병렬 안전).
+        self._case_concurrency = max(1, int(case_concurrency or 4))
         self.log = logger or logging.getLogger(__name__)
         self._progress = progress
         # 검증 흐름을 사람이 읽을 수 있게 정리해 저장할 리포트 파일 경로 (없으면 미작성).
@@ -202,6 +206,8 @@ class ProcessValidator:
         engine_ran = False
         phase_scores: list = []   # 비수렴 판정용 — 단계(static/runtime)가 바뀌면 초기화
         prev_phase = None
+        overall_scores: list = []  # 단계와 무관한 전체 점수 이력(진동 감지용)
+        phase_switches = 0
 
         # 테스트 플랜(폼 예시값 + 의미 기반 기대 실행순서)은 1회만 생성해 전 단계에서 재사용.
         # 기대 순서는 정적 교정 단계의 개선 LLM 에도 '올바른 흐름' 힌트로 쓰인다.
@@ -275,28 +281,44 @@ class ProcessValidator:
                     85, {"proc_def_id": proc_def_id, "phase": "runtime", "cases": len(cases)},
                 )
                 defects = []
-                for case in cases:
-                    try:
-                        trace = await self._run_trace(
+                # 케이스는 서로 독립된 인스턴스라 병렬 실행이 안전하다.
+                # (순차 실행 시 케이스 수에 비례해 대기 시간이 그대로 누적됐다.)
+                sem = asyncio.Semaphore(self._case_concurrency)
+
+                async def _run_case(case):
+                    async with sem:
+                        return await self._run_trace(
                             proc_def_id, current, case.get("activity_inputs") or {}
                         )
-                    except EngineUnreachable as e:
+
+                traces = await asyncio.gather(
+                    *[_run_case(c) for c in cases], return_exceptions=True
+                )
+
+                for tr in traces:
+                    if isinstance(tr, EngineUnreachable):
                         report["skipped"] = True
-                        report["skip_reason"] = f"실행 엔진 접속 실패: {e}"
-                        self.log.warning(f"[VALIDATION] engine unreachable: {e}")
+                        report["skip_reason"] = f"실행 엔진 접속 실패: {tr}"
+                        self.log.warning(f"[VALIDATION] engine unreachable: {tr}")
                         return self._finalize_skip(report, current)
+                for tr in traces:
+                    if isinstance(tr, BaseException):
+                        raise tr
+
+                # 첫 엔진 실행에서 어떤 케이스도 진행하지 못했으면 폴링 서비스 미가동 가능성 → 건너뜀.
+                if not engine_ran and all((t or {}).get("no_progress") for t in traces):
+                    report["skipped"] = True
+                    report["skip_reason"] = (
+                        "엔진이 프로세스를 전혀 진행시키지 못함 — 폴링 서비스 미가동 가능성"
+                    )
+                    self.log.warning(
+                        f"[VALIDATION] no progress for {proc_def_id} — skipping (polling down?)"
+                    )
+                    return self._finalize_skip(report, current)
+                engine_ran = True
+
+                for case, trace in zip(cases, traces):
                     last_trace = trace
-                    # 첫 엔진 실행에서 진행이 전혀 없으면 폴링 서비스 미가동 가능성 → 건너뜀.
-                    if not engine_ran and trace.get("no_progress"):
-                        report["skipped"] = True
-                        report["skip_reason"] = (
-                            "엔진이 프로세스를 전혀 진행시키지 못함 — 폴링 서비스 미가동 가능성"
-                        )
-                        self.log.warning(
-                            f"[VALIDATION] no progress for {proc_def_id} — skipping (polling down?)"
-                        )
-                        return self._finalize_skip(report, current)
-                    engine_ran = True
                     cdefs = self._diff(case.get("expected_activity_order") or [], trace, current)
                     cdefs = [dict(d, case=case.get("name")) for d in cdefs]
                     case_runs.append((case, trace, cdefs))
@@ -307,7 +329,11 @@ class ProcessValidator:
             if phase != prev_phase:
                 phase_scores = []          # 단계 전환 시 비수렴 카운터 초기화
                 prev_phase = phase
+                # 단계가 바뀔 때마다 카운터를 비우면 static↔runtime 진동 시
+                # 비수렴 판정이 영원히 성립하지 않아 max_iters 까지 돈다.
+                phase_switches += 1
             phase_scores.append(cur_score)
+            overall_scores.append(cur_score)
             report["history"].append({
                 "iteration": it,
                 "phase": phase,
@@ -395,6 +421,16 @@ class ProcessValidator:
                 self.log.info(f"[VALIDATION] {proc_def_id}: 비수렴({phase}) — 조기 종료")
                 report["history"][-1]["note"] = f"비수렴({phase})으로 조기 종료"
                 self._rep(f"- 비수렴({phase} 단계, 점수가 더 나아지지 않음) — 조기 종료")
+                self._rep("")
+                break
+
+            # 단계 진동 조기 종료: static↔runtime 을 오가면 위 카운터가 매번 비워져
+            # 비수렴 판정이 성립하지 않는다. 단계 전환이 반복되는데도 전체 점수가
+            # 나아지지 않으면(= 고쳐도 다른 쪽이 깨지는 상태) 중단한다.
+            if phase_switches >= 4 and len(overall_scores) >= 4 and min(overall_scores[-4:]) >= min(overall_scores[:-4] or [10**9]):
+                self.log.info(f"[VALIDATION] {proc_def_id}: 단계 진동(static↔runtime) — 조기 종료")
+                report["history"][-1]["note"] = "단계 진동으로 조기 종료"
+                self._rep("- static↔runtime 단계가 반복 전환되며 점수가 나아지지 않음 — 조기 종료")
                 self._rep("")
                 break
 

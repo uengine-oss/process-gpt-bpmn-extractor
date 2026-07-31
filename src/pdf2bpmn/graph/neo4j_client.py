@@ -1108,7 +1108,7 @@ class Neo4jClient:
         """Get all processes."""
         query = """
         MATCH (p:Process)
-        RETURN p {.*} as process
+        RETURN properties(p) as process
         ORDER BY p.name
         """
         with self.session() as session:
@@ -1126,14 +1126,14 @@ class Neo4jClient:
         OPTIONAL MATCH (r)-[:ASSIGNED_AGENT]->(a:Agent)
         OPTIONAL MATCH (a)-[:USES_SKILL]->(agent_skill:Skill)
         OPTIONAL MATCH (p)-[:HAS_SKILL]->(ps:Skill)
-        RETURN p {.*} as process,
-               collect(DISTINCT t {.*}) as tasks,
-               collect(DISTINCT g {.*}) as gateways,
-               collect(DISTINCT e {.*}) as events,
-               collect(DISTINCT r {.*}) as roles,
-               collect(DISTINCT a {.*}) as agents,
-               collect(DISTINCT agent_skill {.*}) as agent_skills,
-               collect(DISTINCT ps {.*}) as process_skills
+        RETURN properties(p) as process,
+               collect(DISTINCT properties(t)) as tasks,
+               collect(DISTINCT properties(g)) as gateways,
+               collect(DISTINCT properties(e)) as events,
+               collect(DISTINCT properties(r)) as roles,
+               collect(DISTINCT properties(a)) as agents,
+               collect(DISTINCT properties(agent_skill)) as agent_skills,
+               collect(DISTINCT properties(ps)) as process_skills
         """
         with self.session() as session:
             result = session.run(query, {"proc_id": proc_id})
@@ -1296,7 +1296,7 @@ class Neo4jClient:
         """Get all open ambiguity questions."""
         query = """
         MATCH (a:Ambiguity {status: 'open'})
-        RETURN a {.*} as ambiguity
+        RETURN properties(a) as ambiguity
         ORDER BY a.created_at
         """
         with self.session() as session:

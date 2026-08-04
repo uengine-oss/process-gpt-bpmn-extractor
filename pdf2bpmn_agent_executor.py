@@ -899,6 +899,94 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         parser.feed(html or "")
         return parser.fields
 
+    def _normalize_form_row_layout(self, html: Optional[str]) -> Optional[str]:
+        """AI(챗봇/딥에이전트 등)가 생성한 폼 HTML이 row-layout으로 감싸지 않은 채
+        <div class='row' ...>만 내보내는 경우가 있어, 저장 전에 무조건 row-layout으로 감싸서
+        렌더링(RowLayout.vue)과 fields_json 추출(row-layout 기반 is_multidata_mode 그룹핑)이
+        항상 동작하도록 보정한다. 이미 row-layout으로 감싸져 있으면 그대로 둔다.
+        process-gpt-vue3의 ProcessGPTBackend.normalizeFormRowLayout()과 동일한 목적/동작."""
+        if not html or not isinstance(html, str):
+            return html
+        if not re.search(r"<div[^>]*class=(['\"])[^'\"]*\brow\b[^'\"]*\1", html, re.IGNORECASE):
+            return html
+
+        def _extract_and_strip_attr(raw_tag: str, attr_name: str) -> Tuple[str, Optional[str]]:
+            m = re.search(
+                rf"""\s+{attr_name}\s*=\s*(['"])((?:(?!\1).)*)\1""", raw_tag, re.IGNORECASE
+            )
+            if not m:
+                return raw_tag, None
+            stripped = raw_tag[: m.start()] + raw_tag[m.end() :]
+            return stripped, m.group(0).strip()
+
+        class _RowLayoutNormalizer(HTMLParser):
+            def __init__(self):
+                super().__init__(convert_charrefs=False)
+                self.out: List[str] = []
+                self.stack: List[Dict[str, Any]] = []
+
+            def handle_starttag(self, tag: str, attrs: List[tuple]):
+                raw = self.get_starttag_text() or ""
+                t = (tag or "").lower()
+                wrapped = False
+                if t == "div":
+                    attr_map = {k.lower(): v for (k, v) in attrs if k}
+                    class_tokens = (attr_map.get("class") or "").split()
+                    parent_tag = self.stack[-1]["tag"] if self.stack else None
+                    if "row" in class_tokens and parent_tag != "row-layout":
+                        wrapped = True
+                        row_layout_attr_parts: List[str] = []
+                        new_raw = raw
+                        for a in ("name", "alias", "is_multidata_mode"):
+                            new_raw, attr_text = _extract_and_strip_attr(new_raw, a)
+                            if attr_text:
+                                row_layout_attr_parts.append(attr_text)
+                        row_layout_attr_parts.append('v-model="formValues"')
+                        row_layout_attr_parts.append('v-slot="slotProps"')
+                        self.out.append(f"<row-layout {' '.join(row_layout_attr_parts)}>")
+                        raw = new_raw
+                self.out.append(raw)
+                self.stack.append({"tag": t, "wrapped": wrapped})
+
+            def handle_startendtag(self, tag: str, attrs: List[tuple]):
+                self.out.append(self.get_starttag_text() or "")
+
+            def handle_endtag(self, tag: str):
+                t = (tag or "").lower()
+                wrapped = False
+                if self.stack and self.stack[-1]["tag"] == t:
+                    wrapped = self.stack.pop()["wrapped"]
+                else:
+                    for i in range(len(self.stack) - 1, -1, -1):
+                        if self.stack[i]["tag"] == t:
+                            wrapped = self.stack[i]["wrapped"]
+                            del self.stack[i]
+                            break
+                self.out.append(f"</{tag}>")
+                if wrapped:
+                    self.out.append("</row-layout>")
+
+            def handle_data(self, data: str):
+                self.out.append(data)
+
+            def handle_comment(self, data: str):
+                self.out.append(f"<!--{data}-->")
+
+            def handle_entityref(self, name: str):
+                self.out.append(f"&{name};")
+
+            def handle_charref(self, name: str):
+                self.out.append(f"&#{name};")
+
+        try:
+            normalizer = _RowLayoutNormalizer()
+            normalizer.feed(html)
+            normalizer.close()
+            return "".join(normalizer.out)
+        except Exception as e:
+            logger.warning(f"[WARN] row-layout normalization failed, keep original html: {e}")
+            return html
+
     async def _save_form_def(self, *, form_def: Dict[str, Any], tenant_id: str) -> bool:
         """form_def 테이블에 저장 (프론트 putRawDefinition(type=form)과 호환되는 컬럼 사용)."""
         if not self.supabase_client:
@@ -912,6 +1000,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
 
             if not proc_def_id or not activity_id or not form_id:
                 raise ValueError("form_def requires id/proc_def_id/activity_id")
+
+            html = self._normalize_form_row_layout(form_def.get("html"))
 
             # 기존 row 탐색(프론트와 동일 기준: tenant_id + proc_def_id + activity_id)
             existing = (
@@ -930,7 +1020,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     self.supabase_client.table("form_def").update(
                         {
                             "id": form_id,
-                            "html": form_def.get("html"),
+                            "html": html,
                             "proc_def_id": proc_def_id,
                             "activity_id": activity_id,
                             "fields_json": form_def.get("fields_json") or [],
@@ -941,7 +1031,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     # uuid가 없으면 id 기준으로 업데이트 시도
                     self.supabase_client.table("form_def").update(
                         {
-                            "html": form_def.get("html"),
+                            "html": html,
                             "fields_json": form_def.get("fields_json") or [],
                         }
                     ).eq("id", form_id).execute()
@@ -949,7 +1039,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 self.supabase_client.table("form_def").insert(
                     {
                         "id": form_id,
-                        "html": form_def.get("html"),
+                        "html": html,
                         "proc_def_id": proc_def_id,
                         "activity_id": activity_id,
                         "fields_json": form_def.get("fields_json") or [],

@@ -907,7 +907,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
         process-gpt-vue3의 ProcessGPTBackend.normalizeFormRowLayout()과 동일한 목적/동작."""
         if not html or not isinstance(html, str):
             return html
-        if not re.search(r"<div[^>]*class=(['\"])[^'\"]*\brow\b[^'\"]*\1", html, re.IGNORECASE):
+        if not re.search(r"<div[^>]*class\s*=\s*(['\"])[^'\"]*\brow\b[^'\"]*\1", html, re.IGNORECASE):
             return html
 
         def _extract_and_strip_attr(raw_tag: str, attr_name: str) -> Tuple[str, Optional[str]]:
@@ -982,9 +982,13 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             normalizer = _RowLayoutNormalizer()
             normalizer.feed(html)
             normalizer.close()
-            return "".join(normalizer.out)
+            result = "".join(normalizer.out)
+            if result != html:
+                logger.info("[FORM] row-layout normalization applied (bare div.row wrapped)")
+            return result
         except Exception as e:
             logger.warning(f"[WARN] row-layout normalization failed, keep original html: {e}")
+            logger.warning(traceback.format_exc())
             return html
 
     async def _save_form_def(self, *, form_def: Dict[str, Any], tenant_id: str) -> bool:

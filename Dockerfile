@@ -43,8 +43,14 @@ RUN sed -i 's/^# *ko_KR.UTF-8 UTF-8/ko_KR.UTF-8 UTF-8/' /etc/locale.gen \
 ENV LANG=ko_KR.UTF-8 \
     LC_ALL=ko_KR.UTF-8
 
-# Install uv for faster dependency resolution
-RUN pip install uv
+# Install uv for faster dependency resolution.
+#
+# `setuptools` is upgraded in the same layer (2026-10-20 · robo-architect vuln
+# patch): the copies **vendored inside setuptools** were the last two findings
+# in the image — `jaraco-context 5.3.0` and `wheel 0.45.1`. They are not
+# declared anywhere, so a lockfile bump cannot reach them; the packaging tool
+# itself has to move.
+RUN pip install --no-cache-dir uv 'setuptools>=84.0.0'
 
 # Copy project metadata + lock for reproducible install
 COPY pyproject.toml uv.lock README.md ./

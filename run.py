@@ -114,6 +114,16 @@ def run_streamlit():
     """Run the Streamlit UI."""
     import subprocess
     app_path = Path(__file__).parent / "src" / "pdf2bpmn" / "ui" / "app.py"
+    # Streamlit is an optional extra (see pyproject). Say so plainly instead of
+    # letting the subprocess die with a bare "No module named streamlit".
+    try:
+        import streamlit  # noqa: F401
+    except ImportError:
+        print("Streamlit is not installed. It is an optional extra:")
+        print("    pip install '.[ui]'      # or:  uv sync --extra ui")
+        print("(Left out of the container image: the image never runs the UI,")
+        print(" and it pulled 41 critical/high vulnerabilities with it.)")
+        return
     subprocess.run([sys.executable, "-m", "streamlit", "run", str(app_path)])
 
 

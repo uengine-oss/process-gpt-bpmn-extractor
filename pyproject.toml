@@ -16,7 +16,6 @@ dependencies = [
     "tiktoken>=0.7.0",
     "numpy>=1.26.0,<2.0",
     "pydantic>=2.0.0",
-    "streamlit>=1.38.0",
     "python-dotenv>=1.0.0",
     "jinja2>=3.1.0",
     "uuid6>=2024.0.0",
@@ -30,6 +29,24 @@ dependencies = [
     "requests>=2.32.5",
     "process-gpt-agent-sdk>=0.4.15",
     "supabase>=2.28.3",
+]
+
+# Streamlit UI is **optional** (2026-10-20 · robo-architect vuln patch).
+#
+# The container entrypoint runs `run.py api` + `a2a_server.py`; Streamlit is only
+# reached through `run.py ui`, which launches it in a subprocess. Keeping it in
+# the required set pulled **GitPython** and **Tornado** into every image:
+#
+#     gitpython 3.1.45  1 critical + 32 high
+#     tornado   6.5.3   7 high
+#     pyarrow   22.0.0  1 high
+#
+# That is **41 of the image's 153 critical/high findings** for code the image
+# never executes. Install with `pip install .[ui]` (or `uv sync --extra ui`)
+# when you want the Streamlit UI.
+[project.optional-dependencies]
+ui = [
+    "streamlit>=1.38.0",
 ]
 
 [build-system]

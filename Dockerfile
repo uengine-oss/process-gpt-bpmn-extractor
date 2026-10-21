@@ -4,6 +4,14 @@
 # Build: docker build --no-cache -t ghcr.io/uengine-oss/process-gpt-bpmn-extractor:dev .
 # Run: docker run -p 8000:8000 -p 8001:8001 --env-file .env ghcr.io/uengine-oss/process-gpt-bpmn-extractor:dev
 
+# ⚠ **파이썬 3.13 으로 올려 봤고, 되돌렸다** (2026-10-21 실측).
+#
+# 목적은 `protobuf` 한 건(CVE-2026-0994)이었다 — 잠금이 **3.13 이상에서만**
+# 6.33.6 을 고르기 때문이다. 올리니 그 한 건은 사라졌는데 **다른 것이 여덟 개
+# 올라왔다**: 3.13 에서는 langchain 계열이 다른 가지로 풀려 urllib3 2.7.0 2건 ·
+# langsmith 2 · msgpack 2 · setuptools 70.3.0 1 · langchain-community 1 ·
+# langchain-core 1 이 들어온다. **7 → 15 로 나빠진다.**
+# 그래서 3.11 에 머문다. protobuf 한 건은 상류가 정리해야 풀린다.
 FROM python:3.11-slim
 
 # Set environment variables

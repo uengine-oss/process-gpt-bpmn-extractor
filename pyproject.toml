@@ -32,7 +32,10 @@ dependencies = [
     "uvicorn>=0.32.0",
     "python-multipart>=0.0.12",
     # file conversion / OCR / vision (optional at runtime but included for portability)
-    "pillow>=10.0.0",
+    # 취약점 보정 (2026-10-22) — pillow 12.3.0 에 **치명 3 · 고위험 16** 이 붙었다
+    # (CVE-2026-112900 OS 명령 주입 · 112403·112393 힙 오버플로 등). 전부
+    # **13.0.0 에서 고쳐졌다**. 바닥을 거기에 둔다.
+    "pillow>=13.0.0",
     "pytesseract>=0.3.10",
     "pymupdf>=1.24.0",
     "requests>=2.32.5",

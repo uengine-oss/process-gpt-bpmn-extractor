@@ -12,7 +12,37 @@
 # langsmith 2 · msgpack 2 · setuptools 70.3.0 1 · langchain-community 1 ·
 # langchain-core 1 이 들어온다. **7 → 15 로 나빠진다.**
 # 그래서 3.11 에 머문다. protobuf 한 건은 상류가 정리해야 풀린다.
-FROM python:3.11-slim
+# ⚠ **베이스를 `python:3.11-slim` 에서 Ubuntu 24.04(noble) 로 옮겼다** (2026-10-22).
+#
+# `python:*-slim` 은 Debian trixie 위에 있고, trixie 의 `zlib`·`libxml2` 에
+# 걸린 결함을 **데비안이 아직 안 고쳤다**(zlib CVE-2026-85091, 버그 #1146895).
+#     debian:trixie-slim   0C 1H
+#     ubuntu:24.04         **0C 0H**
+#
+# ⚠ **파이썬 판은 3.11 그대로 둔다.** 10-22 실측에서 3.13 으로 올리니
+#   langchain 계열이 다른 가지로 풀려 **7 → 15 로 나빠졌다**. 배포판만 옮기고
+#   런타임 판은 안 움직인다 — uv 가 자기 독립 빌드로 3.11 을 받는다.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    UV_PYTHON_INSTALL_DIR=/opt/python \
+    UV_LINK_MODE=copy \
+    PATH=/usr/local/bin:$PATH
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# ⚠ 받아 온 파이썬에서 `pip` 와 `ensurepip` 휠을 걷어낸다 — 검사기가 휠 **안**과
+#   `pip/_vendor/` 까지 읽어 urllib3·msgpack·setuptools 옛 판을 센다(실측).
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && uv python install 3.11 \
+    && PY="$(uv python find 3.11)" \
+    && PYROOT="$(dirname "$(dirname "$PY")")" \
+    && rm -rf "$PYROOT"/lib/python3.11/site-packages/pip \
+              "$PYROOT"/lib/python3.11/site-packages/pip-*.dist-info \
+              "$PYROOT"/lib/python3.11/ensurepip \
+    && ln -sf "$PY" /usr/local/bin/python3 \
+    && ln -sf /usr/local/bin/python3 /usr/local/bin/python
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -58,7 +88,10 @@ ENV LANG=ko_KR.UTF-8 \
 # in the image — `jaraco-context 5.3.0` and `wheel 0.45.1`. They are not
 # declared anywhere, so a lockfile bump cannot reach them; the packaging tool
 # itself has to move.
-RUN pip install --no-cache-dir uv 'setuptools>=84.0.0'
+# ⚠ **이 줄은 더 필요 없어졌다** (2026-10-22). uv 는 위에서 베이스 이미지로부터
+#   바이너리로 가져오고, `pip` 는 일부러 걷어냈다(검사기가 벤더 사본까지 센다).
+#   setuptools 는 `uv.lock` 이 정한 판이 venv 안에 들어간다.
+#   줄은 지우되 **왜 있었는지는 남긴다** — 다음에 같은 증상을 보면 여기부터 읽는다.
 
 # Copy project metadata + lock for reproducible install
 COPY pyproject.toml uv.lock README.md ./
@@ -69,7 +102,17 @@ COPY src/ ./src/
 # Install dependencies strictly from uv.lock for a fully reproducible build.
 # numpy<2 / langchain-core 1.2 / langgraph 1.0.5 pinning lives in pyproject + lock,
 # so no extra ad-hoc `pip install` lines here.
-RUN uv sync --frozen --no-dev
+# ⚠ **다 깔았으면 빌드 도구를 걷어낸다** (2026-10-22 실측).
+#
+# `build-essential` 이 `linux-libc-dev` 를 끌고 오는데, 검사기는 그것을
+# **커널 소스 패키지(`linux`)** 로 보고 **치명 7 · 고위험 211** 을 통째로 올린다.
+# 베이스를 noble 로 옮기고 6 → 239 로 **폭증해서** 알았다 — 숫자의 93% 가 이것이다.
+#
+# 헤더는 휠을 **컴파일할 때만** 필요하다. `uv sync` 가 끝나면 쓸 일이 없다.
+# ⚠ libreoffice·tesseract·폰트는 런타임이 쓰므로 **안 건드린다**.
+RUN uv sync --frozen --no-dev \
+    && apt-get purge -y --auto-remove build-essential linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/*
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Application entry-point scripts (not part of the installed package)

@@ -54,7 +54,9 @@ dependencies = [
     #           CVE-2026-42203 · CVE-2026-40217
     # 가장 늦게 고쳐진 것이 1.84.0(CVE-2026-49468)이라 바닥을 거기에 둔다.
     "litellm>=1.84.0",
-    # ⚠ **langgraph-sdk 와 protobuf 는 여기서 못 올린다**(2026-10-21 실측).
+    # ⚠ **langgraph-sdk 는 여기서 못 올린다**(2026-10-21 실측).
+    #   protobuf 는 **올렸다** — 아래 `[tool.uv] override-dependencies` 를 보라.
+    #   이 아래 protobuf 줄은 왜 보통 방법으로 안 됐는지의 기록으로만 남긴다.
     #   langgraph-sdk>=0.4.4  → `langchain-community` 가 **사전배포판**(1.0.0a1)을
     #                           요구해 해결 자체가 안 된다
     #   protobuf>=6.33.5      → 해결은 되는데 **SDK 가 0.4.15 → 0.11.0 으로 끌려가고
@@ -86,6 +88,31 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.uv]
+# protobuf 를 **같은 마이너 줄의 패치로 덮는다** (2026-10-22).
+#
+# CVE-2026-0994(고위험 8.2 · 무한 재귀)의 영향 범위는 `<5.29.6` 이다. 위 주석의
+# `protobuf>=6.33.5` 는 **목표를 잘못 잡은 것**이었다 — 6.x 로 갈 필요가 없다.
+#
+# 그런데 보통 방법으로는 5.29.6 도 못 넣는다. 하드 핀이 두 단 위에 있다:
+#
+#     process-gpt-agent-sdk 0.4.15  ⇒  a2a-sdk==0.3.0  ⇒  protobuf==5.29.5
+#
+# `protobuf>=5.29.6` 를 적으면 해에서 a2a-sdk 0.3.0 이 빠지고, 그러면 SDK 가
+# 0.11.0 · a2a-sdk 1.2.3 으로 끌려간다. 그 조합은 **HITL 을 조용히 끈다**(실측):
+# `hitl.py` 가 `a2a.utils.new_agent_text_message` 와
+# `a2a.server.agent_execution.EventQueue` 를 쓰는데 1.2.3 에서 둘 다 옮겨졌고,
+# import 가 `except Exception: logger.warning(); return` 안에 있어서 **오류 없이
+# 기능만 꺼진다.** 사람 확인을 기다리는 기능이 말없이 사라지는 쪽이 더 나쁘다.
+#
+# 그래서 SDK 는 그대로 두고 protobuf 만 덮는다. 5.29.5 → 5.29.6 은 같은 마이너
+# 줄의 **버그픽스 패치**라 a2a-sdk 가 쓰는 API 가 바뀌지 않는다. 상한을 5.30 으로
+# 둬서 덮기가 6.x 까지 번지지 않게 한다.
+#
+# ⚠ **덮기는 상류의 핀을 무시하는 것이다.** 이 세 줄을 지울 날은 상류가 a2a-sdk 를
+# 올려 주는 날이고, 그때는 보통 방법으로 올린다.
+override-dependencies = [
+    "protobuf>=5.29.6,<5.30",
+]
 dev-dependencies = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",

@@ -8,7 +8,48 @@ it can be moved into a standalone backend service later with minimal friction.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional
+
+_HANGUL = re.compile(r"[\uac00-\ud7a3]")
+_LATIN = re.compile(r"[A-Za-z]")
+_SYSTEM_BLOCK = re.compile(r"\n?\[(?:ExecutionPolicy|InputData|OpenUIForm)\]")
+
+
+def _string_values(obj: Any) -> List[str]:
+    """dict/list 안의 문자열 값만(키는 빼고) — 키는 언제나 영어라 언어 판단을 흐린다."""
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, dict):
+        return [s for v in obj.values() for s in _string_values(v)]
+    if isinstance(obj, list):
+        return [s for v in obj for s in _string_values(v)]
+    return []
+
+
+def source_language(user_request: str, consulting_outline: Optional[str], extracted_summary: Any) -> str:
+    """원문(사용자 요청·컨설팅 초안·문서에서 뽑은 값)의 언어 — 영문자가 한글보다 훨씬 많으면 'en', 아니면 'ko'.
+
+    스키마와 규칙이 이름·설명·조건을 「(한글)」로 적어 두어, 영어 초안·영어 문서도 한국어 정의가 나왔다.
+    """
+    texts = [_SYSTEM_BLOCK.split(str(user_request or ""), maxsplit=1)[0], str(consulting_outline or "")]
+    texts += _string_values(extracted_summary or {})
+    joined = " ".join(texts)
+    hangul, latin = len(_HANGUL.findall(joined)), len(_LATIN.findall(joined))
+    return "en" if latin >= 20 and hangul * 10 < latin else "ko"
+
+
+def output_language_system_instructions(lang: str) -> str:
+    """원문이 영어일 때만 — 스키마·규칙의 「한글」을 「영어」로 읽게 한다."""
+    if lang != "en":
+        return ""
+    return (
+        "### Output language (overrides 한글 in the schema and rules)\n"
+        "- The source (request, consulting draft, document) is in English. Wherever the schema or rules say "
+        "한글 or (한글), write English instead: processDefinitionName, description, role names, activity names, "
+        "descriptions and instructions, event and sequence names, gateway conditions, and form field labels.\n"
+        "- Keep ids and JSON keys as the schema defines them.\n"
+    )
 
 
 def strict_json_only_system_instructions() -> str:
@@ -194,10 +235,14 @@ def build_process_definition_messages(
     # - 일부 모델(예: 사내 frentis-ai-model 등)은 "system 메시지는 맨 앞에 1개만 허용" 정책을
     #   적용해 system 을 여러 개 보내면 400 BadRequest 를 반환한다.
     # - 호환성을 위해 system 메시지 3개를 하나의 system 메시지로 합쳐서 보낸다.
+    lang_rule = output_language_system_instructions(
+        source_language(user_request, consulting_outline, extracted_summary)
+    )
     system_content = (
         create_only_process_definition_system_instructions()
         + "\n\n"
         + process_quality_system_instructions()
+        + ("\n\n" + lang_rule if lang_rule else "")
         + "\n\n"
         + strict_json_only_no_error_system_instructions()
     )

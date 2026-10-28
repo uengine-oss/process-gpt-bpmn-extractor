@@ -51,6 +51,13 @@ from src.pdf2bpmn.hitl import (
     selected_ids as hitl_selected_ids,
 )
 
+def _storage_path(value: Any) -> str:
+    """첨부의 스토리지 경로. 채팅 첨부는 서명 주소에서 잘라 와 「files/….pdf?token=…」처럼 쿼리가 붙어 온다.
+    메멘토는 쿼리 없는 저장 경로(files/….pdf)로 청크를 찾으므로 쿼리를 뗀다 — 떼지 않으면
+    「메멘토에 사전 처리된 청크가 없습니다」로 생성이 실패한다."""
+    return str(value or "").strip().split("?", 1)[0]
+
+
 # OpenAI
 try:
     from openai import OpenAI
@@ -2438,7 +2445,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                         {
                             "url": u,
                             "name": _pick_name(candidate),
-                            "path": str(candidate.get("path") or "").strip().rstrip("?"),
+                            "path": _storage_path(candidate.get("path")),
                             "room_id": str(candidate.get("room_id") or default_room_id).strip(),
                             "tenant_id": str(candidate.get("tenant_id") or default_tenant_id).strip(),
                         }
@@ -2484,7 +2491,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     {
                         "url": u,
                         "name": str(f.get("name") or "").strip(),
-                        "path": str(f.get("path") or "").strip().rstrip("?"),
+                        "path": _storage_path(f.get("path")),
                         "room_id": str(f.get("room_id") or default_room_id).strip(),
                         "tenant_id": str(f.get("tenant_id") or default_tenant_id).strip(),
                     }
@@ -2600,7 +2607,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                     {
                         "url": new_url or old_url,
                         "name": str(item.get("name") or ""),
-                        "path": str(item.get("path") or "").strip().rstrip("?"),
+                        "path": _storage_path(item.get("path")),
                         "room_id": str(item.get("room_id") or result.get("room_id") or "").strip(),
                         "tenant_id": str(item.get("tenant_id") or result.get("tenant_id") or "").strip(),
                     }
@@ -9026,7 +9033,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 for idx, file_info in enumerate(input_files, start=1):
                     file_url = (file_info.get("url") or "").strip()
                     display_name = (file_info.get("name") or f"document_{idx}").strip() or f"document_{idx}"
-                    file_path = (file_info.get("path") or "").strip().rstrip("?")
+                    file_path = _storage_path(file_info.get("path"))
                     file_room_id = (file_info.get("room_id") or parsed_room_id or "").strip()
                     file_tenant_id = (file_info.get("tenant_id") or effective_tenant_id or "").strip()
 

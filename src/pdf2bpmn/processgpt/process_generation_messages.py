@@ -8,12 +8,17 @@ it can be moved into a standalone backend service later with minimal friction.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional
 
 _HANGUL = re.compile(r"[\uac00-\ud7a3]")
 _LATIN = re.compile(r"[A-Za-z]")
 _SYSTEM_BLOCK = re.compile(r"\n?\[(?:ExecutionPolicy|InputData|OpenUIForm)\]")
+# 글 중간에 낀 시스템 블록 — 다음 「빈 줄 + [제목]」 또는 끝까지 (컨설팅 모드는 요청·답변마다 붙어 온다)
+_SYSTEM_SECTION = re.compile(r"\[(?:ExecutionPolicy|InputData|OpenUIForm)\][\s\S]*?(?=\n\s*\n\[[^\]\n]+\]|\Z)")
+# 「[사용자 요청]」 같은 칸 이름 줄
+_LABEL_LINE = re.compile(r"^\[[^\]\n]+\]\s*$", re.M)
 
 
 def _string_values(obj: Any) -> List[str]:
@@ -27,16 +32,48 @@ def _string_values(obj: Any) -> List[str]:
     return []
 
 
+def _user_words(user_request: str) -> str:
+    """요청에서 사용자가 쓴 말만.
+
+    워커가 받는 요청은 MCP 가 만든 고정 한국어 틀 — [Description] · [Instruction] · [InputData]{json}
+    (· [추가 요청사항]) — 이라, 통째로 세면 영어로 요청해도 한국어로 판정됐다(VM 실측).
+    틀이면 InputData 의 user_request/user_answer 와 [추가 요청사항] 만, 아니면 시스템 블록 앞까지.
+    """
+    text = str(user_request or "")
+    if "[InputData]" not in text and "[Description]" not in text:
+        return _SYSTEM_BLOCK.split(text, maxsplit=1)[0]
+    words: List[str] = []
+    at = text.find("[InputData]")
+    brace = text.find("{", at) if at >= 0 else -1
+    if brace >= 0:
+        try:
+            data, _ = json.JSONDecoder().raw_decode(text[brace:])
+            if isinstance(data, dict):
+                words += [str(data.get("user_request") or ""), str(data.get("user_answer") or "")]
+        except ValueError:
+            pass
+    extra = text.find("[추가 요청사항]")
+    if extra >= 0:
+        words.append(text[extra + len("[추가 요청사항]"):])
+    return "\n".join(_SYSTEM_BLOCK.split(w, maxsplit=1)[0] for w in words)
+
+
 def source_language(user_request: str, consulting_outline: Optional[str], extracted_summary: Any) -> str:
     """원문(사용자 요청·컨설팅 초안·문서에서 뽑은 값)의 언어 — 영문자가 한글보다 훨씬 많으면 'en', 아니면 'ko'.
 
     스키마와 규칙이 이름·설명·조건을 「(한글)」로 적어 두어, 영어 초안·영어 문서도 한국어 정의가 나왔다.
     """
-    texts = [_SYSTEM_BLOCK.split(str(user_request or ""), maxsplit=1)[0], str(consulting_outline or "")]
+    outline = _LABEL_LINE.sub("", _SYSTEM_SECTION.sub("", str(consulting_outline or "")))
+    texts = [_user_words(user_request), outline]
     texts += _string_values(extracted_summary or {})
     joined = " ".join(texts)
     hangul, latin = len(_HANGUL.findall(joined)), len(_LATIN.findall(joined))
     return "en" if latin >= 20 and hangul * 10 < latin else "ko"
+
+
+def _output_word(lang: str) -> str:
+    """스키마·규칙에서 「무슨 말로 적을지」 자리에 들어갈 낱말."""
+    return "English" if lang == "en" else "한글"
 
 
 def output_language_system_instructions(lang: str) -> str:
@@ -88,11 +125,13 @@ def strict_json_only_no_error_system_instructions() -> str:
     )
 
 
-def create_only_process_definition_system_instructions() -> str:
+def create_only_process_definition_system_instructions(lang: str = "ko") -> str:
     """
     생성 전용(Process Definition Create-Only) 규칙.
     - 질의(askProcessDef), 수정(modifications) 등 다른 모드 규칙을 배제하여 혼선을 줄입니다.
+    - lang="en" 이면 이름·설명·조건을 적을 언어를 「한글」 대신 English 로 적는다(원문이 영어일 때).
     """
+    word = _output_word(lang)
     return (
         "### (목표) 프로세스 정의 생성 전용\n"
         "- 당신의 작업은 오직 1가지: 제공된 extracted(추출 정보)와 컨설팅 초안에 기반해 **프로세스 정의 JSON**을 생성하는 것입니다.\n"
@@ -112,8 +151,8 @@ def create_only_process_definition_system_instructions() -> str:
         "### (출력 스키마 예시 - 이 형태로 100% 출력)\n"
         "{\n"
         "  \"processDefinitionId\": \"<uuid>\",\n"
-        "  \"processDefinitionName\": \"<한글 프로세스명>\",\n"
-        "  \"description\": \"<한글 설명>\",\n"
+        f"  \"processDefinitionName\": \"<{word} 프로세스명>\",\n"
+        f"  \"description\": \"<{word} 설명>\",\n"
         "  \"isHorizontal\": true,\n"
         "  \"data\": [],\n"
         "  \"roles\": [{\"name\":\"100센터\",\"endpoint\":\"role_100_center\",\"resolutionRule\":\"\",\"origin\":\"created\"}],\n"
@@ -151,7 +190,7 @@ def create_only_process_definition_system_instructions() -> str:
         "\n"
         "### (시퀀스/게이트웨이)\n"
         "- extracted.gateways / extracted.sequence_flows 정보가 있으면 반영\n"
-        "- gateway를 만드는 경우 outgoing이 2개 이상이어야 하며, ExclusiveGateway면 각 outgoing condition을 한글로 채우세요\n"
+        f"- gateway를 만드는 경우 outgoing이 2개 이상이어야 하며, ExclusiveGateway면 각 outgoing condition을 {word}로 채우세요\n"
         "- gateway name은 절대로 '분기 1/분기 2' 같은 placeholder를 쓰지 마세요. gateway description/의사결정 의미를 반영한 이름으로 작성하세요.\n"
         "- ExclusiveGateway가 2개 분기라면 condition을 true/false 의미가 드러나게 작성하세요.\n"
         "  예: '<판단주제>인 경우' / '<판단주제>이 아닌 경우'\n"
@@ -177,15 +216,16 @@ def create_only_process_definition_system_instructions() -> str:
     )
 
 
-def process_quality_system_instructions() -> str:
+def process_quality_system_instructions(lang: str = "ko") -> str:
     """
     Extra constraints to improve BPMN quality beyond the baseline ProcessGPT prompt.
     Keep this as a separate system message so it can be adjusted independently.
     """
+    word = _output_word(lang)
     return (
         "### (추가) BPMN 품질/정합성 강화 규칙\n"
         "- Gateway를 생성하는 경우, 반드시 **최소 2개 이상의 outgoing Sequence**가 있어야 합니다.\n"
-        "- ExclusiveGateway: outgoing 각각에 condition(한글)을 반드시 지정하세요.\n"
+        f"- ExclusiveGateway: outgoing 각각에 condition({word})을 반드시 지정하세요.\n"
         "- Gateway 이름은 description과 일치하는 의사결정명이어야 하며, '분기1/2' 같은 이름은 금지입니다.\n"
         "- condition은 '조건 1/조건 2' 같은 자리표시자 금지. 반드시 비즈니스 의미(승인/반려/요건충족/미충족 등)를 담으세요.\n"
         "- ParallelGateway: condition은 비워두고, 분기/병합 구조가 자연스럽게 되도록 설계하세요.\n"
@@ -235,17 +275,20 @@ def build_process_definition_messages(
     # - 일부 모델(예: 사내 frentis-ai-model 등)은 "system 메시지는 맨 앞에 1개만 허용" 정책을
     #   적용해 system 을 여러 개 보내면 400 BadRequest 를 반환한다.
     # - 호환성을 위해 system 메시지 3개를 하나의 system 메시지로 합쳐서 보낸다.
-    lang_rule = output_language_system_instructions(
-        source_language(user_request, consulting_outline, extracted_summary)
-    )
+    lang = source_language(user_request, consulting_outline, extracted_summary)
+    logging.getLogger(__name__).info("[PROCDEF][LANG] output language=%s", lang)
+    lang_rule = output_language_system_instructions(lang)
     system_content = (
-        create_only_process_definition_system_instructions()
+        create_only_process_definition_system_instructions(lang)
         + "\n\n"
-        + process_quality_system_instructions()
-        + ("\n\n" + lang_rule if lang_rule else "")
+        + process_quality_system_instructions(lang)
         + "\n\n"
         + strict_json_only_no_error_system_instructions()
+        + ("\n\n" + lang_rule if lang_rule else "")
     )
+    if lang == "en":
+        # 스키마 설명이 한국어라, 규칙만으로는 한국어 정의가 나오곤 했다(VM 실측) — 입력 끝에 한 번 더
+        user_prompt += "\nWrite every name, description, condition and form label in English, like the source above.\n"
     return [
         {"role": "system", "content": system_content},
         {"role": "user", "content": user_prompt},

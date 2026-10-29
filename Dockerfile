@@ -55,7 +55,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# ⚠ **보안 고침을 받는다.** 2026-10-29 에 `brotli` 가 고위험 1건으로 떴는데
+#    (CVE-2026-111497 · **CISA KEV** — 실제로 악용되는 목록) 우리가 깐 것이 아니라
+#    **베이스 이미지(ubuntu:24.04)에 있던 것**이었다. `install` 로는 안 걷힌다.
+#    ⚠ 같은 레이어에서 한다 — 다음 레이어에서 고치면 옛 판이 그대로 남는다.
+#    ⚠ 여기는 **마지막 apt 레이어**다. 앞쪽(ca-certificates)에만 넣으면 이 설치가
+#      옛 판을 다시 들일 수 있다.
+RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     # Office → PDF conversion

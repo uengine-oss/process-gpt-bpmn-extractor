@@ -58,6 +58,13 @@ def _user_words(user_request: str) -> str:
     return "\n".join(_SYSTEM_BLOCK.split(w, maxsplit=1)[0] for w in words)
 
 
+def output_language_of(text: str) -> str:
+    """이미 만든 정의의 글(태스크 이름·설명 등)의 언어 — 폼 라벨 같은 후속 산출물을 같은 말로 쓰게 한다."""
+    t = str(text or "")
+    hangul, latin = len(_HANGUL.findall(t)), len(_LATIN.findall(t))
+    return "en" if latin >= 3 and not hangul else "ko"
+
+
 def source_language(user_request: str, consulting_outline: Optional[str], extracted_summary: Any) -> str:
     """원문(사용자 요청·컨설팅 초안·문서에서 뽑은 값)의 언어 — 영문자가 한글보다 훨씬 많으면 'en', 아니면 'ko'.
 

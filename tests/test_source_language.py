@@ -56,3 +56,10 @@ def test_consulting_outline_blocks_are_not_counted():
         "[사용자 답변]\nCreate the process as is" + policy,
     ])
     assert source_language("Create a sales proposal process." + policy, combined, {"process_name": "Process 1", "extracted": {}}) == "en"
+
+
+def test_output_language_of_task_text():
+    from src.pdf2bpmn.processgpt.process_generation_messages import output_language_of
+    assert output_language_of("Sales Proposal Creation Write and Send Proposal Sales Representative") == "en"
+    assert output_language_of("영업 제안서 작성 제안서 작성 및 발송") == "ko"
+    assert output_language_of("") == "ko"

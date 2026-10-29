@@ -26,7 +26,8 @@ import zipfile
 from src.pdf2bpmn.processgpt.bpmn_xml_generator import ProcessGPTBPMNXmlGenerator
 from src.pdf2bpmn.processgpt.process_definition_prompt import build_system_prompt_processgpt
 from src.pdf2bpmn.processgpt.process_consulting_prompt import get_process_consulting_system_prompt
-from src.pdf2bpmn.processgpt.process_generation_messages import build_process_definition_messages
+from src.pdf2bpmn.processgpt.process_generation_messages import build_process_definition_messages, output_language_of
+
 from src.pdf2bpmn.config import Config
 from src.pdf2bpmn.models.entities import Document as PdfDocument, Section, ReferenceChunk
 from src.pdf2bpmn.process_post_processor import ProcessPostProcessor
@@ -50,6 +51,12 @@ from src.pdf2bpmn.hitl import (
     read_batch_responses,
     selected_ids as hitl_selected_ids,
 )
+
+
+def _lang_word(lang: str) -> str:
+    """프롬프트 「(한국어)」 자리 — 정의가 영어면 영어로 만들게 한다."""
+    return "영어" if lang == "en" else "한국어"
+
 
 # OpenAI
 try:
@@ -795,14 +802,16 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             "</section>"
         )
 
-    async def _call_openai_for_form_html(self, request_text: str) -> str:
-        """LLM 호출로 폼 HTML 생성. 실패 시 예외를 던집니다(상위에서 폴백 처리)."""
+    async def _call_openai_for_form_html(self, request_text: str, lang: str = "ko") -> str:
+        """LLM 호출로 폼 HTML 생성. 실패 시 예외를 던집니다(상위에서 폴백 처리).
+        lang="en" 이면 alias·label 을 영어로 — 영어 정의의 폼이 한국어 라벨로 나오던 것(VM 실측)."""
         if not self.openai_client:
             raise RuntimeError("OpenAI client is not configured (missing OPENAI_API_KEY or openai package).")
 
         messages = self._build_form_generator_base_messages()
         # FormDesignGenerator의 noteMessage와 유사: alias는 한국어, name은 영어 권장
-        note = "Please write values such as alias and label of the form being created in Korean. However, make sure all name attributes are written in English only."
+        label_lang = "English" if lang == "en" else "Korean"
+        note = f"Please write values such as alias and label of the form being created in {label_lang}. However, make sure all name attributes are written in English only."
         user_message = (
             "# Request Type\n"
             "Create\n\n"
@@ -1144,6 +1153,8 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 {"proc_def_id": proc_def_id, "activity_id": activity_id, "form_def_id": form_def_id},
             )
 
+            # 폼 라벨 언어 = 태스크 정보의 언어(정의를 영어로 만들었으면 폼도 영어)
+            form_lang = output_language_of(" ".join(str(x or "") for x in (process_name, activity_name, role_name, description, instruction)))
             request_text = (
                 f"다음 BPM 프로세스의 사용자 태스크에 필요한 입력 폼을 생성하세요.\n\n"
                 f"- 프로세스명: {process_name}\n"
@@ -1157,7 +1168,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 f"출력 데이터 후보(outputData): {json.dumps(output_data, ensure_ascii=False)}\n\n"
                 f"요구사항:\n"
                 f"- 태스크 수행에 필요한 최소 입력 필드를 포함하세요.\n"
-                f"- 필드 alias는 한국어로, name은 영어로 작성하세요.\n"
+                f"- 필드 alias는 {'영어' if form_lang == 'en' else '한국어'}로, name은 영어로 작성하세요.\n"
                 f"- 태스크 정보가 충분하지 않다면, 자유입력(Free Input) 중심의 폼이 생성되어도 괜찮습니다.\n"
             )
 
@@ -1165,7 +1176,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
                 html = ""
                 # 1) LLM 시도
                 try:
-                    html = await self._call_openai_for_form_html(request_text)
+                    html = await self._call_openai_for_form_html(request_text, form_lang)
                 except Exception as e:
                     # 운영상 폼은 반드시 존재해야 하므로 폴백 폼으로 진행
                     logger.warning(f"[WARN] form LLM failed. process={proc_def_id} activity={activity_id} err={e}")
@@ -6760,7 +6771,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             + '  "reason": "한두 문장 근거",\n'
             + '  "create_agent": {\n'
             + '    "team_id": "생성 에이전트를 소속시킬 team_id (가능하면, 없으면 빈 문자열)",\n'
-            + '    "user_input": "OrganizationAgentGenerator에 넣을 사용자 요구사항(한국어, 3~6문장). 단일 태스크 전용이 아니라 관련 업무를 포괄하는 중간 범위(6/10)로 작성",\n'
+            + f'    "user_input": "OrganizationAgentGenerator에 넣을 사용자 요구사항({_lang_word(output_language_of(process_name + " " + role_name_clean))}, 3~6문장). 단일 태스크 전용이 아니라 관련 업무를 포괄하는 중간 범위(6/10)로 작성",\n'
             + '    "agent_type": "agent" \n'
             + "  }\n"
             + "}\n"
@@ -7058,7 +7069,7 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             + '      "reason": "한두 문장 근거",\n'
             + '      "create_agent": {\n'
             + '        "team_id": "",\n'
-            + '        "user_input": "새 에이전트 생성 요구사항(한국어, 3~6문장). 해당 태스크의 자동화 기준/입력/출력/검증을 포함",\n'
+            + f'        "user_input": "새 에이전트 생성 요구사항({_lang_word(output_language_of(process_name + " " + json.dumps(tasks_payload, ensure_ascii=False)))}, 3~6문장). 해당 태스크의 자동화 기준/입력/출력/검증을 포함",\n'
             + '        "agent_type": "agent"\n'
             + "      }\n"
             + "    }\n"
@@ -7124,14 +7135,14 @@ class PDF2BPMNAgentExecutor(AgentExecutor):
             f'사용자가 입력한 요구사항을 바탕으로 "{team_name}" 팀에 적합한 에이전트의 상세 정보를 JSON 형식으로 생성해주세요.\n\n'
             "다음 형식에 맞춰 응답해주세요:\n\n"
             "{\n"
-            '  "name": "에이전트의 이름 (한국어)",\n'
+            f'  "name": "에이전트의 이름 ({_lang_word(output_language_of(user_input))})",\n'
             '  "role": "에이전트의 역할 (간단명료하게)",\n'
             '  "goal": "에이전트의 목표 (구체적이고 측정 가능하게)",\n'
             '  "persona": "에이전트의 성격과 특징 (상세하게 기술)",\n'
             '  "tools": "필요한 MCP 도구들 (쉼표로 구분)"\n'
             "}\n\n"
             "## 지침:\n"
-            "1. name은 한국어로 직관적이고 명확하게\n"
+            f"1. name은 {_lang_word(output_language_of(user_input))}로 직관적이고 명확하게\n"
             "2. role은 한 문장으로 핵심 역할만\n"
             "3. goal은 SMART 원칙에 따라 구체적이고 측정 가능하게\n"
             "4. persona는 에이전트의 성격, 말투, 전문성 등을 포함하여 상세히\n"
